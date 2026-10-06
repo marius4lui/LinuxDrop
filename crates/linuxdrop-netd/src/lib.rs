@@ -4,6 +4,9 @@ pub const SOCKET_PATH: &str = "/run/linuxdrop/netd.sock";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    CancelP2p {
+        lease_id: String,
+    },
     JoinP2p {
         lease_id: String,
         peer_name: String,

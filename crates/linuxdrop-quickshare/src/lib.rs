@@ -80,12 +80,14 @@ pub async fn start(
         ),
     };
     rqs_lib::set_receive_limits(config.max_receive_bytes, config.max_files);
-    rqs_lib::hdl::set_upgrade_interface(
-        config
-            .upgrade_lease
-            .as_ref()
-            .map(|lease| lease.interface.clone()),
-    );
+    rqs_lib::hdl::set_upgrade_lease(config.upgrade_lease.map(|lease| {
+        linuxdrop_network::nm::Lease {
+            interface: lease.interface,
+            lease_id: lease.lease_id,
+            connection_uuid: lease.connection_uuid,
+        }
+    }));
+    rqs_lib::hdl::set_p2p_connector(config.p2p_connector);
     let mut messages = engine.message_sender.subscribe();
     let (send, _) = match engine.run().await {
         Ok(channels) => channels,

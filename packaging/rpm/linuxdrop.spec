@@ -13,7 +13,7 @@ BuildRequires:  glib2 systemd-rpm-macros
 BuildRequires:  cargo rust gcc pkgconfig(gtk4) pkgconfig(libadwaita-1) pkgconfig(openssl) pkgconfig(dbus-1) pkgconfig(libudev) pkgconfig(libnl-3.0) pkgconfig(libnl-genl-3.0) libpcap-devel libev-devel protobuf-compiler glib2-devel
 BuildRequires:  systemd-rpm-macros
 %endif
-Requires:       gtk4 libadwaita openssl-libs systemd dbus polkit iw iproute ethtool python3
+Requires:       gtk4 libadwaita openssl-libs systemd dbus polkit iw iproute ethtool python3 busybox
 %{?systemd_requires}
 
 %description
@@ -63,6 +63,7 @@ install -Dm644 packaging/linuxdrop.sysusers %{buildroot}%{_sysusersdir}/linuxdro
 %{_datadir}/applications/io.github.marius4lui.LinuxDrop.desktop
 %{_datadir}/metainfo/io.github.marius4lui.LinuxDrop.metainfo.xml
 %{_datadir}/dbus-1/services/io.github.marius4lui.LinuxDrop.service
+%{_datadir}/dbus-1/system.d/io.github.marius4lui.LinuxDrop.Netd.conf
 %{_datadir}/polkit-1/actions/io.github.marius4lui.LinuxDrop.policy
 %{_datadir}/polkit-1/rules.d/50-linuxdrop-netd.rules
 %{_datadir}/nautilus-python/extensions/linuxdrop.py

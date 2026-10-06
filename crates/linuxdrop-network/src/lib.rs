@@ -1,4 +1,5 @@
 //! Shared network selection and bounded bandwidth policy; no radio mutations.
+pub mod nm;
 pub mod p2p;
 pub struct P2pConnection {
     pub interface: String,

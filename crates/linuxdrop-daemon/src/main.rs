@@ -235,12 +235,45 @@ fn failed(message: impl ToString) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(message.to_string())
 }
 struct Manager(Arc<Shared>);
+#[derive(Clone)]
 struct HelperP2p {
     shared: std::sync::Weak<Shared>,
     lease_id: String,
 }
 impl HelperP2p {
     async fn request(&self, request: linuxdrop_netd::Request) -> Result<linuxdrop_netd::Response> {
+        let client = self.clone();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_on_drop = cancel.clone().drop_guard();
+        let joining = matches!(&request, linuxdrop_netd::Request::JoinP2p { .. });
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let pending = client.request_inner(request);
+            tokio::pin!(pending);
+            let result = tokio::select! {
+                result = &mut pending => result,
+                _ = cancel.cancelled(), if joining => {
+                    // Cancel on a separate authorized socket, while the original
+                    // worker drains its response and preserves request framing.
+                    let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                        let mut control = linuxdrop_netd::Client::connect().await?;
+                        control.request(&linuxdrop_netd::Request::CancelP2p { lease_id: client.lease_id.clone() }).await
+                    }).await;
+                    pending.await
+                }
+            };
+            let _ = sender.send(result);
+        });
+        let result = receiver
+            .await
+            .context("P2P helper request worker stopped")?;
+        cancel_on_drop.disarm();
+        result
+    }
+    async fn request_inner(
+        &self,
+        request: linuxdrop_netd::Request,
+    ) -> Result<linuxdrop_netd::Response> {
         let shared = self
             .shared
             .upgrade()

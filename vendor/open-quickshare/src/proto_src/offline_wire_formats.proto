@@ -307,6 +307,10 @@ message BandwidthUpgradeNegotiationFrame {
       optional int32 port = 3;
       optional int32 frequency = 4;
       optional string gateway = 5 [default = "0.0.0.0"];
+      optional bytes ip_v6_address = 6;
+      optional string service_name = 7 [deprecated = true];
+      optional string pin = 8;
+      optional string device_name = 9;
     }
 
     // Accompanies Medium.WEB_RTC

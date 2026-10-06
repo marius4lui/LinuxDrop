@@ -26,8 +26,75 @@ struct State {
     children: HashMap<String, tokio::process::Child>,
     recovery_errors: Vec<String>,
     attached: std::collections::HashSet<String>,
+    pending_p2p: HashMap<String, PendingP2p>,
+    cancelled_p2p: std::collections::HashSet<String>,
 }
 type Shared = Arc<Mutex<State>>;
+
+struct PendingP2p {
+    cancel: tokio_util::sync::CancellationToken,
+    interfaces: std::collections::HashSet<String>,
+}
+
+/// Cancellation and bookkeeping survive an abruptly disconnected helper client.
+struct P2pOperation {
+    shared: Shared,
+    lease_id: String,
+    cancel: tokio_util::sync::CancellationToken,
+}
+impl Drop for P2pOperation {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        let shared = self.shared.clone();
+        let lease_id = self.lease_id.clone();
+        tokio::spawn(async move {
+            let mut state = shared.lock().await;
+            if state
+                .pending_p2p
+                .get(&lease_id)
+                .is_some_and(|p| p.cancel.is_cancelled())
+            {
+                state.pending_p2p.remove(&lease_id);
+            }
+        });
+    }
+}
+
+fn competing_use(
+    lease: &Lease,
+    interface: &linuxdrop_hardware::NetworkInterface,
+    pending: Option<&PendingP2p>,
+) -> bool {
+    if interface.phy.as_deref() != Some(&lease.phy) || !interface.in_use() {
+        return false;
+    }
+    if lease.kind != LeaseKind::DirectWifi {
+        return interface.name != lease.interface;
+    }
+    if interface.active_connection_uuid.is_some()
+        && interface.active_connection_uuid == lease.connection_uuid
+    {
+        return false;
+    }
+    // A supplicant-created group has no NetworkManager connection UUID. It must
+    // never gain a default route or be taken over by another NM connection.
+    if interface.default_route
+        || interface.active_connection.is_some()
+        || interface.active_connection_uuid.is_some()
+    {
+        return true;
+    }
+    if lease
+        .p2p_group
+        .as_ref()
+        .is_some_and(|group| group.interface == interface.name)
+    {
+        return false;
+    }
+    // Between GroupStarted and journal publication, tolerate only a newly
+    // created VIF. Existing parent/sibling interfaces remain protected.
+    !pending.is_some_and(|operation| !operation.interfaces.contains(&interface.name))
+}
 
 pub async fn run() -> io::Result<()> {
     let socket = Path::new(SOCKET_PATH);
@@ -84,10 +151,9 @@ pub async fn run() -> io::Result<()> {
                             })
                         })
                     });
-                let unsafe_use = inventory.interfaces.iter().any(|i| {
-                    i.phy.as_deref() == Some(&lease.phy) && i.in_use() && if lease.kind == LeaseKind::DirectWifi { i.active_connection_uuid.as_ref() != lease.connection_uuid.as_ref() } else { i.name != lease.interface }
-                });
+                let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.pending_p2p.get(&lease.id)));
                 if dead || radio_gone || unsafe_use || regulatory_change {
+                    if let Some(operation) = state.pending_p2p.remove(&lease.id) { operation.cancel.cancel(); }
                     stop_child(&mut state, &lease.id).await;
                     match restore(&lease).await {
                         Ok(()) => {
@@ -186,7 +252,15 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
                             }
                         }
                     }
-                    match apply(request, uid, &mut owned, &state).await {
+                    let joining = matches!(&request, Request::JoinP2p { .. });
+                    let response = tokio::select! {
+                        result = apply(request, uid, &mut owned, &state) => result,
+                        result = reader.fill_buf(), if joining => {
+                            if result?.is_empty() { break; }
+                            return Err(io::Error::other("pipelined helper requests are not supported"));
+                        }
+                    };
+                    match response {
                         Ok(r) => r,
                         Err(e) => Response::Error { message: e },
                     }
@@ -201,6 +275,10 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
     .await;
     let mut state = state.lock().await;
     for id in owned {
+        state.cancelled_p2p.remove(&id);
+        if let Some(operation) = state.pending_p2p.remove(&id) {
+            operation.cancel.cancel();
+        }
         state.attached.remove(&id);
         stop_child(&mut state, &id).await;
         if let Some(lease) = state.leases.get(&id).cloned() {
@@ -301,6 +379,137 @@ async fn authorize(pid: i32, uid: u32, start: u64) -> Result<(), String> {
     Ok(())
 }
 
+async fn join_p2p(
+    shared: &Shared,
+    lease_id: String,
+    peer_name: String,
+    pin: String,
+    frequency: u32,
+) -> Result<Response, String> {
+    // Inventory and supplicant/DHCP I/O may take seconds. Other leased radios
+    // and read-only status requests must remain serviceable throughout.
+    let inv = inventory().await;
+    let mut state = shared.lock().await;
+    let mut lease = state
+        .leases
+        .get(&lease_id)
+        .ok_or("lease not found")?
+        .clone();
+    if state.cancelled_p2p.contains(&lease_id) {
+        return Err("P2P operation cancelled".into());
+    }
+    if lease.kind != LeaseKind::DirectWifi
+        || lease.p2p_group.is_some()
+        || state.pending_p2p.contains_key(&lease_id)
+    {
+        return Err("a free direct Wi-Fi lease is required".into());
+    }
+    let radio = inv
+        .radios
+        .iter()
+        .find(|radio| radio.phy == lease.phy)
+        .ok_or("radio disappeared")?;
+    if radio.protected || radio.rfkill {
+        return Err("radio became active or blocked".into());
+    }
+    if frequency != 0
+        && !radio.channels.iter().any(|channel| {
+            channel.frequency_mhz == frequency
+                && !channel.disabled
+                && !channel.no_ir
+                && !channel.radar
+        })
+    {
+        return Err("P2P frequency is not permitted by the radio regulatory policy".into());
+    }
+    let cancel = tokio_util::sync::CancellationToken::new();
+    state.pending_p2p.insert(
+        lease_id.clone(),
+        PendingP2p {
+            cancel: cancel.clone(),
+            interfaces: inv
+                .interfaces
+                .iter()
+                .filter(|i| i.phy.as_deref() == Some(&lease.phy))
+                .map(|i| i.name.clone())
+                .collect(),
+        },
+    );
+    let operation = P2pOperation {
+        shared: shared.clone(),
+        lease_id: lease_id.clone(),
+        cancel: cancel.clone(),
+    };
+    drop(state);
+    let group = linuxdrop_network::p2p::connect_wps(
+        &lease.interface,
+        &peer_name,
+        &pin,
+        frequency,
+        cancel.clone(),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let interface = group.identity.interface.clone();
+    run_command(
+        "/usr/sbin/ip",
+        &[
+            "link",
+            "set",
+            "dev",
+            &interface,
+            "alias",
+            &format!("linuxdrop:p2p:{}", lease.id),
+        ],
+        5,
+    )
+    .await?;
+    let mut state = shared.lock().await;
+    if cancel.is_cancelled() || !state.leases.contains_key(&lease_id) {
+        return Err("P2P radio lease ended during group formation".into());
+    }
+    lease.p2p_group = Some(group.identity.clone());
+    state.leases.insert(lease_id.clone(), lease.clone());
+    persist(&state).map_err(|e| e.to_string())?;
+    group.into_journaled();
+    drop(state);
+    let dhcp = tokio::select! {
+        result = start_p2p_dhcp(&lease) => result,
+        _ = cancel.cancelled() => Err("P2P radio lease ended during address acquisition".into()),
+    };
+    let mut state = shared.lock().await;
+    let lease_exists = state.leases.contains_key(&lease_id);
+    let still_owned = lease_exists && !cancel.is_cancelled();
+    match dhcp {
+        Ok((child, address)) if still_owned => {
+            state.children.insert(lease_id.clone(), child);
+            state.pending_p2p.remove(&lease_id);
+            drop(state);
+            drop(operation);
+            Ok(Response::P2pJoined {
+                interface,
+                ipv4_address: address,
+            })
+        }
+        result => {
+            // A successful DHCP child is kill-on-drop if the radio lease ended.
+            let error = result
+                .err()
+                .unwrap_or_else(|| "P2P radio lease ended during address acquisition".into());
+            state.pending_p2p.remove(&lease_id);
+            drop(state);
+            if lease_exists && restore_p2p(&lease).await.is_ok() {
+                let mut state = shared.lock().await;
+                if let Some(current) = state.leases.get_mut(&lease_id) {
+                    current.p2p_group = None;
+                }
+                persist(&state).map_err(|e| e.to_string())?;
+            }
+            Err(error)
+        }
+    }
+}
+
 async fn apply(
     request: Request,
     uid: u32,
@@ -362,90 +571,41 @@ async fn apply(
         }
         return Ok(Response::Diagnostic { report });
     }
+    if let Request::JoinP2p {
+        lease_id,
+        peer_name,
+        pin,
+        frequency,
+    } = request
+    {
+        if !owned.contains(&lease_id) {
+            return Err("lease does not belong to this connection".into());
+        }
+        return join_p2p(shared, lease_id, peer_name, pin, frequency).await;
+    }
     let mut state = shared.lock().await;
     let awdl = matches!(request, Request::AcquireAwdl { .. });
     match request {
         Request::Diagnose { .. } => unreachable!(),
-        Request::JoinP2p {
-            lease_id,
-            peer_name,
-            pin,
-            frequency,
-        } => {
-            if !owned.contains(&lease_id) {
-                return Err("lease does not belong to this connection".into());
-            }
-            let mut lease = state
-                .leases
-                .get(&lease_id)
-                .ok_or("lease not found")?
-                .clone();
-            if lease.kind != LeaseKind::DirectWifi || lease.p2p_group.is_some() {
-                return Err("a free direct Wi-Fi lease is required".into());
-            }
-            let inv = inventory().await;
-            let radio = inv
-                .radios
-                .iter()
-                .find(|radio| radio.phy == lease.phy)
-                .ok_or("radio disappeared")?;
-            if radio.protected || radio.rfkill {
-                return Err("radio became active or blocked".into());
-            }
-            if frequency != 0
-                && !radio.channels.iter().any(|channel| {
-                    channel.frequency_mhz == frequency
-                        && !channel.disabled
-                        && !channel.no_ir
-                        && !channel.radar
-                })
+        Request::JoinP2p { .. } => unreachable!(),
+        Request::CancelP2p { lease_id } => {
+            // The original connection is busy awaiting JoinP2p. A separately
+            // authorized connection of the same uid may only cancel its pending
+            // operation; it cannot take over or mutate another user's lease.
+            let lease = state.leases.get(&lease_id).ok_or("lease not found")?;
+            if lease.uid != uid
+                || lease.kind != LeaseKind::DirectWifi
+                || !state.attached.contains(&lease_id)
             {
-                return Err("P2P frequency is not permitted by the radio regulatory policy".into());
+                return Err("P2P operation does not belong to this user".into());
             }
-            let group = linuxdrop_network::p2p::connect_wps(
-                &lease.interface,
-                &peer_name,
-                &pin,
-                frequency,
-                tokio_util::sync::CancellationToken::new(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let interface = group.identity.interface.clone();
-            run_command(
-                "/usr/sbin/ip",
-                &[
-                    "link",
-                    "set",
-                    "dev",
-                    &interface,
-                    "alias",
-                    &format!("linuxdrop:p2p:{}", lease.id),
-                ],
-                5,
-            )
-            .await?;
-            lease.p2p_group = Some(group.identity.clone());
-            state.leases.insert(lease_id.clone(), lease.clone());
-            persist(&state).map_err(|e| e.to_string())?;
-            group.into_journaled();
-            match start_p2p_dhcp(&lease).await {
-                Ok((child, address)) => {
-                    state.children.insert(lease_id, child);
-                    Ok(Response::P2pJoined {
-                        interface,
-                        ipv4_address: address,
-                    })
-                }
-                Err(error) => {
-                    if restore_p2p(&lease).await.is_ok() {
-                        lease.p2p_group = None;
-                        state.leases.insert(lease_id, lease);
-                        persist(&state).map_err(|e| e.to_string())?;
-                    }
-                    Err(error)
-                }
+            if let Some(operation) = state.pending_p2p.get(&lease_id) {
+                operation.cancel.cancel();
             }
+            // Also cover cancellation while JoinP2p is collecting inventory,
+            // before a supplicant operation has been registered.
+            state.cancelled_p2p.insert(lease_id);
+            Ok(Response::Ok)
         }
         Request::LeaveP2p { lease_id } => {
             if !owned.contains(&lease_id) {
@@ -462,6 +622,7 @@ async fn apply(
             stop_child(&mut state, &lease_id).await;
             restore_p2p(&lease).await?;
             lease.p2p_group = None;
+            state.cancelled_p2p.remove(&lease_id);
             state.leases.insert(lease_id, lease);
             persist(&state).map_err(|e| e.to_string())?;
             Ok(Response::Ok)
@@ -845,6 +1006,7 @@ async fn apply(
             restore(&lease).await?;
             state.leases.remove(&lease_id);
             state.attached.remove(&lease_id);
+            state.cancelled_p2p.remove(&lease_id);
             owned.retain(|id| id != &lease_id);
             persist(&state).map_err(|e| e.to_string())?;
             Ok(Response::Ok)
@@ -918,8 +1080,9 @@ async fn start_p2p_dhcp(lease: &Lease) -> Result<(tokio::process::Child, String)
     let group = lease.p2p_group.as_ref().ok_or("P2P group missing")?;
     let result_path = format!("/run/linuxdrop/{}.ipv4.json", lease.id);
     let _ = std::fs::remove_file(&result_path);
-    let mut child = Command::new("/usr/sbin/udhcpc")
+    let mut child = Command::new("/usr/bin/busybox")
         .args([
+            "udhcpc",
             "-f",
             "-n",
             "-t",
@@ -1040,95 +1203,140 @@ async fn restore_connection(lease: &Lease) -> Result<(), String> {
     let Some(uuid) = &lease.connection_uuid else {
         return Ok(());
     };
-    let connection = zbus::Connection::system()
-        .await
-        .map_err(|e| e.to_string())?;
-    let settings = zbus::Proxy::new(
-        &connection,
-        "org.freedesktop.NetworkManager",
-        "/org/freedesktop/NetworkManager/Settings",
-        "org.freedesktop.NetworkManager.Settings",
-    )
+    linuxdrop_network::nm::remove_owned(&linuxdrop_network::nm::Lease {
+        interface: lease.interface.clone(),
+        lease_id: lease.id.clone(),
+        connection_uuid: uuid.clone(),
+    })
     .await
-    .map_err(|e| e.to_string())?;
-    let paths: Vec<zbus::zvariant::OwnedObjectPath> =
-        match settings.call("ListConnections", &()).await {
-            Ok(paths) => paths,
-            Err(zbus::Error::MethodError(name, _, _))
-                if name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown" =>
-            {
-                return Ok(())
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-    for path in paths {
-        let profile = zbus::Proxy::new(
-            &connection,
-            "org.freedesktop.NetworkManager",
-            path,
-            "org.freedesktop.NetworkManager.Settings.Connection",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        let settings: HashMap<String, HashMap<String, zbus::zvariant::OwnedValue>> = profile
-            .call("GetSettings", &())
-            .await
-            .map_err(|e| e.to_string())?;
-        let Some(properties) = settings.get("connection") else {
-            continue;
-        };
-        let text = |key: &str| properties.get(key).and_then(|v| <&str>::try_from(v).ok());
-        if text("uuid") != Some(uuid) {
-            continue;
-        }
-        if text("id") != Some(format!("linuxdrop-{}", lease.id).as_str()) {
-            return Err(
-                "direct connection ownership marker mismatch; retained for inspection".into(),
-            );
-        }
-        let manager = zbus::Proxy::new(
-            &connection,
-            "org.freedesktop.NetworkManager",
-            "/org/freedesktop/NetworkManager",
-            "org.freedesktop.NetworkManager",
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        let active_paths: Vec<zbus::zvariant::OwnedObjectPath> = manager
-            .get_property("ActiveConnections")
-            .await
-            .map_err(|e| e.to_string())?;
-        for active_path in active_paths {
-            let active = zbus::Proxy::new(
-                &connection,
-                "org.freedesktop.NetworkManager",
-                active_path.clone(),
-                "org.freedesktop.NetworkManager.Connection.Active",
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            let active_uuid: String = active
-                .get_property("Uuid")
-                .await
-                .map_err(|e| e.to_string())?;
-            if active_uuid == *uuid {
-                let _: () = manager
-                    .call("DeactivateConnection", &(active_path,))
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        let _: () = profile
-            .call("Delete", &())
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    .map_err(|error| error.to_string())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn direct_lease() -> Lease {
+        Lease {
+            id: "a".repeat(32),
+            uid: 1000,
+            phy: "phy2".into(),
+            interface: "wlan2".into(),
+            channel: 0,
+            boot_id: "test".into(),
+            awdl_interface: None,
+            allowed_frequencies: vec![],
+            kind: LeaseKind::DirectWifi,
+            connection_uuid: Some("owned-uuid".into()),
+            p2p_group: None,
+        }
+    }
+    fn active_interface(name: &str) -> linuxdrop_hardware::NetworkInterface {
+        linuxdrop_hardware::NetworkInterface {
+            name: name.into(),
+            ifindex: 3,
+            phy: Some("phy2".into()),
+            state: "up".into(),
+            default_route: false,
+            nm_state: None,
+            nm_managed: None,
+            active_connection: None,
+            active_connection_uuid: None,
+        }
+    }
+    #[test]
+    fn watchdog_distinguishes_owned_p2p_from_competing_networks() {
+        let mut lease = direct_lease();
+        let pending = PendingP2p {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            interfaces: ["wlan2".into(), "sibling0".into()].into_iter().collect(),
+        };
+        let mut group = active_interface("p2p-wlan2-0");
+        assert!(competing_use(&lease, &group, None));
+        assert!(!competing_use(&lease, &group, Some(&pending)));
+        assert!(competing_use(
+            &lease,
+            &active_interface("wlan2"),
+            Some(&pending)
+        ));
+        assert!(competing_use(
+            &lease,
+            &active_interface("sibling0"),
+            Some(&pending)
+        ));
+        lease.p2p_group = Some(linuxdrop_network::p2p::GroupIdentity {
+            interface: group.name.clone(),
+            interface_object: "/test".into(),
+            group_object: "/group".into(),
+            parent_interface: "wlan2".into(),
+            peer_object: "/peer".into(),
+        });
+        assert!(!competing_use(&lease, &group, None));
+        group.default_route = true;
+        assert!(competing_use(&lease, &group, None));
+        group.default_route = false;
+        group.active_connection_uuid = Some("somebody-elses-network".into());
+        assert!(competing_use(&lease, &group, Some(&pending)));
+        let mut parent = active_interface("wlan2");
+        parent.active_connection_uuid = lease.connection_uuid.clone();
+        assert!(!competing_use(&lease, &parent, None));
+    }
+    #[tokio::test]
+    async fn abandoned_p2p_operation_cancels_without_removing_a_new_operation() {
+        let shared = Arc::new(Mutex::new(State::default()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let old = P2pOperation {
+            shared: shared.clone(),
+            lease_id: "lease".into(),
+            cancel: cancel.clone(),
+        };
+        let fresh = tokio_util::sync::CancellationToken::new();
+        shared.lock().await.pending_p2p.insert(
+            "lease".into(),
+            PendingP2p {
+                cancel: fresh.clone(),
+                interfaces: Default::default(),
+            },
+        );
+        drop(old);
+        tokio::task::yield_now().await;
+        assert!(cancel.is_cancelled());
+        assert!(!fresh.is_cancelled());
+        assert!(shared.lock().await.pending_p2p.contains_key("lease"));
+    }
+    #[tokio::test]
+    async fn pending_p2p_can_be_cancelled_only_by_its_authorized_user() {
+        let lease = direct_lease();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let shared = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = shared.lock().await;
+            state.attached.insert(lease.id.clone());
+            state.leases.insert(lease.id.clone(), lease.clone());
+            state.pending_p2p.insert(
+                lease.id.clone(),
+                PendingP2p {
+                    cancel: cancel.clone(),
+                    interfaces: Default::default(),
+                },
+            );
+        }
+        let request = Request::CancelP2p {
+            lease_id: lease.id.clone(),
+        };
+        assert!(apply(request.clone(), 2000, &mut vec![], &shared)
+            .await
+            .is_err());
+        assert!(!cancel.is_cancelled());
+        assert!(matches!(
+            apply(request, 1000, &mut vec![], &shared).await,
+            Ok(Response::Ok)
+        ));
+        assert!(cancel.is_cancelled());
+        assert!(shared.lock().await.cancelled_p2p.contains(&lease.id));
+        assert!(matches!(
+            apply(Request::Status, 1000, &mut vec![], &shared).await,
+            Ok(Response::State { .. })
+        ));
+    }
     #[test]
     fn process_start_is_available() {
         assert!(process_start(std::process::id() as i32).unwrap() > 0);

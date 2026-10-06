@@ -62,7 +62,7 @@ fn validate(interface: &str, name: &str, pin: &str, frequency: u32) -> Result<()
     if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
         bail!("Invalid P2P peer name");
     }
-    if pin.len() != 8 || !pin.bytes().all(|b| b.is_ascii_digit()) {
+    if !pin.is_empty() && (pin.len() != 8 || !pin.bytes().all(|b| b.is_ascii_digit())) {
         bail!("Wi-Fi Direct requires an eight digit WPS PIN");
     }
     if frequency != 0 && !(2300..=7200).contains(&frequency) {
@@ -85,13 +85,16 @@ pub async fn connect_wps(
     let interface = interface.to_owned();
     let peer_name = peer_name.to_owned();
     let pin = pin.to_owned();
+    let cancel_on_drop = cancel.clone().drop_guard();
     // The worker keeps cleanup alive even if its caller drops the future.
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = connect_inner(interface, peer_name, pin, frequency, cancel).await;
         let _ = sender.send(result); // An abandoned result drops the group guard.
     });
-    receiver.await.context("P2P connection worker stopped")?
+    let result = receiver.await.context("P2P connection worker stopped")?;
+    cancel_on_drop.disarm();
+    result
 }
 
 async fn connect_inner(
@@ -157,8 +160,13 @@ async fn connect_inner(
         args.insert("peer", Value::from(peer.clone()));
         args.insert("join", Value::from(true));
         args.insert("persistent", Value::from(false));
-        args.insert("wps_method", Value::from("keypad"));
-        args.insert("pin", Value::from(pin.as_str()));
+        args.insert(
+            "wps_method",
+            Value::from(if pin.is_empty() { "pbc" } else { "keypad" }),
+        );
+        if !pin.is_empty() {
+            args.insert("pin", Value::from(pin.as_str()));
+        }
         if frequency != 0 {
             args.insert("frequency", Value::from(frequency as i32));
         }
@@ -260,6 +268,7 @@ mod tests {
     #[test]
     fn only_bounded_wps_credentials_and_interface_names_are_accepted() {
         assert!(validate("wlan2", "Android", "12345670", 2437).is_ok());
+        assert!(validate("wlan2", "Android", "", 2437).is_ok());
         assert!(validate("../wlan0", "Android", "12345670", 2437).is_err());
         assert!(validate("wlan0", "Android", "1234", 2437).is_err());
         assert!(validate("wlan0", "Android", "12345670", 99999).is_err());

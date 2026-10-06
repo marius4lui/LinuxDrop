@@ -20,7 +20,7 @@ Section: net
 Priority: optional
 Architecture: $arch
 Maintainer: LinuxDrop contributors <noreply@github.com>
-Depends: libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.5), libssl3t64, libc6, libgcc-s1, systemd, dbus, policykit-1, iw, iproute2, ethtool, adduser
+Depends: libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.5), libssl3t64, libc6, libgcc-s1, systemd, dbus, policykit-1, iw, iproute2, ethtool, adduser, python3, busybox | busybox-static
 Recommends: network-manager, bluez, python3-nautilus, gnome-shell-extension-prefs
 Homepage: https://github.com/marius4lui/LinuxDrop
 Description: Nearby file sharing for Linux

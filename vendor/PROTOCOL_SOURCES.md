@@ -15,6 +15,8 @@ Quick Share:
 
 - Runtime Bluetooth setting, receive size/count policy, no unsolicited controller power-on.
 - Dedicated explicitly selected disconnected interface for Wi-Fi upgrades; no first-radio choice or active connection disruption. Temporary connection names use the LinuxDrop namespace. Errors omit argument lists containing network passwords.
+- NetworkManager upgrades now use lease-scoped volatile D-Bus profiles bound to the creating client, plus an exclusive transfer semaphore and ownership-checked asynchronous cleanup. The old fixed profile names and `nmcli` password arguments are removed.
+- Added Google wire fields `ip_v6_address=6`, `pin=8`, `device_name=9`; device-name offers route through LinuxDrop's leased supplicant P2P connector. IPv6 credential routing and complete role negotiation remain explicit completion work; a decoded field is not advertised as working transport support.
 - Per-session random inbound IDs (LAN, GATT, L2CAP); daemon transfer ID retained on outbound failures.
 - Explicit SAS consent in both directions; hidden-mode offers are rejected by the adapter.
 - Private per-session staging, exclusive file creation, name/count/size checks, exact end-of-file checks, receive publication through LinuxDrop ReceiveStore.
