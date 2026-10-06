@@ -134,6 +134,7 @@ pub async fn start_with_budget(
                 },
                 command = rx.recv() => match command {
                     None | Some(BackendCommand::Shutdown) => break,
+                    Some(BackendCommand::ReceiveOffer { .. }) => {}, // Routed only to LocalSend by the daemon.
                     Some(BackendCommand::SetVisibility {visible:value}) => {visible=value;engine.change_visibility(if visible {Visibility::Visible} else {Visibility::Invisible});},
                     Some(BackendCommand::Send {transfer_id, peer_id, files}) => {
                         let result = prepare_send(&transfer_id, &peer_id, &files, &peers);

@@ -3,11 +3,69 @@ use crate::{
     ui::{bytes, label, Ui},
 };
 use adw::prelude::*;
-use gtk::gio;
+use gtk::{gio, glib};
 use serde_json::{json, Value};
 use std::{cell::RefCell, rc::Rc};
 
 impl Ui {
+    pub fn receive_link(self: &Rc<Self>, initial: Option<&str>) -> adw::AlertDialog {
+        let entry = adw::EntryRow::builder()
+            .title(tr("LocalSend link"))
+            .text(initial.unwrap_or(""))
+            .build();
+        entry.set_widget_name("download-offer-url");
+        let list = gtk::ListBox::new();
+        list.add_css_class("boxed-list");
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.append(&entry);
+        let dialog = adw::AlertDialog::builder().heading(tr("Receive from a link"))
+            .body(tr("Paste the sender's LocalSend link, such as http://192.168.1.20:53317. Download links use unencrypted HTTP on your local network. You will review the files and choose where to save them before downloading."))
+            .extra_child(&list).build();
+        dialog.add_responses(&[("cancel", &tr("Cancel")), ("open", &tr("Review offer"))]);
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
+        dialog.set_response_enabled("open", !entry.text().trim().is_empty());
+        let weak = dialog.downgrade();
+        entry.connect_changed(move |entry| {
+            if let Some(dialog) = weak.upgrade() {
+                dialog.set_response_enabled("open", !entry.text().trim().is_empty());
+            }
+        });
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response != "open" {
+                return;
+            }
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let Some(proxy) = ui.proxy.borrow().clone() else {
+                ui.toast("Background service unavailable");
+                return;
+            };
+            let url = entry.text().trim().to_owned();
+            glib::MainContext::default().spawn_local(async move {
+                match crate::ipc::call(
+                    &proxy,
+                    "ReceiveDownloadOffer",
+                    Some((url.clone(),).to_variant()),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        ui.show_transfers();
+                        ui.refresh();
+                    }
+                    Err(error) => {
+                        ui.receive_link(Some(&url));
+                        ui.toast(&error);
+                    }
+                }
+            });
+        });
+        dialog.present(Some(&self.window));
+        dialog
+    }
     pub fn accept_request(self: &Rc<Self>, transfer: &Value) -> adw::AlertDialog {
         let id = transfer["id"].as_str().unwrap_or_default().to_owned();
         let files = transfer["files"].as_array().cloned().unwrap_or_default();
@@ -155,14 +213,19 @@ impl Ui {
     }
 
     pub fn provide_pin(self: &Rc<Self>, transfer: &Value) {
+        let download = transfer["direction"].as_str() == Some("incoming");
         let pin = adw::PasswordEntryRow::builder()
-            .title(tr("Receiving PIN"))
+            .title(tr(if download {
+                "Sender's PIN"
+            } else {
+                "Receiving PIN"
+            }))
             .build();
         let list = gtk::ListBox::new();
         list.add_css_class("boxed-list");
         list.set_selection_mode(gtk::SelectionMode::None);
         list.append(&pin);
-        let dialog = adw::AlertDialog::builder().heading(tr("Enter PIN")).body(tr("Enter the PIN shown in the receiving device's LocalSend settings. This is separate from Quick Share code verification.")).extra_child(&list).build();
+        let dialog = adw::AlertDialog::builder().heading(tr("Enter PIN")).body(tr(if download { "Enter the PIN supplied by the sender for this download link." } else { "Enter the PIN shown in the receiving device's LocalSend settings. This is separate from Quick Share code verification." })).extra_child(&list).build();
         dialog.add_responses(&[("cancel", &tr("Cancel")), ("send", &tr("Continue"))]);
         dialog.set_close_response("cancel");
         dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);

@@ -236,6 +236,13 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert_eq!(accepted_options.borrow()["directory"],"/tmp/Reviewed-Sender","Acceptance must preserve the exact previewed destination, including automatic subfolders");
         assert_eq!(accepted_options.borrow()["selected_indices"],json!([0]),"Quick Share publishes only the selected files");
         dialog.force_close();
+        settle().await;
+        let download = ui.receive_link(Some("http://192.168.1.20:53317"));
+        glib::timeout_future(Duration::from_millis(400)).await;
+        let address = find(&download, "download-offer-url").unwrap().downcast::<adw::EntryRow>().unwrap();
+        assert_eq!(address.text(), "http://192.168.1.20:53317");
+        capture(&ui, "download-offer-review.png");
+        download.force_close();
         ui.allow_close.set(true);
         ui.window.close();
     });

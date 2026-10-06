@@ -85,6 +85,10 @@ pub struct BackendState {
 
 #[derive(Debug, Clone)]
 pub enum BackendCommand {
+    ReceiveOffer {
+        transfer_id: String,
+        url: String,
+    },
     Send {
         transfer_id: String,
         peer_id: String,

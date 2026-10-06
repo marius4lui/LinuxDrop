@@ -285,6 +285,10 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         "hero-subtitle",
     ));
     let transfers = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let receive_link = gtk::Button::with_label(&tr("Receive from a link"));
+    receive_link.set_halign(gtk::Align::Start);
+    receive_link.add_css_class("pill");
+    transfer_page.append(&receive_link);
     transfer_page.append(&transfers);
     stack.add_titled_with_icon(
         &page(&transfer_page),
@@ -430,6 +434,12 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     ui.share_link.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
             ui.share_link();
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    receive_link.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.receive_link(None);
         }
     });
     let weak = Rc::downgrade(&ui);
@@ -626,6 +636,9 @@ impl Ui {
     }
     pub fn toast(&self, message: &str) {
         self.toasts.add_toast(adw::Toast::new(&tr(message)));
+    }
+    pub fn show_transfers(&self) {
+        self.stack.set_visible_child_name("transfers");
     }
     fn service_error(&self, error: &str) {
         self.connection
@@ -1312,6 +1325,8 @@ impl Ui {
                 "waiting" if incoming => "Wants to share with you",
                 "waiting" => "Waiting for the other device",
                 "verification" => "Compare this code on both devices",
+                "connecting" => "Opening download offer",
+                "pin_required" if incoming => "Enter the sender's PIN",
                 "pin_required" => "Enter the receiving device's PIN",
                 "transferring" => "Transferring",
                 "completed" => "Completed",

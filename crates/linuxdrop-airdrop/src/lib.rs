@@ -200,6 +200,7 @@ pub async fn start_with_budget(
                 },
                 command=commands.recv()=>match command {
                     None|Some(BackendCommand::Shutdown)=>break,
+                    Some(BackendCommand::ReceiveOffer { .. }) => {}, // LocalSend-only command.
                     Some(BackendCommand::SetVisibility{visible})=>{
                         shared.visible.store(visible,Ordering::Relaxed);
                         if visible {let _=mdns.register(service.clone());} else {let _=mdns.unregister(service.get_fullname());}

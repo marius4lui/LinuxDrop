@@ -1,4 +1,5 @@
 mod discovery;
+pub mod download;
 mod rate;
 pub mod reverse;
 mod server;
@@ -162,6 +163,7 @@ struct Shared {
     registration_gate: rate::RequestGate,
     pin_gate: rate::RequestGate,
     pin_requests: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    download_decisions: Mutex<HashMap<String, oneshot::Sender<Option<ReceiveOptions>>>>,
     interfaces: std::sync::RwLock<Vec<linuxdrop_network::InterfaceAddress>>,
     bandwidth: linuxdrop_network::BandwidthLimiter,
 }
@@ -221,6 +223,7 @@ async fn start_bound_with_budget(
         registration_gate: rate::RequestGate::new(120, Duration::from_secs(60)),
         pin_gate: rate::RequestGate::new(6, Duration::from_secs(60)),
         pin_requests: Mutex::new(HashMap::new()),
+        download_decisions: Mutex::new(HashMap::new()),
         store: ReceiveStore::open(&config.download_dir)?,
         visible: AtomicBool::new(config.visible),
         config: config.clone(),
@@ -253,6 +256,17 @@ async fn start_bound_with_budget(
     tokio::spawn(async move {
         while let Some(command) = rx.recv().await {
             match command {
+                BackendCommand::ReceiveOffer { transfer_id, url } => {
+                    let cancel = s.stop.child_token();
+                    s.outgoing
+                        .lock()
+                        .await
+                        .insert(transfer_id.clone(), cancel.clone());
+                    let state = s.clone();
+                    tokio::spawn(async move {
+                        download::run(state, transfer_id, url, cancel).await;
+                    });
+                }
                 BackendCommand::Send {
                     transfer_id,
                     peer_id,
@@ -332,6 +346,10 @@ impl Shared {
             .await;
     }
     async fn decide(&self, id: &str, options: Option<ReceiveOptions>) {
+        if let Some(consent) = self.download_decisions.lock().await.remove(id) {
+            let _ = consent.send(options);
+            return;
+        }
         if let Some(session) = self.sessions.lock().await.get_mut(id) {
             if let Some(consent) = session.consent.take() {
                 let _ = consent.send(options);
@@ -370,23 +388,7 @@ impl Shared {
         if info.fingerprint == self.info.fingerprint {
             return Ok(());
         }
-        if info.alias.len() > 256
-            || info.fingerprint.is_empty()
-            || info.fingerprint.len() > 128
-            || info.version.len() > 32
-            || info
-                .device_model
-                .as_ref()
-                .is_some_and(|model| model.len() > 256)
-            || info
-                .device_type
-                .as_ref()
-                .is_some_and(|kind| kind.len() > 64)
-            || info.port == 0
-            || !matches!(info.protocol.as_str(), "http" | "https")
-        {
-            bail!("Invalid peer metadata");
-        }
+        validate_info(&info)?;
         let id = format!("localsend:{}", info.fingerprint);
         let address = SocketAddr::new(ip, info.port);
         let peer = Peer {
@@ -413,6 +415,27 @@ impl Shared {
         let _ = self.events.send(BackendEvent::PeerUpsert(peer)).await;
         Ok(())
     }
+}
+
+fn validate_info(info: &DeviceInfo) -> Result<()> {
+    if info.alias.len() > 256
+        || info.fingerprint.is_empty()
+        || info.fingerprint.len() > 128
+        || info.version.len() > 32
+        || info
+            .device_model
+            .as_ref()
+            .is_some_and(|model| model.len() > 256)
+        || info
+            .device_type
+            .as_ref()
+            .is_some_and(|kind| kind.len() > 64)
+        || info.port == 0
+        || !matches!(info.protocol.as_str(), "http" | "https")
+    {
+        bail!("Invalid peer metadata");
+    }
+    Ok(())
 }
 
 async fn get_info(State(s): State<SharedState>) -> Result<Json<DeviceInfo>, StatusCode> {
@@ -1106,7 +1129,10 @@ mod tests {
             receive_pin: None,
         }
     }
-    async fn next_transfer(rx: &mut mpsc::Receiver<BackendEvent>, state: &str) -> Transfer {
+    pub(super) async fn next_transfer(
+        rx: &mut mpsc::Receiver<BackendEvent>,
+        state: &str,
+    ) -> Transfer {
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 match rx.recv().await.unwrap() {

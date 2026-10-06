@@ -43,6 +43,8 @@ Service `io.github.marius4lui.LinuxDrop`, object `/io/github/marius4lui/LinuxDro
 | ClearHistory | none | remove terminal metadata; keep downloaded files |
 | CreateDownloadOffer | draft ID | JSON URL, PIN, expiry, encryption flag |
 | StopDownloadOffer | none | revoke download server |
+| ReceiveDownloadOffer | explicit local HTTP URL | transfer ID; metadata/PIN then receive review before payload download |
+| ProvideTransferPin | transfer ID, PIN | LocalSend upload or download-offer PIN challenge |
 | OpenApplication | none | open native app |
 
 Signal `Changed(revision: u64)` invalidates snapshots. JSON shapes follow `linuxdrop-core` and `settings.rs`. Unknown settings/types are rejected. Incompatible contract changes require Manager2.

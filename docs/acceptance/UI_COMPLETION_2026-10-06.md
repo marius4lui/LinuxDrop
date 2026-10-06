@@ -54,3 +54,15 @@ Fractional scaling, mixed-monitor hotplug, full screen-reader traversal, portal
 exports and GNOME versions beyond the recorded runtime remain on the full goal's
 acceptance ledger. New installable artifacts still require the final integration
 build; old 0.1.0 packages do not contain this pass.
+
+## Download-offer reception follow-up
+
+Transfers now includes “Receive from a link” / “Über einen Link empfangen”. The
+native dialog discloses local HTTP, retains the address after validation failure
+and leads to the existing PIN and file-selection review. PIN text distinguishes
+incoming download offers from outgoing uploads. The isolated GTK regression and
+the real daemon reverse-download integration passed. Root inspected the fully
+opened German dialog at 480x600 in
+`ui/completion/download-offer-review.png`; all text, input and actions fit.
+The visible desktop demo was not restarted. Existing broader desktop acceptance
+items above remain open.

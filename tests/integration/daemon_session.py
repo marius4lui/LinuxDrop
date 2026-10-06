@@ -3,6 +3,7 @@
 Run: dbus-run-session -- python3 tests/integration/daemon_session.py /path/linuxdropd
 """
 import concurrent.futures
+import http.server
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import urllib.error
 import urllib.request
 from gi.repository import Gio, GLib
@@ -165,9 +167,58 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             except GLib.Error as error:
                 assert "No enabled IPv4 LAN interface" in str(error), str(error)
         call("DiscardDraft", "(s)", (draft,))
+        wait(lambda: any(b["id"] == "localsend" and b["state"] == "unavailable" for b in snapshot()["backends"]))
+        # Explicit reverse reception remains available while hidden, but the
+        # daemon must require the PIN and actual receive consent before payload.
+        downloads = []
+        class OfferHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                if self.path != "/api/localsend/v2/prepare-download?pin=424242":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                body = json.dumps({"info": {"alias": "Download sender", "fingerprint": "download-fixture"},
+                    "sessionId": "download-session", "files": {"one": {"id": "one", "fileName": "downloaded.txt",
+                    "size": 8, "fileType": "text/plain"}}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def do_GET(self):
+                downloads.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "8")
+                self.end_headers()
+                self.wfile.write(b"download")
+        offer = http.server.ThreadingHTTPServer(("127.0.0.1", 0), OfferHandler)
+        thread = threading.Thread(target=offer.serve_forever, daemon=True)
+        thread.start()
+        try:
+            transfer_id = call("ReceiveDownloadOffer", "(s)", (f"http://127.0.0.1:{offer.server_port}",))
+            def download_state(state):
+                return next((t for t in snapshot()["transfers"] if t["id"] == transfer_id and t["state"] == state), None)
+            wait(lambda: download_state("pin_required"))
+            assert not downloads
+            call("ProvideTransferPin", "(ss)", (transfer_id, "424242"))
+            waiting = wait(lambda: download_state("waiting"))
+            assert waiting["direction"] == "incoming" and waiting["peer_name"] == "Download sender"
+            assert not downloads
+            chosen = root / "reverse-received"
+            call("AcceptTransferWithOptions", "(ss)", (transfer_id, json.dumps({"directory": str(chosen), "selected_indices": [0]})))
+            received = wait(lambda: download_state("completed"))
+            assert received["transferred_bytes"] == 8
+            assert (chosen / "downloaded.txt").read_bytes() == b"download"
+            assert len(downloads) == 1
+            assert snapshot()["settings"]["visibility"]["mode"] == "hidden"
+        finally:
+            offer.shutdown()
+            offer.server_close()
+            thread.join(timeout=2)
         call("StopWhenIdle")
         assert daemon.wait(timeout=5) == 0
-        print("PASS actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, idle shutdown")
+        print("PASS actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, reverse-download PIN and consent while hidden, idle shutdown")
     finally:
         daemon.terminate()
         try:

@@ -521,6 +521,48 @@ impl Manager {
     async fn stop_download_offer(&self) {
         self.0.download_offer.lock().await.take();
     }
+    async fn receive_download_offer(&self, url: String) -> zbus::fdo::Result<String> {
+        if self.0.locked.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(failed("Unlock the session to receive files"));
+        }
+        let mut d = self.0.data.lock().await;
+        if d.stop_when_idle {
+            return Err(failed("LinuxDrop is stopping"));
+        }
+        if d.transfers
+            .values()
+            .filter(|transfer| !transfer.is_terminal())
+            .count()
+            >= d.settings["transfers"]["max_parallel"].as_u64().unwrap() as usize
+        {
+            return Err(failed("Parallel transfer limit reached"));
+        }
+        let (address, _) =
+            linuxdrop_localsend::download::offer_address(&url, &transfer_policy(&d.settings))
+                .map_err(failed)?;
+        if d.settings["localsend"]["enabled"] != true {
+            return Err(failed("Enable LocalSend before receiving a download offer"));
+        }
+        let sender = d
+            .commands
+            .get("localsend")
+            .ok_or_else(|| failed("LocalSend is restarting or unavailable; wait for its status or restart it from Settings"))?;
+        let id = Uuid::new_v4().to_string();
+        sender
+            .try_send(BackendCommand::ReceiveOffer {
+                transfer_id: id.clone(),
+                url,
+            })
+            .map_err(failed)?;
+        d.transfer_order.push(id.clone());
+        d.transfers.insert(
+            id.clone(),
+            linuxdrop_localsend::download::pending_transfer(id.clone(), address),
+        );
+        drop(d);
+        self.0.changed().await;
+        Ok(id)
+    }
     async fn start_send(
         &self,
         draft_id: String,
@@ -630,7 +672,7 @@ impl Manager {
             .transfers
             .get(&id)
             .ok_or_else(|| failed("Unknown transfer"))?;
-        if t.state != "pin_required" || t.direction != "outgoing" || t.protocol != "localsend" {
+        if t.state != "pin_required" || t.protocol != "localsend" {
             return Err(failed("Transfer is not awaiting a PIN"));
         }
         d.commands

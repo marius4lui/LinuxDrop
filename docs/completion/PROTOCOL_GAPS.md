@@ -16,7 +16,7 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] HTTP registration reply to multicast announcement, with UDP fallback; interface-scoped multicast and LAN-only reachability policy.
 - [x] Allowed network interfaces, VPN/virtual exclusions, upload request rate limits, shared bandwidth policy.
 - [x] Live IPv4 address/interface reconciliation with listener and discovery retirement, stale-peer removal and preservation of connections on unaffected interfaces.
-- [ ] Download API client usable through explicit peer offers (server implementation already present).
+- [x] Download API client usable through explicit local HTTP offers, native link entry, PIN challenge, receive review and selected-file publication.
 
 ## Quick Share / Nearby Share (one backend)
 
@@ -204,3 +204,32 @@ pinned mDNS library's append-only interface-selection history: repeated runtime
 reconfiguration needs a bounded daemon refresh strategy and an accompanying
 long-running discovery/cache check. IPv6 and full P2P negotiation remain active
 software work, not device-only acceptance exceptions.
+
+## Native LocalSend download reception, 2026-10-06
+
+`ReceiveDownloadOffer` starts a tracked incoming transfer from an explicitly
+entered local HTTP link. The Transfers page exposes the native entry dialog.
+Metadata and PIN negotiation precede the existing receive review; only accepted
+files are requested, using the chosen destination and collision policy. An
+explicit download works while hidden without enabling unsolicited reception.
+Parallel limits, blocked-peer decisions, lock-state checks and normal history
+and completion handling remain in the daemon. Reverse-only endpoints are not
+incorrectly added to the nearby upload-device list.
+
+The client accepts literal on-link addresses under the network policy, binds its
+source interface and rejects URL credentials, extra paths/queries/fragments,
+website names and redirects. Metadata size, file count, names, lengths and
+optional checksums are checked. PIN waits, consent waits, response/stream waits
+and cancellation are bounded; payloads use the shared bandwidth budget. Partial
+files are removed on failure, and request errors omit URLs containing session
+tokens or PINs. HTTP is disclosed in the dialog, as required for browser-style
+LocalSend download interoperability; it is not represented as encrypted sharing.
+
+Verification: 46 workspace tests passed, including real HTTP offers with wrong
+PIN retry, partial selection, empty files, collisions, traversal, size/checksum
+failures and cancellation. The actual daemon D-Bus/HTTPS integration additionally
+exercises reverse-download PIN and consent while hidden and verifies saved bytes.
+The native GTK regression passed separately; the final rendered 480x600 German
+dialog was inspected at `docs/acceptance/ui/completion/download-offer-review.png`.
+This pass does not establish official-client or physical-device acceptance, and
+the final installation packages still need rebuilding.

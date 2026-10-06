@@ -170,6 +170,7 @@ pub(crate) mod tests {
             registration_gate: rate::RequestGate::new(120, Duration::from_secs(60)),
             pin_gate: rate::RequestGate::new(6, Duration::from_secs(60)),
             pin_requests: Mutex::new(HashMap::new()),
+            download_decisions: Mutex::new(HashMap::new()),
             interfaces: std::sync::RwLock::new(
                 linuxdrop_network::interfaces(&config.policy, true).unwrap(),
             ),
