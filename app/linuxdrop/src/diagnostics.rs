@@ -72,19 +72,25 @@ pub fn add_actions(ui: &Rc<Ui>, group: &adw::PreferencesGroup) -> Vec<(gtk::Widg
 }
 
 fn confirm(ui: &Rc<Ui>, method: &'static str, title: &str, description: &str) {
-    let active = ui.snapshot.borrow()["transfers"]
-        .as_array()
-        .is_some_and(|transfers| {
-            transfers.iter().any(|transfer| {
-                !matches!(
-                    transfer["state"].as_str(),
-                    Some("completed" | "rejected" | "cancelled" | "failed")
-                )
-            })
-        });
+    let link_active = ui.snapshot.borrow()["download_link_active"] == true;
+    let active = link_active
+        || ui.snapshot.borrow()["transfers"]
+            .as_array()
+            .is_some_and(|transfers| {
+                transfers.iter().any(|transfer| {
+                    !matches!(
+                        transfer["state"].as_str(),
+                        Some("completed" | "rejected" | "cancelled" | "failed")
+                    )
+                })
+            });
     let dialog = adw::AlertDialog::builder()
         .heading(tr(title))
-        .body(tr(description))
+        .body(tr(if link_active {
+            "Stop the download link before restarting sharing or changing network settings"
+        } else {
+            description
+        }))
         .build();
     dialog.add_responses(&[("cancel", &tr("Cancel")), ("apply", &tr(title))]);
     dialog.set_close_response("cancel");

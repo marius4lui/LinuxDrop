@@ -79,6 +79,16 @@ listener task also waits for the connection watcher count to reach zero: the
 server's forced-shutdown return alone does not prove that accepted TLS sockets
 have closed. Quick Share waits for its engine tracker; AirDrop waits for its
 connection/transfer tracker, cancellation guards and mDNS shutdown response.
-BlueZ unregister acknowledgements, helper-loss recovery and reverse-download
-listener shutdown remain separate lifecycle work; this receipt is not a claim
-that those outstanding paths have been verified.
+BlueZ unregister acknowledgements and helper-loss recovery remain separate
+lifecycle work; this receipt is not a claim that those outstanding paths have
+been verified.
+
+Reverse-download links use the same persistent shutdown receipt. Revocation and
+expiry force-close HTTP connections and await tracked file reads before port
+reuse. Pending/failed cleanup remains visible through `download_link_active`.
+Explicit revocation cancels streams; StopWhenIdle closes admission under the
+same lock used to acquire stream permits and lets existing downloads finish.
+A live link blocks backend restarts/network-setting changes. Replacing a link
+requires it to have no active streams, then waits for confirmed shutdown; failed
+replacement keeps the prepared file selection. The Transfers page exposes a
+persistent stop action with retry on failure.

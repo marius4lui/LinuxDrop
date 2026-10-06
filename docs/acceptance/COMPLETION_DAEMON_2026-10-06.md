@@ -48,3 +48,28 @@ The existing 0.1.0 release packages must be rebuilt before delivering these chan
 
 These checks do not cover BlueZ unregister acknowledgement, helper-loss recovery,
 reverse-offer drain or installed-package acceptance. No live demo was restarted.
+
+## 2026-10-07: link lifetime and idle shutdown
+
+- ReverseOffer now confirms HTTP connection and blocking-file-reader cleanup on
+  stop/expiry; same-port replacement no longer uses a fixed 100 ms sleep. Cleanup
+  timeout/failure stays observable and retryable through ShutdownReceipt.
+- Admission quiescing preserves already-admitted payloads for StopWhenIdle. New
+  requests are rejected. Explicit stop still cancels active payloads. Link
+  replacement refuses active streams atomically and preserves the prepared draft.
+- Live links block network settings/restarts; snapshot `download_link_active`
+  exposes sharing state without publishing PINs/URLs. Failed cleanup remains
+  visible until a successful receipt.
+- Core and LocalSend tests: 21 passed, including blocked payload cancellation,
+  partial HTTP requests, expiry, port reuse and quiescing with exact saved bytes.
+  Daemon unit tests: 5 passed. Workspace/all-target Clippy passed.
+- The extended private-network/document-portal integration passed with actual
+  D-Bus/HTTP: active-link restart protection, confirmed revocation, immediate
+  same-port replacement, refused replacement during a download, HTTP 410 after
+  idle quiescing and a complete 512 KiB payload before daemon exit.
+- The ordinary daemon HTTPS/consent integration passed. Native German GTK
+  regression passed, including failed-stop visibility and retry. The 480x600
+  active-link card was rendered and inspected (`ui/completion/active-download-link.png`).
+
+No running demo or installed package was changed. BlueZ unregister and helper-loss
+recovery are still separate open lifecycle work.

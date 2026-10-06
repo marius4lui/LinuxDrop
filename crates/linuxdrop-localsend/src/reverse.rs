@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_SESSIONS: usize = 16;
+const MAX_DOWNLOADS: usize = 16;
 const MAX_ATTEMPT_IPS: usize = 256;
 
 pub struct OfferConfig {
@@ -38,10 +39,42 @@ pub struct ReverseOffer {
     pub address: SocketAddr,
     pub pin: String,
     stop: CancellationToken,
+    completion: linuxdrop_core::ShutdownReceipt,
+    accepting: Arc<std::sync::Mutex<bool>>,
+    downloads: Arc<Semaphore>,
 }
 impl ReverseOffer {
     pub fn stop(&self) {
         self.stop.cancel();
+    }
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.stop.cancel();
+        self.completion.wait().await
+    }
+    pub fn is_active(&self) -> bool {
+        // Keep an unresolved cleanup visible and retryable after cancellation.
+        !self.completion.is_complete()
+    }
+    /// Close admission without interrupting streams that already hold a permit.
+    pub fn quiesce(&self) {
+        *self
+            .accepting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = false;
+    }
+    pub fn quiesce_if_idle(&self) -> bool {
+        let mut accepting = self
+            .accepting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.active_downloads() != 0 {
+            return false;
+        }
+        *accepting = false;
+        true
+    }
+    pub fn active_downloads(&self) -> usize {
+        MAX_DOWNLOADS - self.downloads.available_permits()
     }
 }
 impl Drop for ReverseOffer {
@@ -67,6 +100,8 @@ struct DownloadSession {
     ip: IpAddr,
 }
 struct OfferState {
+    accepting: Arc<std::sync::Mutex<bool>>,
+    readers: tokio_util::task::TaskTracker,
     bandwidth: linuxdrop_network::BandwidthLimiter,
     alias: String,
     fingerprint: String,
@@ -110,7 +145,12 @@ struct Prepared {
 }
 impl OfferState {
     fn active(&self) -> bool {
-        !self.stop.is_cancelled() && self.created.elapsed() < self.expires_after
+        !self.stop.is_cancelled()
+            && self.created.elapsed() < self.expires_after
+            && *self
+                .accepting
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
     }
     fn info(&self) -> Info {
         Info {
@@ -193,7 +233,12 @@ pub async fn start_sources_with_budget(
         u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000
     );
     let stop = CancellationToken::new();
+    let accepting = Arc::new(std::sync::Mutex::new(true));
+    let downloads = Arc::new(Semaphore::new(MAX_DOWNLOADS));
+    let readers = tokio_util::task::TaskTracker::new();
     let state = Arc::new(OfferState {
+        accepting: accepting.clone(),
+        readers: readers.clone(),
         bandwidth,
         alias: config.alias,
         fingerprint: Uuid::new_v4().to_string(),
@@ -203,7 +248,7 @@ pub async fn start_sources_with_budget(
         files,
         sessions: Mutex::new(HashMap::new()),
         attempts: Mutex::new(HashMap::new()),
-        downloads: Arc::new(Semaphore::new(16)),
+        downloads: downloads.clone(),
         stop: stop.clone(),
     });
     let router = Router::new()
@@ -216,18 +261,40 @@ pub async fn start_sources_with_budget(
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     let address = listener.local_addr()?;
     let cancel = stop.clone();
-    tokio::spawn(async move {
-        let lifetime = async move {
-            tokio::select! {_=cancel.cancelled()=>{},_=tokio::time::sleep(config.expires_after)=>{cancel.cancel();}}
+    let task = tokio::spawn(async move {
+        let handle = axum_server::Handle::new();
+        let server = axum_server::from_tcp(listener.into_std().map_err(|error| error.to_string())?)
+            .handle(handle.clone())
+            .serve(router.into_make_service_with_connect_info::<SocketAddr>());
+        tokio::pin!(server);
+        let result = tokio::select! {
+            result = &mut server => result,
+            _ = async {
+                tokio::select! { _ = cancel.cancelled() => {}, _ = tokio::time::sleep(config.expires_after) => {} }
+            } => {
+                cancel.cancel();
+                handle.shutdown();
+                server.await
+            },
         };
-        let _ = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(lifetime)
-        .await;
+        cancel.cancel();
+        handle.shutdown();
+        // Forced shutdown returns before detached HTTP connections are dropped.
+        while handle.connection_count() != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        readers.close();
+        readers.wait().await;
+        result.map_err(|error| error.to_string())
     });
-    Ok(ReverseOffer { address, pin, stop })
+    Ok(ReverseOffer {
+        address,
+        pin,
+        stop,
+        accepting,
+        downloads,
+        completion: linuxdrop_core::ShutdownReceipt::track(task),
+    })
 }
 
 async fn info(State(state): State<Arc<OfferState>>) -> Response {
@@ -317,8 +384,18 @@ async fn download(
     let Some(source) = state.files.get(&query.file_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(permit) = state.downloads.clone().try_acquire_owned() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    let permit = {
+        let accepting = state
+            .accepting
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !*accepting || state.stop.is_cancelled() {
+            return StatusCode::GONE.into_response();
+        }
+        let Ok(permit) = state.downloads.clone().try_acquire_owned() else {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        };
+        permit
     };
     if source.file.metadata().map(|m| m.len()).ok() != Some(source.metadata.size) {
         return StatusCode::CONFLICT.into_response();
@@ -326,48 +403,53 @@ async fn download(
     let file = source.file.clone();
     let size = source.metadata.size;
     let stop = state.stop.clone();
+    let readers = state.readers.clone();
     let stream = futures_util::stream::try_unfold(
         (file, 0u64, stop, permit, state.bandwidth.clone()),
-        move |(file, offset, stop, permit, bandwidth)| async move {
-            if stop.is_cancelled() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "Offer ended",
-                ));
-            }
-            if offset == size {
-                return Ok(None);
-            }
-            let handle = file.clone();
-            let bytes = tokio::task::spawn_blocking(move || {
-                let mut bytes = vec![0u8; ((size - offset).min(64 * 1024)) as usize];
-                #[cfg(unix)]
-                let count = {
-                    use std::os::unix::fs::FileExt;
-                    handle.read_at(&mut bytes, offset)?
-                };
-                #[cfg(windows)]
-                let count = {
-                    use std::os::windows::fs::FileExt;
-                    handle.seek_read(&mut bytes, offset)?
-                };
-                if count == 0 {
+        move |(file, offset, stop, permit, bandwidth)| {
+            let readers = readers.clone();
+            async move {
+                if stop.is_cancelled() {
                     return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "Source changed during download",
+                        std::io::ErrorKind::Interrupted,
+                        "Offer ended",
                     ));
                 }
-                bytes.truncate(count);
-                Ok::<_, std::io::Error>(bytes)
-            })
-            .await
-            .map_err(std::io::Error::other)??;
-            bandwidth
-                .acquire(bytes.len(), &stop)
-                .await
-                .map_err(std::io::Error::other)?;
-            let next = offset + bytes.len() as u64;
-            Ok(Some((bytes, (file, next, stop, permit, bandwidth))))
+                if offset == size {
+                    return Ok(None);
+                }
+                let handle = file.clone();
+                let bytes = readers
+                    .spawn_blocking(move || {
+                        let mut bytes = vec![0u8; ((size - offset).min(64 * 1024)) as usize];
+                        #[cfg(unix)]
+                        let count = {
+                            use std::os::unix::fs::FileExt;
+                            handle.read_at(&mut bytes, offset)?
+                        };
+                        #[cfg(windows)]
+                        let count = {
+                            use std::os::windows::fs::FileExt;
+                            handle.seek_read(&mut bytes, offset)?
+                        };
+                        if count == 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "Source changed during download",
+                            ));
+                        }
+                        bytes.truncate(count);
+                        Ok::<_, std::io::Error>(bytes)
+                    })
+                    .await
+                    .map_err(std::io::Error::other)??;
+                bandwidth
+                    .acquire(bytes.len(), &stop)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let next = offset + bytes.len() as u64;
+                Ok(Some((bytes, (file, next, stop, permit, bandwidth))))
+            }
         },
     );
     let encoded = source
@@ -507,10 +589,123 @@ mod tests {
             .await
             .unwrap();
         assert!(refresh.status().is_success());
-        offer.stop();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        offer.shutdown().await.unwrap();
         assert!(client.get(&url).send().await.is_err());
     }
+    async fn slow_offer(
+        root: &std::path::Path,
+        expires_after: Duration,
+        rate: u64,
+    ) -> (ReverseOffer, String) {
+        let path = root.join("stream.bin");
+        std::fs::write(&path, vec![42u8; 16_384]).unwrap();
+        let offer = start_offer_with_budget(
+            OfferConfig {
+                alias: "Lifecycle test".into(),
+                bind: "127.0.0.1:0".parse().unwrap(),
+                expires_after,
+                max_files: 1,
+                max_bytes: 16_384,
+            },
+            vec![path],
+            linuxdrop_network::BandwidthLimiter::new(Some(rate)),
+        )
+        .await
+        .unwrap();
+        let prepared: serde_json::Value = reqwest::Client::new()
+            .post(format!(
+                "http://{}/api/localsend/v2/prepare-download?pin={}",
+                offer.address, offer.pin
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let session = prepared["sessionId"].as_str().unwrap();
+        let file = prepared["files"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap();
+        let url = format!(
+            "http://{}/api/localsend/v2/download?sessionId={session}&fileId={file}",
+            offer.address
+        );
+        (offer, url)
+    }
+    async fn wait_for_download(offer: &ReverseOffer) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while offer.active_downloads() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn quiescing_preserves_admitted_downloads_and_rejects_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let (offer, url) = slow_offer(dir.path(), Duration::from_secs(60), 16_384).await;
+        let target = url.clone();
+        let download =
+            tokio::spawn(async move { reqwest::get(target).await.unwrap().bytes().await.unwrap() });
+        wait_for_download(&offer).await;
+        assert!(
+            !offer.quiesce_if_idle(),
+            "Replacing a link may not cancel an active stream"
+        );
+        offer.quiesce();
+        assert_eq!(reqwest::get(url).await.unwrap().status(), StatusCode::GONE);
+        assert_eq!(download.await.unwrap().as_ref(), vec![42u8; 16_384]);
+        assert_eq!(offer.active_downloads(), 0);
+        offer.shutdown().await.unwrap();
+    }
+    #[tokio::test]
+    async fn stop_and_expiry_drain_streams_and_incomplete_requests_before_port_reuse() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for explicit_stop in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let lifetime = if explicit_stop {
+                Duration::from_secs(60)
+            } else {
+                Duration::from_millis(250)
+            };
+            let (offer, url) = slow_offer(dir.path(), lifetime, 1).await;
+            let download = tokio::spawn(async move {
+                match reqwest::get(url).await {
+                    Ok(response) => response.bytes().await,
+                    Err(error) => Err(error),
+                }
+            });
+            wait_for_download(&offer).await;
+            let mut incomplete = tokio::net::TcpStream::connect(offer.address).await.unwrap();
+            incomplete
+                .write_all(b"GET / HTTP/1.1\r\nHost:")
+                .await
+                .unwrap();
+            if explicit_stop {
+                offer.shutdown().await.unwrap();
+            } else {
+                offer.completion.wait().await.unwrap();
+            }
+            assert!(
+                download.await.unwrap().is_err(),
+                "Revocation must terminate the blocked body"
+            );
+            assert_eq!(offer.active_downloads(), 0);
+            assert!(!offer.is_active());
+            let mut tail = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(1), incomplete.read_to_end(&mut tail))
+                .await
+                .unwrap();
+            let _replacement = tokio::net::TcpListener::bind(offer.address).await.unwrap();
+            offer.shutdown().await.unwrap(); // persistent receipt
+        }
+    }
+
     #[tokio::test]
     async fn repeated_bad_codes_are_rate_limited() {
         let dir = tempfile::tempdir().unwrap();

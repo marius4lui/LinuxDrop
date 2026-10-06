@@ -139,7 +139,13 @@ impl Shared {
                 value
             })
             .collect();
-        json!({"restarting":d.restarting,"epoch":d.epoch,"revision":d.revision,"peers":peers,"known_peers":known_peers,"transfers":transfers,"backends":d.backends.values().collect::<Vec<_>>(),"hardware":d.hardware,"settings":d.settings}).to_string()
+        let download_link_active = self
+            .download_offer
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|offer| offer.is_active());
+        json!({"download_link_active":download_link_active,"restarting":d.restarting,"epoch":d.epoch,"revision":d.revision,"peers":peers,"known_peers":known_peers,"transfers":transfers,"backends":d.backends.values().collect::<Vec<_>>(),"hardware":d.hardware,"settings":d.settings}).to_string()
     }
     async fn action(&self, id: &str, action: &str) -> zbus::fdo::Result<()> {
         if action == "accept" {
@@ -427,6 +433,18 @@ impl Manager {
                 "Finish or cancel active transfers before restarting",
             ));
         }
+        if self
+            .0
+            .download_offer
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|offer| offer.is_active())
+        {
+            return Err(failed(
+                "Stop the download link before restarting sharing or changing network settings",
+            ));
+        }
         let permit = self.0.restart.try_reserve().map_err(failed)?;
         d.restarting = true;
         permit.send(());
@@ -435,9 +453,14 @@ impl Manager {
         Ok(())
     }
     async fn stop_when_idle(&self) -> zbus::fdo::Result<()> {
+        {
+            let mut d = self.0.data.lock().await;
+            if let Some(offer) = self.0.download_offer.lock().await.as_ref() {
+                offer.quiesce();
+            }
+            d.stop_when_idle = true;
+        }
         self.set_visibility("hidden".into()).await?;
-        self.0.download_offer.lock().await.take();
-        self.0.data.lock().await.stop_when_idle = true;
         Ok(())
     }
     async fn reset_settings(&self) -> zbus::fdo::Result<()> {
@@ -573,10 +596,12 @@ impl Manager {
             .ok_or_else(|| {
                 failed("No enabled IPv4 LAN interface for a download link; check network settings")
             })?;
-        let draft = d
+        let sources = d
             .drafts
-            .remove(&draft_id)
-            .ok_or_else(|| failed("File selection expired"))?;
+            .get(&draft_id)
+            .ok_or_else(|| failed("File selection expired"))?
+            .files
+            .clone();
         let config = linuxdrop_localsend::reverse::OfferConfig {
             alias: d.settings["general"]["device_name"]
                 .as_str()
@@ -588,20 +613,37 @@ impl Manager {
             max_bytes: d.settings["receive"]["max_bytes"].as_u64().unwrap(),
         };
         let mut current = self.0.download_offer.lock().await;
+        if let Some(offer) = current.as_ref() {
+            if !offer.quiesce_if_idle() {
+                return Err(failed(
+                    "Finish or stop the current download before creating another link",
+                ));
+            }
+            offer.shutdown().await.map_err(failed)?;
+        }
         current.take();
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let budget = self.0.bandwidth.lock().await.clone();
         let offer =
-            linuxdrop_localsend::reverse::start_sources_with_budget(config, draft.files, budget)
+            linuxdrop_localsend::reverse::start_sources_with_budget(config, sources, budget)
                 .await
                 .map_err(failed)?;
         let result=json!({"url":format!("http://{}",offer.address),"pin":offer.pin,"expires_in":600,"encrypted":false}).to_string();
         *current = Some(offer);
+        d.drafts.remove(&draft_id);
+        drop(current);
         drop(d); // Offer publication is serialized with restart admission.
+        self.0.changed().await;
         Ok(result)
     }
-    async fn stop_download_offer(&self) {
-        self.0.download_offer.lock().await.take();
+    async fn stop_download_offer(&self) -> zbus::fdo::Result<()> {
+        let mut current = self.0.download_offer.lock().await;
+        if let Some(offer) = current.as_ref() {
+            offer.shutdown().await.map_err(failed)?;
+        }
+        current.take();
+        drop(current);
+        self.0.changed().await;
+        Ok(())
     }
     async fn receive_download_offer(&self, url: String) -> zbus::fdo::Result<String> {
         if self.0.locked.load(std::sync::atomic::Ordering::Relaxed) {
@@ -871,6 +913,18 @@ impl Manager {
         let restart = settings::needs_backend_restart(&d.settings, &next);
         if restart {
             d.accepting_transfers()?;
+            if self
+                .0
+                .download_offer
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|offer| offer.is_active())
+            {
+                return Err(failed(
+                    "Stop the download link before restarting sharing or changing network settings",
+                ));
+            }
         }
         let restart_permit = if restart {
             Some(self.0.restart.try_reserve().map_err(failed)?)
@@ -1013,6 +1067,17 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
             }
         }
     }
+    {
+        let mut current = shared.download_offer.lock().await;
+        if let Some(offer) = current.as_ref() {
+            match offer.shutdown().await {
+                Ok(()) => {
+                    current.take();
+                }
+                Err(error) => failures.push(format!("Download link: {error}")),
+            }
+        }
+    }
     if !failures.is_empty() {
         let mut d = shared.data.lock().await;
         for state in d.backends.values_mut() {
@@ -1026,7 +1091,6 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     }
     shared.helper.lock().await.take();
     shared.quickshare_helper.lock().await.take();
-    shared.download_offer.lock().await.take();
     let bandwidth = linuxdrop_network::BandwidthLimiter::new(
         transfer_policy(&settings).bandwidth_bytes_per_second,
     );
@@ -1527,7 +1591,8 @@ async fn main() -> Result<()> {
             _=shutdown_tick.tick()=>{
                 let mut d=shared.data.lock().await;
                 d.drafts.retain(|_, draft| draft.created.elapsed() < Duration::from_secs(1800));
-                if d.stop_when_idle && !d.transfers.values().any(|t|!t.is_terminal()) {break;}
+                if d.stop_when_idle && !d.transfers.values().any(|t|!t.is_terminal())
+                    && shared.download_offer.lock().await.as_ref().is_none_or(|offer| offer.active_downloads() == 0) {break;}
             },
             Some((generation,event))=event_rx.recv()=>{
                 if generation != shared.backend_generation.load(std::sync::atomic::Ordering::Acquire) {continue;}
@@ -1579,6 +1644,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+    if let Some(offer) = shared.download_offer.lock().await.as_ref() {
+        offer.shutdown().await.map_err(anyhow::Error::msg)?;
     }
     for tx in shared.data.lock().await.commands.values() {
         let _ = tx.send(BackendCommand::Shutdown).await;

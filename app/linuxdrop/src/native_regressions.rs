@@ -83,19 +83,32 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let fail_next_accept = Rc::new(Cell::new(false));
     let batches = Rc::new(RefCell::new(Vec::new()));
     let discarded = Rc::new(Cell::new(false));
-    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
+    let fail_next_stop = Rc::new(Cell::new(true));
+    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='StopDownloadOffer'/><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
     let accepted = accepted_options.clone();
     let fail_accept = fail_next_accept.clone();
     let sent_batches = batches.clone();
     let was_discarded = discarded.clone();
+    let fail_stop = fail_next_stop.clone();
     let registration = bus
         .register_object(ipc::PATH, &info.interfaces()[0])
         .method_call(
             move |_, _, _, _, method, parameters, invocation| match method {
                 "GetSnapshot" => {
                     invocation.return_value(Some(&(state.borrow().to_string(),).to_variant()))
+                }
+                "StopDownloadOffer" => {
+                    if fail_stop.replace(false) {
+                        invocation.return_dbus_error(
+                            "io.github.marius4lui.Error",
+                            "Cleanup still running",
+                        );
+                    } else {
+                        state.borrow_mut()["download_link_active"] = json!(false);
+                        invocation.return_value(None);
+                    }
                 }
                 "PrepareSendFiles" => {
                     use std::os::fd::FromRawFd;
@@ -358,6 +371,20 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         ui.refresh();
         settle().await;
         assert!(!ui.settings_status.is_visible(), "Recovery removes stale apply errors");
+        snapshot.borrow_mut()["download_link_active"] = json!(true);
+        ui.refresh();
+        settle().await;
+        ui.stack.set_visible_child_name("transfers");
+        settle().await;
+        assert!(ui.download_link.is_visible());
+        capture(&ui, "active-download-link.png");
+        ui.stop_link.emit_clicked();
+        settle().await;
+        assert!(ui.download_link.is_visible(), "A failed revocation may not hide the active link");
+        assert!(ui.stop_link.is_sensitive(), "A failed stop must remain retryable");
+        ui.stop_link.emit_clicked();
+        settle().await;
+        assert!(!ui.download_link.is_visible());
         ui.allow_close.set(true);
         ui.window.close();
     });

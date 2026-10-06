@@ -146,3 +146,13 @@ applying -> error -> offline -> recovered states, the Details navigation and
 search-widget identity. The rendered 480x600 view was inspected:
 `ui/completion/settings-apply-error.png`. All status text, actions, search and
 bottom navigation fit. No running user demo was restarted.
+
+## 2026-10-07: persistent link revocation
+
+The Transfers page shows an active-link card with an explicit stop action and
+explains that stopping cancels its downloads. It remains visible after a failed
+stop so the user can retry; it disappears only when the daemon reports completed
+cleanup. Restart/reset dialogs explain why a live link must be stopped first.
+The private GTK regression tested stop failure then successful retry. The German
+480x600 render `ui/completion/active-download-link.png` fits the text, button,
+transfer progress and navigation without overlap.

@@ -129,11 +129,55 @@ pub enum BackendEvent {
 }
 
 pub type EventSender = tokio::sync::mpsc::Sender<BackendEvent>;
+/// Persistent completion result; waiting never aborts the tracked cleanup task.
+#[derive(Debug, Clone)]
+pub struct ShutdownReceipt {
+    completion: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+impl ShutdownReceipt {
+    pub fn track(task: tokio::task::JoinHandle<Result<(), String>>) -> Self {
+        let (finished, completion) = tokio::sync::watch::channel(None);
+        tokio::spawn(async move {
+            let result = task
+                .await
+                .unwrap_or_else(|error| Err(format!("Service cleanup task failed: {error}")));
+            finished.send_replace(Some(result));
+        });
+        Self { completion }
+    }
+    pub fn is_finished(&self) -> bool {
+        self.completion.borrow().is_some()
+    }
+    pub fn is_complete(&self) -> bool {
+        matches!(*self.completion.borrow(), Some(Ok(())))
+    }
+    async fn result(&self) -> Result<(), String> {
+        let mut completion = self.completion.clone();
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            completion
+                .changed()
+                .await
+                .map_err(|_| "Service ended without a cleanup receipt".to_owned())?;
+        }
+    }
+    pub async fn wait(&self) -> Result<(), String> {
+        tokio::time::timeout(std::time::Duration::from_secs(20), self.result())
+            .await
+            .map_err(|_| {
+                "Service resources have not stopped within 20 seconds; retry after cleanup finishes"
+                    .to_owned()
+            })?
+    }
+}
+
 /// Commands and a persistent receipt for the backend's complete cleanup.
 #[derive(Debug, Clone)]
 pub struct CommandSender {
     commands: tokio::sync::mpsc::Sender<BackendCommand>,
-    completion: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+    completion: ShutdownReceipt,
 }
 impl std::ops::Deref for CommandSender {
     type Target = tokio::sync::mpsc::Sender<BackendCommand>;
@@ -146,33 +190,17 @@ impl CommandSender {
         commands: tokio::sync::mpsc::Sender<BackendCommand>,
         task: tokio::task::JoinHandle<Result<(), String>>,
     ) -> Self {
-        let (finished, completion) = tokio::sync::watch::channel(None);
-        tokio::spawn(async move {
-            let result = task
-                .await
-                .unwrap_or_else(|error| Err(format!("Backend cleanup task failed: {error}")));
-            finished.send_replace(Some(result));
-        });
         Self {
             commands,
-            completion,
+            completion: ShutdownReceipt::track(task),
         }
     }
     pub async fn shutdown(&self) -> Result<(), String> {
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
-            let mut completion = self.completion.clone();
-            if completion.borrow().is_none() {
+            if !self.completion.is_finished() {
                 let _ = self.commands.send(BackendCommand::Shutdown).await;
             }
-            loop {
-                if let Some(result) = completion.borrow().clone() {
-                    return result;
-                }
-                completion
-                    .changed()
-                    .await
-                    .map_err(|_| "Backend ended without a cleanup receipt".to_owned())?;
-            }
+            self.completion.result().await
         })
         .await
         .map_err(|_| {
@@ -239,9 +267,11 @@ mod shutdown_tests {
         );
         tokio::time::advance(std::time::Duration::from_secs(21)).await;
         assert!(shutdown.await.unwrap().unwrap_err().contains("retry"));
+        assert!(!handle.completion.is_complete());
         // A timeout must not abort the backend or lose the eventual receipt.
         release.send(()).unwrap();
         handle.shutdown().await.unwrap();
+        assert!(handle.completion.is_complete());
         handle.shutdown().await.unwrap();
     }
 
@@ -256,5 +286,9 @@ mod shutdown_tests {
         let error = handle.shutdown().await.unwrap_err();
         assert!(error.contains("cleanup task failed"));
         assert_eq!(handle.shutdown().await.unwrap_err(), error);
+        assert!(
+            !handle.completion.is_complete(),
+            "Failed cleanup remains unresolved"
+        );
     }
 }

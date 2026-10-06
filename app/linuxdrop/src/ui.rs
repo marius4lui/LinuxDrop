@@ -32,6 +32,9 @@ pub struct Ui {
     share_link: gtk::Button,
     send_caption: gtk::Label,
     transfers: gtk::Box,
+    download_link: adw::PreferencesGroup,
+    stop_link: gtk::Button,
+    stopping_link: Cell<bool>,
     hardware: gtk::Box,
     pub settings_body: gtk::Box,
     pub settings_status: adw::PreferencesGroup,
@@ -292,6 +295,19 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     receive_link.set_halign(gtk::Align::Start);
     receive_link.add_css_class("pill");
     transfer_page.append(&receive_link);
+    let download_link = adw::PreferencesGroup::new();
+    download_link.set_visible(false);
+    let link_row = adw::ActionRow::builder()
+        .title(tr("Download link is active"))
+        .subtitle(tr("Stopping the link also cancels its active downloads."))
+        .subtitle_lines(0)
+        .build();
+    let stop_link = gtk::Button::with_label(&tr("Stop sharing"));
+    stop_link.set_valign(gtk::Align::Center);
+    stop_link.set_tooltip_text(Some(&tr("Stop sharing this download link")));
+    link_row.add_suffix(&stop_link);
+    download_link.add(&link_row);
+    transfer_page.append(&download_link);
     transfer_page.append(&transfers);
     stack.add_titled_with_icon(
         &page(&transfer_page),
@@ -360,6 +376,9 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         share_link,
         send_caption,
         transfers,
+        download_link,
+        stop_link,
+        stopping_link: Cell::new(false),
         hardware,
         settings_body,
         settings_status,
@@ -381,6 +400,26 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         transfer_progress: RefCell::new(HashMap::new()),
     });
 
+    let weak = Rc::downgrade(&ui);
+    ui.stop_link.connect_clicked(move |_| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Some(proxy) = ui.proxy.borrow().clone() else {
+            ui.toast("The sharing service is not connected yet");
+            return;
+        };
+        ui.stop_link.set_sensitive(false);
+        ui.stopping_link.set(true);
+        glib::MainContext::default().spawn_local(async move {
+            if let Err(error) = ipc::call(&proxy, "StopDownloadOffer", Some(().to_variant())).await
+            {
+                ui.toast(&error);
+            }
+            ui.stopping_link.set(false);
+            ui.refresh();
+        });
+    });
     let weak = Rc::downgrade(&ui);
     ui.settings_status_details.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
@@ -670,6 +709,7 @@ impl Ui {
         self.status.set_label(&tr("Offline"));
         self.send.set_sensitive(false);
         self.share_link.set_sensitive(false);
+        self.stop_link.set_sensitive(false);
         self.settings_status.set_visible(true);
         self.settings_status_details.set_visible(false);
         self.settings_status_row
@@ -810,6 +850,8 @@ impl Ui {
                         "light" => adw::ColorScheme::ForceLight,
                         _ => adw::ColorScheme::Default,
                     });
+                    ui.download_link.set_visible(ui.snapshot.borrow()["download_link_active"] == true);
+                    ui.stop_link.set_sensitive(!ui.stopping_link.get());
                     ui.update_settings_status();
                     ui.update_send();
                 }

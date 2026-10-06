@@ -9,6 +9,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from gi.repository import Gio, GLib
 
 assert os.environ.get("LINUXDROP_FD_TEST_PRIVATE") == "1"
@@ -112,8 +113,52 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-fd-sources-") as directory:
                 "sessionId": metadata["sessionId"], "fileId": item["id"]})
             with opener.open(url) as response:
                 assert response.read() == b"selected bytes"
+        assert json.loads(call("GetSnapshot")[0])["download_link_active"]
+        rejected(lambda: call("RestartBackends"))
+        rejected(lambda: call("UpdateSettings", "(s)", (json.dumps({"general": {"device_name": "must not replace active link"}}),)))
         call("StopDownloadOffer")
-        print("PASS real document-portal export/revocation, descriptor ownership, 25-file batching, invalid-descriptor rejection, atomic append and exact payload")
+        assert not json.loads(call("GetSnapshot")[0])["download_link_active"]
+        try:
+            opener.open(url, timeout=1)
+            raise AssertionError("A completed revocation left the old listener usable")
+        except urllib.error.URLError:
+            pass
+        # Same-port replacement and idle shutdown with a real throttled stream.
+        call("UpdateSettings", "(s)", (json.dumps({"receive": {"max_bytes": 1048576}, "transfers": {"bandwidth_limit_mbps": 1}}),))
+        for _ in range(100):
+            if not json.loads(call("GetSnapshot")[0])["restarting"]:
+                break
+            time.sleep(.02)
+        payload = bytes(range(256)) * 2048
+        large = root / "idle-shutdown.bin"
+        large.write_bytes(payload)
+        with large.open("rb") as file:
+            draft = prepare("", [(large.name, file.fileno())])
+        replacement = json.loads(call("CreateDownloadOffer", "(s)", (draft,))[0])
+        assert replacement["url"] == offer["url"], "Replacement must reuse the released port"
+        request = urllib.request.Request(replacement["url"] + "/api/localsend/v2/prepare-download?" +
+            urllib.parse.urlencode({"pin": replacement["pin"]}), data=b"", method="POST")
+        with opener.open(request) as response:
+            metadata = json.load(response)
+        item = next(iter(metadata["files"].values()))
+        url = replacement["url"] + "/api/localsend/v2/download?" + urllib.parse.urlencode({
+            "sessionId": metadata["sessionId"], "fileId": item["id"]})
+        with opener.open(url) as response:
+            first = response.read(1)
+            assert first == payload[:1]
+            with large.open("rb") as file:
+                second_draft = prepare("", [(large.name, file.fileno())])
+            rejected(lambda: call("CreateDownloadOffer", "(s)", (second_draft,)))
+            call("StopWhenIdle")
+            assert daemon.poll() is None, "Idle shutdown interrupted an active link download"
+            try:
+                opener.open(url)
+                raise AssertionError("A stopping daemon admitted another download")
+            except urllib.error.HTTPError as error:
+                assert error.code == 410
+            assert first + response.read() == payload
+        assert daemon.wait(timeout=5) == 0
+        print("PASS portal/descriptor ownership, 25-file batching and exact bytes; link restart protection, confirmed revocation, same-port replacement and idle shutdown preserving active downloads")
     finally:
         daemon.terminate()
         try:
