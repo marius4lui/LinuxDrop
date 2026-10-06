@@ -27,6 +27,7 @@ install -Dm755 "$root/integrations/thunar/install-action.py" "$dest$prefix/bin/l
 install -Dm644 "$root/LICENSE" "$dest$prefix/share/doc/linuxdrop/copyright"
 install -Dm644 "$root/vendor/open-quickshare/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/open-quickshare-LICENSE"
 install -Dm644 "$root/vendor/bluer/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/bluer-LICENSE"
+install -Dm644 "$root/vendor/bluer/bluetooth-numbers-database/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/bluetooth-numbers-database-LICENSE"
 install -Dm644 "$root/vendor/opendrop-rs/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/opendrop-rs-LICENSE"
 for document in "$root"/vendor/*.md "$root"/docs/adr/*; do
     if [ -f "$document" ]; then install -Dm644 "$document" "$dest$prefix/share/doc/linuxdrop/provenance/$(basename "$document")"; fi

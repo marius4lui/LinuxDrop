@@ -69,3 +69,7 @@ replies, retry, registration cancellation, drop cleanup and bus-owner removal.
 Physical Bluetooth packet/controller acceptance remains separate.
 
 Reference: [BlueZ LEAdvertisingManager1](https://bluez.readthedocs.io/en/latest/advertising-api/).
+
+The BlueR snapshot also includes Nordic Semiconductor's Bluetooth Numbers
+Database under its own BSD-3-Clause license. Its original license stays in the
+source subtree and is installed beside the BlueR license in binary packages.
