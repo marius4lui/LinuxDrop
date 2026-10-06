@@ -1,18 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bluer::adv::Advertisement;
 use bluer::UuidExt;
+use bluer::adv::Advertisement;
 use bytes::Bytes;
 use once_cell::sync::Lazy;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
 use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::hdl::{scanning_suppressed, BleScanSuppressor, Visibility};
+use crate::hdl::{BleScanSuppressor, Visibility, scanning_suppressed};
 
 /// Rings when a connection has consumed the receiver advertisement and the
 /// link is gone, so [`ReceiverAdvertiser`] should put a fresh one on the air.
@@ -78,7 +78,7 @@ impl BleAdvertiser {
         };
         handle.unregister().await?;
         if released {
-            anyhow::bail!("Bluetooth sender advertisement was removed by BlueZ");
+            anyhow::bail!("Bluetooth sender advertisement is no longer active");
         }
         Ok(())
     }
@@ -573,7 +573,7 @@ impl ReceiverAdvertiser {
                         return Ok(());
                     }
                     _ = async { futures::future::select_all(handles.iter().map(|handle| Box::pin(handle.released()))).await; } => {
-                        warn!("{RX_INNER_NAME}: BlueZ released our advertisement; registering again");
+                        warn!("{RX_INNER_NAME}: Bluetooth advertisement ended; registering again");
                         break;
                     }
                     _ = ADV_CYCLE.notified() => {

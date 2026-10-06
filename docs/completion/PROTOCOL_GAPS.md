@@ -362,3 +362,26 @@ physical simultaneous-role acceptance still need their corresponding evidence.
 Verification for this follow-up also passed all-target workspace Clippy and the
 nine AirDrop/Quick Share library tests, including TLS/UKEY2 consent and exact-byte
 loopbacks. No physical radio or installed-demo state was changed.
+
+
+## Advertisement controller/daemon loss, 2026-10-07
+
+Advertisement handles now monitor authenticated owner-specific PropertiesChanged,
+InterfacesRemoved and the bus daemon's NameOwnerChanged signals. Power loss,
+controller removal and replacement of org.bluez end that registration, even if
+no Release callback arrives. An owner/power snapshot after registration closes
+the signal-subscription race. Cleanup still targets the original unique owner;
+the newly started service cannot receive stale UnregisterAdvertisement requests.
+BlueR dispatches signals to all matching subscribers so its ordinary adapter
+routing does not consume the advertisement lifecycle notification first.
+
+The guarded private-bus tests now exercise forged power signals (ignored), actual
+power changes, controller removal without Release, and replacement of the BlueZ
+owner while the old process remains reachable and the replacement has an unrelated
+advertisement. The actual Quick Share receiver actor re-registers against a
+replacement service on its selected controller and keeps running. AirDrop's
+message accurately describes Bluetooth wake loss while retaining AWDL reception.
+Both private-bus suites and all-target workspace Clippy passed. These tests prove
+advertisement lifecycle behavior, not complete scanner/GATT/L2CAP recovery or
+physical hardware interoperability; those broader rows remain open. Demo and
+installed packages are unchanged.

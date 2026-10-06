@@ -275,4 +275,94 @@ async fn advertisements_use_selected_controller_and_confirm_cleanup() {
         .await
         .is_err());
     assert_eq!(second.registrations.load(Ordering::SeqCst), registrations);
+    // A forged controller signal is ignored; the real owner's power signal
+    // invalidates and cleans exactly this registration.
+    second_power.store(true, Ordering::SeqCst);
+    let mut powered = linuxdrop_network::advertise(&adapter, apple())
+        .await
+        .unwrap();
+    let powered_change: HashMap<&str, zbus::zvariant::Value<'_>> =
+        [("Powered", false.into())].into();
+    outsider
+        .emit_signal(
+            None::<&str>,
+            "/org/bluez/hci1",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &("org.bluez.Adapter1", &powered_change, Vec::<String>::new()),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), powered.released())
+            .await
+            .is_err()
+    );
+    second_power.store(false, Ordering::SeqCst);
+    let object = bus
+        .object_server()
+        .interface::<_, Adapter>("/org/bluez/hci1")
+        .await
+        .unwrap();
+    object
+        .get()
+        .await
+        .powered_changed(object.signal_emitter())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), powered.released())
+        .await
+        .unwrap();
+    powered.unregister().await.unwrap();
+    assert!(second.active.lock().unwrap().is_empty());
+    drop(object);
+
+    // InterfacesRemoved is independent of Powered/Release; USB disappearance
+    // need not send either of those signals.
+    second_power.store(true, Ordering::SeqCst);
+    let mut removed = linuxdrop_network::advertise(&adapter, apple())
+        .await
+        .unwrap();
+    bus.object_server()
+        .remove::<Adapter, _>("/org/bluez/hci1")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), removed.released())
+        .await
+        .unwrap();
+    removed.unregister().await.unwrap();
+    assert!(second.active.lock().unwrap().is_empty());
+    bus.object_server()
+        .at("/org/bluez/hci1", Adapter(second_power.clone()))
+        .await
+        .unwrap();
+
+    // Keep the old unique owner alive after replacing the well-known service.
+    // Its cleanup must never be sent to the newly started Bluetooth daemon.
+    let mut old = linuxdrop_network::advertise(&adapter, apple())
+        .await
+        .unwrap();
+    assert!(bus.release_name("org.bluez").await.unwrap());
+    let replacement_state = Arc::new(State::default());
+    replacement_state
+        .active
+        .lock()
+        .unwrap()
+        .insert("/replacement/advertisement".into(), ":replacement".into());
+    let _replacement = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.bluez")
+        .unwrap()
+        .serve_at("/org/bluez/hci1", Advertising(replacement_state.clone()))
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), old.released())
+        .await
+        .unwrap();
+    old.unregister().await.unwrap();
+    assert!(second.active.lock().unwrap().is_empty());
+    assert_eq!(replacement_state.removals.load(Ordering::SeqCst), 0);
+    assert_eq!(replacement_state.active.lock().unwrap().len(), 1);
 }

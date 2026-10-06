@@ -214,6 +214,9 @@ impl Session {
     /// This establishes a connection to the system Bluetooth daemon over D-Bus.
     pub async fn new() -> Result<Self> {
         let (resource, connection) = spawn_blocking(connection::new_system_sync).await??;
+        // Adapter/GATT event routing and advertisement lifecycle monitors may
+        // legitimately subscribe to the same signal on this session.
+        connection.set_signal_match_mode(true);
         let dbus_task = tokio::spawn(resource);
         log::trace!(
             "Connected to D-Bus with unique name {}",

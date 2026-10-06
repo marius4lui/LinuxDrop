@@ -87,3 +87,12 @@ The private-bus tests exercise forged callbacks, release while another
 advertisement occupies the slot, exact-controller Quick Share re-registration,
 and sender loss. Controller power-loss/restart recovery across all roles remains
 separate work.
+
+
+Advertisement loss monitoring also subscribes to owner-authenticated controller
+power/removal and bus-daemon name-owner changes, with a post-registration snapshot
+to close races. Session signal dispatch reaches all matching listeners, permitting
+these monitors to coexist with standard adapter/GATT event routing. Cleanup stays
+pinned to the registering owner. Private-bus tests cover spoofed signals, power-off,
+removed controllers and replacing BlueZ while old/new owners coexist, plus the
+real Quick Share receiver's re-registration against that replacement.

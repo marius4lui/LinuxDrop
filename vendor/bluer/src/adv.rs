@@ -336,6 +336,73 @@ impl Advertisement {
         let (owner,): (String,) = bus
             .method_call("org.freedesktop.DBus", "GetNameOwner", (SERVICE_NAME,))
             .await?;
+        let (lost_tx, lost) = tokio::sync::watch::channel(false);
+        let owner_signal = owner.clone();
+        let owner_lost = lost_tx.clone();
+        let owner_match = inner
+            .connection
+            .add_match(
+                dbus::message::MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged")
+                    .with_strict_sender("org.freedesktop.DBus")
+                    .with_path("/org/freedesktop/DBus"),
+            )
+            .await?
+            .msg_cb(move |message| {
+                if let Ok((name, old, new)) = message.read3::<String, String, String>() {
+                    if name == SERVICE_NAME && old == owner_signal && new != owner_signal {
+                        owner_lost.send_replace(true);
+                    }
+                }
+                true
+            });
+        let power_lost = lost_tx.clone();
+        let power_match = inner
+            .connection
+            .add_match(
+                dbus::message::MatchRule::new_signal(
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                )
+                .with_strict_sender(owner.clone())
+                .with_path(Adapter::dbus_path(&adapter_name)?),
+            )
+            .await?
+            .msg_cb(move |message| {
+                if let Ok((interface, changed, invalidated)) =
+                    message.read3::<String, PropMap, Vec<String>>()
+                {
+                    if interface == "org.bluez.Adapter1"
+                        && (changed.get("Powered").and_then(|value| value.0.as_i64()) == Some(0)
+                            || invalidated.iter().any(|name| name == "Powered"))
+                    {
+                        power_lost.send_replace(true);
+                    }
+                }
+                true
+            });
+        let removed_lost = lost_tx.clone();
+        let adapter_path = Adapter::dbus_path(&adapter_name)?;
+        let removed_match = inner
+            .connection
+            .add_match(
+                dbus::message::MatchRule::new_signal(
+                    "org.freedesktop.DBus.ObjectManager",
+                    "InterfacesRemoved",
+                )
+                .with_strict_sender(owner.clone()),
+            )
+            .await?
+            .msg_cb(move |message| {
+                if let Ok((path, interfaces)) = message.read2::<dbus::Path<'static>, Vec<String>>()
+                {
+                    if path == adapter_path
+                        && interfaces.iter().any(|name| name == "org.bluez.Adapter1")
+                    {
+                        removed_lost.send_replace(true);
+                    }
+                }
+                true
+            });
         let (released_tx, released) = tokio::sync::watch::channel(false);
         {
             let mut cr = inner.crossroads.lock().await;
@@ -353,7 +420,7 @@ impl Advertisement {
         // Bind this lifecycle to one bluetoothd instance. A restarted daemon
         // must not receive cleanup requests for another owner's registration.
         let proxy = Proxy::new(
-            owner,
+            owner.clone(),
             Adapter::dbus_path(&adapter_name)?,
             Duration::from_secs(15),
             inner.connection.clone(),
@@ -363,9 +430,14 @@ impl Advertisement {
         let (finished, completion) = tokio::sync::watch::channel(None);
         let unreg_name = name.clone();
         let mut released_rx = released.clone();
+        let mut lost_rx = lost.clone();
         // Own registration until its reply, even if the caller's future is
         // cancelled. A late successful reply must still be unregistered.
         tokio::spawn(async move {
+            // Keep subscriptions until this registration's cleanup is complete.
+            let _owner_match = owner_match;
+            let _power_match = power_match;
+            let _removed_match = removed_match;
             log::trace!("Registering advertisement at {}", &unreg_name);
             let registered: Result<()> = proxy
                 .method_call(
@@ -378,8 +450,30 @@ impl Advertisement {
             let mut registered_tx = Some(registered_tx);
             if registered.is_ok() {
                 let _ = registered_tx.take().unwrap().send(Ok(()));
+                // Close the subscribe/register race, including a controller
+                // removed before it could emit its final PropertiesChanged.
+                let current_owner: std::result::Result<(String,), dbus::Error> = bus
+                    .method_call("org.freedesktop.DBus", "GetNameOwner", (SERVICE_NAME,))
+                    .await;
+                let powered: std::result::Result<(Variant<bool>,), dbus::Error> = proxy
+                    .method_call(
+                        "org.freedesktop.DBus.Properties",
+                        "Get",
+                        ("org.bluez.Adapter1", "Powered"),
+                    )
+                    .await;
+                if !matches!(current_owner, Ok((current,)) if current == owner)
+                    || !matches!(powered, Ok((Variant(true),)))
+                {
+                    lost_tx.send_replace(true);
+                }
                 tokio::select! {
                     _ = drop_rx => {},
+                    _ = async {
+                        while !*lost_rx.borrow() {
+                            if lost_rx.changed().await.is_err() { break; }
+                        }
+                    } => {},
                     _ = async {
                         while !*released_rx.borrow() {
                             if released_rx.changed().await.is_err() { break; }
@@ -445,6 +539,7 @@ impl Advertisement {
             _drop_tx: Some(drop_tx),
             completion,
             released,
+            lost,
         })
     }
 }
@@ -458,17 +553,18 @@ pub struct AdvertisementHandle {
     _drop_tx: Option<oneshot::Sender<()>>,
     completion: tokio::sync::watch::Receiver<Option<Result<()>>>,
     released: tokio::sync::watch::Receiver<bool>,
+    lost: tokio::sync::watch::Receiver<bool>,
 }
 
 impl AdvertisementHandle {
-    /// Wait for external Release or completed local removal without initiating
+    /// Wait for external Release, controller/owner loss or completed local removal without initiating
     /// removal. Safe to cancel and restart this wait.
     pub async fn released(&self) {
         let mut released = self.released.clone();
-        while !*released.borrow() {
-            if released.changed().await.is_err() {
-                break;
-            }
+        let mut lost = self.lost.clone();
+        tokio::select! {
+            _ = async { while !*released.borrow() { if released.changed().await.is_err() { break; } } } => {},
+            _ = async { while !*lost.borrow() { if lost.changed().await.is_err() { break; } } } => {},
         }
     }
 

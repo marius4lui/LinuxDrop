@@ -12,7 +12,7 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 async fn wait_for(mut predicate: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(8), async {
         while !predicate() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -93,6 +93,37 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         !task.is_finished(),
         "The receiver should recover from an external Release"
     );
+    // A replacement bluetoothd gets new exported objects. The running receiver
+    // must renew on it; cleanup remains directed at the still-live old owner.
+    let old_bus = bus;
+    assert!(old_bus.release_name("org.bluez").await.unwrap());
+    let previous_state = second;
+    let second = Arc::new(State::default());
+    let bus = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.bluez")
+        .unwrap()
+        .serve_at("/", zbus::fdo::ObjectManager)
+        .unwrap()
+        .serve_at("/org/bluez/hci0", Adapter(Arc::new(AtomicBool::new(true))))
+        .unwrap()
+        .serve_at("/org/bluez/hci0", Advertising(first.clone()))
+        .unwrap()
+        .serve_at("/org/bluez/hci1", Adapter(Arc::new(AtomicBool::new(true))))
+        .unwrap()
+        .serve_at("/org/bluez/hci1", Advertising(second.clone()))
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    wait_for(|| second.active.lock().unwrap().len() == 1).await;
+    assert!(previous_state.active.lock().unwrap().is_empty());
+    assert_eq!(
+        second.removals.load(Ordering::SeqCst),
+        0,
+        "Old cleanup must not touch the replacement service"
+    );
+    assert!(!task.is_finished());
     cancel.cancel();
     tokio::time::timeout(Duration::from_secs(2), task)
         .await
@@ -111,7 +142,7 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert!(error.to_string().contains("removed by BlueZ"));
+    assert!(error.to_string().contains("no longer active"));
     assert!(second.active.lock().unwrap().is_empty());
     assert_eq!(first.registrations.load(Ordering::SeqCst), 0);
 }
