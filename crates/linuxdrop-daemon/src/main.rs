@@ -1,5 +1,6 @@
 mod helper;
 mod history;
+mod lifecycle;
 mod notifications;
 mod preferences;
 mod receive;
@@ -66,6 +67,7 @@ struct Shared {
     helper: Mutex<Option<helper::HelperLease>>,
     quickshare_helper: Mutex<Option<helper::HelperLease>>,
     backend_generation: std::sync::atomic::AtomicU64,
+    event_forwarders: tokio_util::task::TaskTracker,
     locked: std::sync::atomic::AtomicBool,
     download_offer: Mutex<Option<linuxdrop_localsend::reverse::ReverseOffer>>,
     history_io: Mutex<()>,
@@ -885,6 +887,9 @@ impl Manager {
             return Err(failed("Invalid visibility"));
         }
         let mut d = self.0.data.lock().await;
+        if mode == "everyone" && d.stop_when_idle {
+            return Err(failed("LinuxDrop is stopping"));
+        }
         d.settings["visibility"]["mode"] = json!(mode);
         d.visibility_since = if mode == "everyone" {
             Some(Instant::now())
@@ -1027,6 +1032,9 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     // Advance the generation under the same lock used to apply fault/events.
     let generation = {
         let mut data = shared.data.lock().await;
+        if data.stop_when_idle {
+            return;
+        }
         let generation = shared
             .backend_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -1035,7 +1043,7 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
         generation
     };
     let (events, mut receiver) = mpsc::channel(256);
-    tokio::spawn(async move {
+    shared.event_forwarders.spawn(async move {
         while let Some(event) = receiver.recv().await {
             if output.send((generation, event)).await.is_err() {
                 break;
@@ -1092,6 +1100,17 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
             }
         }
     }
+    if failures.is_empty() {
+        let (airdrop, quickshare) = tokio::join!(
+            helper::release(&shared.helper),
+            helper::release(&shared.quickshare_helper),
+        );
+        for (name, result) in [("AirDrop", airdrop), ("Quick Share", quickshare)] {
+            if let Err(error) = result {
+                failures.push(format!("{name} radio restoration: {error}"));
+            }
+        }
+    }
     if !failures.is_empty() {
         let mut d = shared.data.lock().await;
         for state in d.backends.values_mut() {
@@ -1103,8 +1122,6 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
         shared.changed().await;
         return;
     }
-    shared.helper.lock().await.take();
-    shared.quickshare_helper.lock().await.take();
     let bandwidth = linuxdrop_network::BandwidthLimiter::new(
         transfer_policy(&settings).bandwidth_bytes_per_second,
     );
@@ -1117,6 +1134,9 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     // Do not accept offers on a partially installed generation. Apply the latest
     // visibility only after every command channel is registered below.
     let visible = false;
+    if shared.data.lock().await.stop_when_idle {
+        return;
+    }
     if settings["localsend"]["enabled"] == true {
         let result = linuxdrop_localsend::start_with_budget(
             linuxdrop_localsend::Config {
@@ -1144,6 +1164,9 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
         install_backend(shared, "localsend", result).await;
     } else {
         disabled(shared, "localsend").await;
+    }
+    if shared.data.lock().await.stop_when_idle {
+        return;
     }
     if settings["quickshare"]["enabled"] == true {
         let preferred = settings["hardware"]["preferred_adapter"]
@@ -1192,6 +1215,9 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     } else {
         disabled(shared, "quickshare").await;
     }
+    if shared.data.lock().await.stop_when_idle {
+        return;
+    }
     if settings["airdrop"]["enabled"] == true {
         let result =
             start_airdrop(shared, &settings, name, directory, visible, events.clone()).await;
@@ -1217,7 +1243,7 @@ async fn install_backend(shared: &Arc<Shared>, id: &str, result: Result<CommandS
     let mut data = shared.data.lock().await;
     match result {
         Ok(tx) => {
-            if data.failed_backends.contains(id) {
+            if data.failed_backends.contains(id) || data.stop_when_idle {
                 data.retiring.insert(id.into(), tx.clone());
                 helper::drain(id.to_owned(), tx);
             } else {
@@ -1483,6 +1509,7 @@ async fn main() -> Result<()> {
         helper: Mutex::new(None),
         quickshare_helper: Mutex::new(None),
         backend_generation: std::sync::atomic::AtomicU64::new(0),
+        event_forwarders: tokio_util::task::TaskTracker::new(),
         locked: std::sync::atomic::AtomicBool::new(false),
         download_offer: Mutex::new(None),
         history_io: Mutex::new(()),
@@ -1495,10 +1522,20 @@ async fn main() -> Result<()> {
         .await?;
     shared.connection.set(connection.clone()).ok();
     notifications::start(shared.clone());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let mut terminating =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupting =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     let helper = shared.clone();
-    tokio::spawn(async move {
+    let helper_stop = stop.clone();
+    let helper_watch = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::select! {
+                biased;
+                _ = helper_stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
             for (backend, socket) in [
                 ("airdrop", &helper.helper),
                 ("quickshare", &helper.quickshare_helper),
@@ -1510,17 +1547,31 @@ async fn main() -> Result<()> {
     let (events, mut event_rx) = mpsc::channel(256);
     let supervisor = shared.clone();
     let event_tx = events.clone();
-    tokio::spawn(async move {
+    let supervisor_stop = stop.clone();
+    let supervisor = tokio::spawn(async move {
         boot_backends(&supervisor, event_tx.clone()).await;
-        while restarts.recv().await.is_some() {
-            boot_backends(&supervisor, event_tx.clone()).await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = supervisor_stop.cancelled() => break,
+                request = restarts.recv() => {
+                    if request.is_none() { break; }
+                    boot_backends(&supervisor, event_tx.clone()).await;
+                }
+            }
         }
     });
     let hardware = shared.clone();
-    tokio::spawn(async move {
+    let hardware_stop = stop.clone();
+    let hardware_watch = tokio::spawn(async move {
         let mut inventories = linuxdrop_hardware::watch_inventory();
         let mut initialized = false;
-        while inventories.changed().await.is_ok() {
+        loop {
+            tokio::select! {
+                biased;
+                _ = hardware_stop.cancelled() => break,
+                result = inventories.changed() => { if result.is_err() { break; } }
+            }
             let value =
                 serde_json::to_value(inventories.borrow_and_update().clone()).unwrap_or_default();
             let mut d = hardware.data.lock().await;
@@ -1565,9 +1616,14 @@ async fn main() -> Result<()> {
         }
     });
     let visibility = shared.clone();
-    tokio::spawn(async move {
+    let visibility_stop = stop.clone();
+    let visibility_watch = tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::select! {
+                biased;
+                _ = visibility_stop.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
             let d = visibility.data.lock().await;
             let duration = d.settings["visibility"]["duration_minutes"]
                 .as_u64()
@@ -1586,7 +1642,8 @@ async fn main() -> Result<()> {
     let mut shutdown_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
-            _=tokio::signal::ctrl_c()=>break,
+            _=terminating.recv()=>break,
+            _=interrupting.recv()=>break,
             _=shutdown_tick.tick()=>{
                 let mut d=shared.data.lock().await;
                 d.drafts.retain(|_, draft| draft.created.elapsed() < Duration::from_secs(1800));
@@ -1594,62 +1651,181 @@ async fn main() -> Result<()> {
                     && shared.download_offer.lock().await.as_ref().is_none_or(|offer| offer.active_downloads() == 0) {break;}
             },
             Some((generation,event))=event_rx.recv()=>{
-                let mut d=shared.data.lock().await;
-                if generation != shared.backend_generation.load(std::sync::atomic::Ordering::Acquire) {continue;}
-                let Some(event) = helper::filter_event(&d, event) else {continue;};
-                let mut notification=None;
-                if let BackendEvent::Incoming(t)|BackendEvent::TransferUpdated(t)=&event {
-                    if !d.transfers.contains_key(&t.id){d.transfer_order.push(t.id.clone());}
-                }
-                match event {
-                    BackendEvent::PeerUpsert(peer)=>{d.peers.insert(peer.id.clone(),peer);},
-                    BackendEvent::PeerRemoved{peer_id}=>{d.peers.remove(&peer_id);},
-                    BackendEvent::Incoming(mut transfer)=>{
-                        if !d.transfers.get(&transfer.id).is_some_and(Transfer::is_terminal) {
-                            let full=!d.transfers.contains_key(&transfer.id) && d.transfers.values().filter(|t|!t.is_terminal()).count() >= d.settings["transfers"]["max_parallel"].as_u64().unwrap() as usize;
-                            let blocked=d.peer_preferences.get(&transfer.peer_id).is_some_and(|p|p.blocked);
-                            let receive_disabled=transfer.protocol=="airdrop" && d.settings["airdrop"]["receive"]!=true;
-                            if full || blocked || receive_disabled || d.failed_backends.contains(&transfer.protocol) || d.restarting || d.stop_when_idle || shared.locked.load(std::sync::atomic::Ordering::Relaxed) {
-                                if let Some(tx)=d.commands.get(&transfer.protocol) {let _=tx.try_send(BackendCommand::Reject{transfer_id:transfer.id.clone()});}
-                                transfer.state="rejected".into();
-                                transfer.error=Some("LinuxDrop is not accepting this request".into());
-                                d.completed_at.insert(transfer.id.clone(), history::now());
-                            } else {notification=Some(transfer.clone());}
-                            d.transfers.insert(transfer.id.clone(),transfer);
-                        }
-                    },
-                    BackendEvent::TransferUpdated(transfer)=>{
-                        if transfer.is_terminal(){d.decisions.remove(&transfer.id);d.completed_at.entry(transfer.id.clone()).or_insert_with(history::now);}
-                        if d.transfers.get(&transfer.id).is_none_or(|old|old.accepts_update(&transfer)){
-                            if transfer.is_terminal(){notification=Some(transfer.clone());}
-                            d.transfers.insert(transfer.id.clone(),transfer);
-                        }
-                    },
-                    BackendEvent::StateChanged(state)=>{d.backends.insert(state.id.clone(),state);}
-                }
-                let persist=notification.as_ref().is_some_and(Transfer::is_terminal);
-                let history=if persist {
-                    let keep=d.settings["transfers"]["history_limit"].as_u64().unwrap_or(100) as usize;
-                    let finished:Vec<_>=d.transfer_order.iter().filter(|id|d.transfers.get(*id).is_some_and(Transfer::is_terminal)).cloned().collect();
-                    for id in finished.iter().take(finished.len().saturating_sub(keep)){d.transfers.remove(id);}
-                    let expired:Vec<_>=d.completed_at.iter().filter(|(_,timestamp)|!history::retained(**timestamp,d.settings["transfers"]["history_days"].as_u64().unwrap_or(30),history::now())).map(|(id,_)|id.clone()).collect();
-                    for id in expired {d.transfers.remove(&id);d.completed_at.remove(&id);}
-                    let order:Vec<_>=d.transfer_order.iter().filter(|id|d.transfers.contains_key(*id)).cloned().collect();d.transfer_order=order;
-                    Some(json!(d.transfer_order.iter().filter_map(|id|d.transfers.get(id)).filter(|t|t.is_terminal()).collect::<Vec<_>>()))
-                }else{None};
-                drop(d);shared.changed().await;
-                if history.is_some() {if let Err(error)=shared.persist_history().await {tracing::warn!(%error,"Could not save transfer history");}}
-                if let Some(transfer)=notification {
-                    let shared=shared.clone();tokio::spawn(async move{notifications::notify(shared.clone(),transfer.clone()).await;notifications::after_receive(shared,transfer).await;});
-                }
+                handle_event(&shared, generation, event).await;
             }
         }
     }
-    if let Some(offer) = shared.download_offer.lock().await.as_ref() {
-        offer.shutdown().await.map_err(anyhow::Error::msg)?;
+    lifecycle::begin_stop(&shared, &stop).await;
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(120),
+        lifecycle::finish(
+            &shared,
+            supervisor,
+            vec![helper_watch, hardware_watch, visibility_watch],
+        ),
+    );
+    tokio::pin!(cleanup);
+    // Backends can publish more than one channel's capacity while draining.
+    // Keep processing their terminal events until their forwarders also stop.
+    let outcome = loop {
+        tokio::select! {
+            result = &mut cleanup => break result,
+            Some((generation, event)) = event_rx.recv() => handle_event(&shared, generation, event).await,
+        }
+    };
+    while let Ok((generation, event)) = event_rx.try_recv() {
+        handle_event(&shared, generation, event).await;
     }
-    for tx in shared.data.lock().await.commands.values() {
-        let _ = tx.send(BackendCommand::Shutdown).await;
-    }
+    lifecycle::finish_history(&shared).await?;
+    outcome.context(
+        "LinuxDrop cleanup exceeded 120 seconds; some resources could not be confirmed stopped",
+    )??;
     Ok(())
+}
+
+async fn handle_event(shared: &Arc<Shared>, generation: u64, event: BackendEvent) {
+    let mut d = shared.data.lock().await;
+    if generation
+        != shared
+            .backend_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return;
+    }
+    let Some(event) = helper::filter_event(&d, event) else {
+        return;
+    };
+    let mut notification = None;
+    if let BackendEvent::Incoming(t) | BackendEvent::TransferUpdated(t) = &event {
+        if !d.transfers.contains_key(&t.id) {
+            d.transfer_order.push(t.id.clone());
+        }
+    }
+    match event {
+        BackendEvent::PeerUpsert(peer) => {
+            d.peers.insert(peer.id.clone(), peer);
+        }
+        BackendEvent::PeerRemoved { peer_id } => {
+            d.peers.remove(&peer_id);
+        }
+        BackendEvent::Incoming(mut transfer) => {
+            if !d
+                .transfers
+                .get(&transfer.id)
+                .is_some_and(Transfer::is_terminal)
+            {
+                let full = !d.transfers.contains_key(&transfer.id)
+                    && d.transfers.values().filter(|t| !t.is_terminal()).count()
+                        >= d.settings["transfers"]["max_parallel"].as_u64().unwrap() as usize;
+                let blocked = d
+                    .peer_preferences
+                    .get(&transfer.peer_id)
+                    .is_some_and(|p| p.blocked);
+                let receive_disabled =
+                    transfer.protocol == "airdrop" && d.settings["airdrop"]["receive"] != true;
+                if full
+                    || blocked
+                    || receive_disabled
+                    || d.failed_backends.contains(&transfer.protocol)
+                    || d.restarting
+                    || d.stop_when_idle
+                    || shared.locked.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(tx) = d.commands.get(&transfer.protocol) {
+                        let _ = tx.try_send(BackendCommand::Reject {
+                            transfer_id: transfer.id.clone(),
+                        });
+                    }
+                    transfer.state = "rejected".into();
+                    transfer.error = Some("LinuxDrop is not accepting this request".into());
+                    d.completed_at.insert(transfer.id.clone(), history::now());
+                } else {
+                    notification = Some(transfer.clone());
+                }
+                d.transfers.insert(transfer.id.clone(), transfer);
+            }
+        }
+        BackendEvent::TransferUpdated(transfer) => {
+            if transfer.is_terminal() {
+                d.decisions.remove(&transfer.id);
+                d.completed_at
+                    .entry(transfer.id.clone())
+                    .or_insert_with(history::now);
+            }
+            if d.transfers
+                .get(&transfer.id)
+                .is_none_or(|old| old.accepts_update(&transfer))
+            {
+                if transfer.is_terminal() {
+                    notification = Some(transfer.clone());
+                }
+                d.transfers.insert(transfer.id.clone(), transfer);
+            }
+        }
+        BackendEvent::StateChanged(state) => {
+            d.backends.insert(state.id.clone(), state);
+        }
+    }
+    let persist = notification.as_ref().is_some_and(Transfer::is_terminal);
+    let history = if persist {
+        let keep = d.settings["transfers"]["history_limit"]
+            .as_u64()
+            .unwrap_or(100) as usize;
+        let finished: Vec<_> = d
+            .transfer_order
+            .iter()
+            .filter(|id| d.transfers.get(*id).is_some_and(Transfer::is_terminal))
+            .cloned()
+            .collect();
+        for id in finished.iter().take(finished.len().saturating_sub(keep)) {
+            d.transfers.remove(id);
+        }
+        let expired: Vec<_> = d
+            .completed_at
+            .iter()
+            .filter(|(_, timestamp)| {
+                !history::retained(
+                    **timestamp,
+                    d.settings["transfers"]["history_days"]
+                        .as_u64()
+                        .unwrap_or(30),
+                    history::now(),
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            d.transfers.remove(&id);
+            d.completed_at.remove(&id);
+        }
+        let order: Vec<_> = d
+            .transfer_order
+            .iter()
+            .filter(|id| d.transfers.contains_key(*id))
+            .cloned()
+            .collect();
+        d.transfer_order = order;
+        Some(json!(d
+            .transfer_order
+            .iter()
+            .filter_map(|id| d.transfers.get(id))
+            .filter(|t| t.is_terminal())
+            .collect::<Vec<_>>()))
+    } else {
+        None
+    };
+    drop(d);
+    shared.changed().await;
+    if history.is_some() {
+        if let Err(error) = shared.persist_history().await {
+            tracing::warn!(%error,"Could not save transfer history");
+        }
+    }
+    if let Some(transfer) = notification {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            notifications::notify(shared.clone(), transfer.clone()).await;
+            notifications::after_receive(shared, transfer).await;
+        });
+    }
 }

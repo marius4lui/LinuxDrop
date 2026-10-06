@@ -52,6 +52,25 @@ pub(super) async fn poll(shared: &Arc<Shared>, backend: &str, socket: &Mutex<Opt
 
 const FAILURE: &str = "Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.";
 
+pub(super) async fn release(socket: &Mutex<Option<HelperLease>>) -> Result<()> {
+    let Some(mut lease) = socket.lock().await.take() else {
+        return Ok(());
+    };
+    match tokio::time::timeout(
+        Duration::from_secs(45),
+        lease.client.request(&Request::Release {
+            lease_id: lease.expected.id,
+        }),
+    )
+    .await
+    .context("Network helper did not confirm radio restoration within 45 seconds")??
+    {
+        Response::Ok => Ok(()),
+        Response::Error { message } => anyhow::bail!(message),
+        _ => anyhow::bail!("Unexpected network helper release response"),
+    }
+}
+
 pub(super) async fn failed(shared: &Arc<Shared>, backend: &str, generation: u64) {
     let mut data = shared.data.lock().await;
     if generation != shared.backend_generation.load(Ordering::Acquire)
@@ -139,14 +158,14 @@ pub(super) fn filter_event(data: &Data, event: BackendEvent) -> Option<BackendEv
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::oneshot;
 
-    struct Fixture(Arc<Shared>);
+    pub(crate) struct Fixture(pub(crate) Arc<Shared>);
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let directory =
                 std::env::temp_dir().join(format!("linuxdrop-helper-{}", Uuid::new_v4()));
             std::fs::create_dir(&directory).unwrap();
@@ -182,6 +201,7 @@ mod tests {
                 helper: Mutex::new(None),
                 quickshare_helper: Mutex::new(None),
                 backend_generation: 1.into(),
+                event_forwarders: tokio_util::task::TaskTracker::new(),
                 locked: false.into(),
                 download_offer: Mutex::new(None),
                 history_io: Mutex::new(()),

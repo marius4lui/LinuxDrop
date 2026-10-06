@@ -10,6 +10,7 @@ BusName=io.github.marius4lui.LinuxDrop
 ExecStart=/usr/bin/linuxdropd
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=150
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full

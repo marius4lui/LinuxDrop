@@ -281,3 +281,31 @@ late initialization, stale results across restart and P2P socket failure. No phy
 unplug acceptance or completion of all netd journal/recovery work is inferred.
 Final daemon-exit draining remains a separate software item. Installed packages
 and the user's live demo have not been replaced by this source revision.
+
+
+## Confirmed daemon exit and radio release, 2026-10-07
+
+SIGTERM, SIGINT and StopWhenIdle now share admission closure and an explicit
+cleanup phase. In-flight constructors are allowed to return their resource-owning
+handles; actors completing after stop are retired, and no subsequent backend is
+started. The daemon waits for its supervisor and safely ends watcher requests.
+Backend actors and link servers drain concurrently with those watchers so a P2P
+request cannot deadlock shutdown behind a health check. It keeps consuming bounded
+event channels throughout cleanup, then waits for all event forwarders and drains
+the remaining queue before persisting final transfer history. Nonterminal leftovers
+are recorded as interrupted, while completed results remain completed.
+
+Both normal restart and final exit request explicit helper Release acknowledgements
+after backend cleanup. Final exit has a 120-second limit and returns a failure if
+cleanup or radio restoration cannot be confirmed; the user service allows 150 seconds
+before the service manager's hard limit. Partial cleanup failure does not skip the
+other services. This does not prove hardware restoration on an absent real radio,
+or close every startup-error resource path inside protocol libraries.
+
+Passed: 12 daemon tests, including delayed startup/cleanup, a bounded-queue event
+backlog, partial cleanup failure and actual Unix-socket release acknowledgements;
+daemon all-target Clippy; actual SIGTERM/SIGINT with an accepted stalled TLS upload
+(partial removal, terminal history, immediate same-port restart); existing private
+D-Bus/HTTPS consent/restart/idle tests; real portal/descriptor plus active-download
+idle-exit test. The staged systemd user unit validates. The signal integration is
+now part of CI. No running demo or installed package was changed.

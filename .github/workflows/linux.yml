@@ -39,7 +39,9 @@ jobs:
       - name: Build installable package
         run: sh packaging/build-deb.sh
       - name: Daemon session and HTTPS integration
-        run: dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
+        run: |
+          dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
+          dbus-run-session -- python3 tests/integration/daemon_shutdown.py target/release/linuxdropd
       - name: Package smoke test
         run: |
           sudo apt-get install -y ./dist/linuxdrop_*.deb
