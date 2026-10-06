@@ -1,4 +1,3 @@
-use tokio::net::TcpListener;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +30,7 @@ pub struct SendInfo {
 
 pub struct TcpServer {
     endpoint_id: [u8; 4],
-    tcp_listeners: Vec<TcpListener>,
+    tcp_listeners: crate::lan_policy::LanListeners,
     sender: Sender<ChannelMessage>,
     connect_receiver: Receiver<SendInfo>,
 }
@@ -39,7 +38,7 @@ pub struct TcpServer {
 impl TcpServer {
     pub fn new(
         endpoint_id: [u8; 4],
-        tcp_listeners: Vec<TcpListener>,
+        tcp_listeners: crate::lan_policy::LanListeners,
         sender: Sender<ChannelMessage>,
         connect_receiver: Receiver<SendInfo>,
     ) -> Result<Self, anyhow::Error> {
@@ -53,6 +52,8 @@ impl TcpServer {
 
     pub async fn run(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         let mut jobs = tokio::task::JoinSet::new();
+        let mut network_changes = tokio::time::interval(std::time::Duration::from_secs(3));
+        network_changes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         info!("{INNER_NAME}: service starting");
 
         loop {
@@ -64,6 +65,7 @@ impl TcpServer {
                     break;
                 }
                 Some(_) = jobs.join_next(), if !jobs.is_empty() => {},
+                _ = network_changes.tick() => { self.tcp_listeners.refresh().await?; },
                 Some(i) = self.connect_receiver.recv() => {
                     info!("{INNER_NAME}: connect_receiver: got {:?}", i);
                     let report_id = i.id.clone();
@@ -85,7 +87,7 @@ impl TcpServer {
                     }
                     });
                 }
-                r = crate::lan_policy::accept(&self.tcp_listeners) => {
+                r = self.tcp_listeners.accept() => {
                     match r {
                         Ok((socket, remote_addr)) => {
                             if !socket.local_addr().is_ok_and(|local| crate::lan_policy::permits(local.ip(), remote_addr.ip())) { continue; }

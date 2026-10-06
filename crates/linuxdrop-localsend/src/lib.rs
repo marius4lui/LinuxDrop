@@ -1081,9 +1081,17 @@ async fn send_files(
 mod tests {
     use super::*;
     pub(super) fn config(root: &std::path::Path, name: &str) -> Config {
-        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = socket.local_addr().unwrap().port();
-        drop(socket);
+        // Parallel fixtures must not reuse a just-released ephemeral port while
+        // another fixture is still generating its TLS identity. Keep their
+        // server ports distinct and below Linux's usual client port range.
+        static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(16000);
+        let port = loop {
+            let candidate = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+            assert!(candidate < 32000, "Test port range exhausted");
+            if std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, candidate)).is_ok() {
+                break candidate;
+            }
+        };
         Config {
             name: name.into(),
             download_dir: root.join("received"),

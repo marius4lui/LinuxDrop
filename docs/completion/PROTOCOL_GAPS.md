@@ -26,7 +26,8 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] SSID/password-based peer group joining and sender-hosted network credentials; dedicated disconnected interface required.
 - [x] Missing BlueZ preserves LAN functionality; task failures and cancellation produce terminal states; mdns lifecycle cleanup.
 - [x] Stable configurable IPv4 LAN listener port and interface-filtered advertisement/discovery/listening; exact local-address binds and source-bound outgoing connections.
-- [ ] Live LAN address/interface changes must reconcile listeners and mDNS records without requiring a manual backend restart; IPv6 LAN/address candidates remain separate work.
+- [x] Live IPv4 LAN address/interface changes reconcile listeners, mDNS records, discovery probes and readiness without requiring a manual backend restart.
+- [ ] IPv6 LAN and negotiated IPv6 address candidates; prolonged mDNS reconfiguration/resource-bound acceptance.
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
 - [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
@@ -159,3 +160,47 @@ These checks do not replace interoperability tests with official clients or real
 adapter hotplug. Quick Share's live listener/mDNS reconciliation remains open,
 along with the other unchecked software items above. Release packages have not
 yet been rebuilt with these changes.
+
+## Quick Share network lifecycle and key decoding, 2026-10-06
+
+One listener owner now publishes the exact bound-interface snapshot used by
+mDNS advertisement, discovery and backend readiness. It polls network changes
+every three seconds, retains unchanged listeners, retries failed new binds and
+removes listeners on retired interfaces. Existing accepted TCP sessions have
+independent ownership. mDNS withdraws the previous record before registering
+the current explicit address set; loopback aliases and failed binds are omitted.
+Visibility is checked again before network-triggered advertisement. Removal
+waits are asynchronous and bounded rather than blocking the runtime thread.
+
+Discovery probes run independently of network and cancellation events, with at
+most sixteen pending services and sixteen IPv4 candidates per service under one
+three-second deadline. Network changes cancel stale probes and prune unreachable
+peers. Removed or superseded discovery results cannot resurrect an older peer.
+Bluetooth component failures remain visible when LAN connectivity recovers.
+
+The isolated namespace runner exercises an actual running engine while adding
+an address and bringing a dummy link down/up, then verifies listener recovery,
+absence of component-failure events and bounded shutdown. The normal socket test
+also proves that an existing accepted connection survives other listener changes
+and that failed binds never enter generated service metadata. These are software
+checks; they do not prove remote Android discovery or capture every external
+resolver's cache behavior.
+
+The broader test run exposed a separate P-256 interoperability bug: signed wire
+coordinates shorter than 32 bytes were concatenated without left-padding, and
+oversized coordinates were silently truncated. Both handshake directions now
+use one decoder which restores fixed-width coordinates, rejects negative or
+oversized integers and verifies the resulting curve point and key type. A fixed
+379*G public-point regression covers the short-x/sign-prefixed-y case, invalid
+points and truncation attempts; the real UKEY2/SAS/payload exchange passes too.
+LocalSend's parallel fixtures now allocate distinct server ports to avoid an
+observed race while generating their TLS identities.
+
+Verification: 43 workspace tests, Clippy with warnings denied and the rebuilt
+daemon's D-Bus/HTTPS integration passed. The private network-namespace test passed
+separately; the normal listener-lifecycle test also passed as the unprivileged
+Ubuntu user. Release artifacts remain pending. One identified follow-up is the
+pinned mDNS library's append-only interface-selection history: repeated runtime
+reconfiguration needs a bounded daemon refresh strategy and an accompanying
+long-running discovery/cache check. IPv6 and full P2P negotiation remain active
+software work, not device-only acceptance exceptions.

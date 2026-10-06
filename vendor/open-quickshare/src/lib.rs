@@ -105,6 +105,7 @@ pub struct RQS {
     // Discovery token is different than ctoken because he is on his own
     // - can be cancelled while the ctoken is still active
     discovery_ctk: Option<CancellationToken>,
+    lan_state: Option<watch::Receiver<lan_policy::LanSnapshot>>,
 
     // Used to trigger a change in the mDNS visibility (and later on, BLE)
     pub visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
@@ -154,6 +155,7 @@ impl RQS {
             tracker: None,
             ctoken: None,
             discovery_ctk: None,
+            lan_state: None,
             visibility_sender: Arc::new(Mutex::new(visibility_sender)),
             visibility_receiver,
             ble_sender,
@@ -177,14 +179,16 @@ impl RQS {
             .map(u8::from)
             .collect();
         let tcp_listeners =
-            lan_policy::listeners(u16::try_from(self.port_number.unwrap_or(0))?).await?;
-        let binded_addr = tcp_listeners[0].local_addr()?;
-        info!("TcpListener on: {}", binded_addr);
+            lan_policy::LanListeners::new(u16::try_from(self.port_number.unwrap_or(0))?).await?;
+        let service_port = tcp_listeners.port();
+        let lan_state = tcp_listeners.subscribe();
+        self.lan_state = Some(lan_state.clone());
+        info!("TCP listeners on port: {}", service_port);
 
         // So the random port can be accessed from the user if needed.
         // This does have a difference in behaviour however when port_number is Some.
         // .stop() and .run() will reuse the port number instead of generating a new one.
-        self.port_number = Some(binded_addr.port() as u32);
+        self.port_number = Some(service_port as u32);
 
         // MPSC for the TcpServer
         let send_channel = mpsc::channel(10);
@@ -235,10 +239,11 @@ impl RQS {
         // Start MDnsServer in own "task"
         let mut mdns = MDnsServer::new(
             endpoint_id[..4].try_into()?,
-            binded_addr.port(),
+            service_port,
             self.ble_sender.subscribe(),
             self.visibility_sender.clone(),
             self.visibility_receiver.clone(),
+            lan_state,
         )?;
         let ctk = ctoken.clone();
         let lifetime = ctk.clone();
@@ -311,7 +316,7 @@ impl RQS {
                 if let Some((server, _)) = l2cap {
                     let l2cap_advert = advert.clone();
                     let l2cap_sender = self.message_sender.clone();
-                    let l2cap_tcp_port = binded_addr.port();
+                    let l2cap_tcp_port = service_port;
                     let lctk = ctoken.clone();
                     tracker.spawn(async move {
                         server
@@ -325,7 +330,7 @@ impl RQS {
                 // socket which we bridge to the inbound handshake.
                 let gatt_advert = advert.clone();
                 let gatt_sender = self.message_sender.clone();
-                let gatt_tcp_port = binded_addr.port();
+                let gatt_tcp_port = service_port;
                 let gctk = ctoken.clone();
                 let status = self.message_sender.clone();
                 tracker.spawn(async move {
@@ -434,7 +439,7 @@ impl RQS {
         {
             info!("MDnsDiscovery: disabled by PACKET_PREFER_BLE=on (BLE-only recipient discovery)");
         } else {
-            let discovery = MDnsDiscovery::new(sender)?;
+            let discovery = MDnsDiscovery::new(sender, self.lan_state()?)?;
             let status = self.message_sender.clone();
             tracker.spawn(async move {
                 let result = discovery.run(ctk.clone()).await;
@@ -456,6 +461,12 @@ impl RQS {
         }
 
         Ok(())
+    }
+
+    pub fn lan_state(&self) -> Result<watch::Receiver<lan_policy::LanSnapshot>, anyhow::Error> {
+        self.lan_state
+            .clone()
+            .ok_or_else(|| anyhow!("LAN service is not running"))
     }
 
     pub fn stop_discovery(&mut self) {
@@ -497,6 +508,7 @@ impl RQS {
 
         self.ctoken = None;
         self.tracker = None;
+        self.lan_state = None;
     }
 
     // Setting None here will resume the default settings

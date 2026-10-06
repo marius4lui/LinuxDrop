@@ -81,22 +81,6 @@ pub async fn start_with_budget(
             .cloned(),
     );
     rqs_lib::lan_policy::set(config.policy.clone());
-    let lan_ready = rqs_lib::lan_policy::interfaces(false)?
-        .iter()
-        .any(|interface| interface.address.is_ipv4());
-    let available = lan_ready || engine.ble_enabled;
-    let lan_status = if lan_ready {
-        "Quick Share LAN active"
-    } else {
-        "Quick Share has no enabled IPv4 LAN interface; check network settings"
-    };
-    let readiness = match &bluetooth {
-        Ok(name) if config.ble => format!("{lan_status}; Bluetooth discovery on {name}."),
-        Ok(_) => format!("{lan_status}; Bluetooth discovery disabled in settings."),
-        Err(error) => format!(
-            "{lan_status}. Bluetooth unavailable: {error}. Enable a BlueZ controller and restart LinuxDrop to use Bluetooth discovery."
-        ),
-    };
     rqs_lib::set_receive_limits(config.max_receive_bytes, config.max_files);
     rqs_lib::payload_budget::set_budget(bandwidth);
     rqs_lib::hdl::set_upgrade_lease(config.upgrade_lease.map(|lease| {
@@ -115,18 +99,22 @@ pub async fn start_with_budget(
             return Err(error);
         }
     };
+    let mut lan_state = engine.lan_state()?;
     let (discovery, mut peers_rx) = broadcast::channel::<EndpointInfo>(128);
     if let Err(error) = engine.discovery(discovery) {
         let _ = tokio::time::timeout(Duration::from_secs(10), engine.stop()).await;
         return Err(error);
     }
     let (commands, mut rx) = mpsc::channel(32);
+    let mut bluetooth_errors = std::collections::BTreeMap::new();
+    let initial_network = lan_state.borrow().clone();
     events
-        .send(BackendEvent::StateChanged(BackendState {
-            id: "quickshare".into(),
-            state: if available { "ready" } else { "unavailable" }.into(),
-            detail: readiness,
-        }))
+        .send(BackendEvent::StateChanged(network_status(
+            &initial_network,
+            &bluetooth,
+            config.ble,
+            &bluetooth_errors,
+        )))
         .await
         .ok();
     tokio::spawn(async move {
@@ -139,6 +127,11 @@ pub async fn start_with_budget(
         let mut visible = config.visible;
         loop {
             tokio::select! {
+                changed = lan_state.changed() => {
+                    if changed.is_err() { break; }
+                    let snapshot = lan_state.borrow_and_update().clone();
+                    events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors))).await.ok();
+                },
                 command = rx.recv() => match command {
                     None | Some(BackendCommand::Shutdown) => break,
                     Some(BackendCommand::SetVisibility {visible:value}) => {visible=value;engine.change_visibility(if visible {Visibility::Visible} else {Visibility::Invisible});},
@@ -192,10 +185,14 @@ pub async fn start_with_budget(
                 },
                 message = messages.recv() => match message {
                     Ok(ChannelMessage {msg:Message::Backend {component,detail},..}) => {
-                        let bluetooth=component.starts_with("bluetooth-");
-                        let lan_active=rqs_lib::lan_policy::interfaces(false).is_ok_and(|interfaces|interfaces.iter().any(|interface|interface.address.is_ipv4()));
-                        events.send(BackendEvent::StateChanged(BackendState{id:"quickshare".into(),state:if bluetooth && lan_active {"ready"} else {"error"}.into(),detail:if bluetooth {format!("{}; {component} unavailable: {detail}. Check BlueZ and restart the backend from Settings.",if lan_active {"Quick Share LAN active"} else {"Quick Share has no enabled LAN interface"})} else {format!("Quick Share {component} stopped: {detail}. Restart the backend from Settings.")}})).await.ok();
-                        if !bluetooth {break;}
+                        if component.starts_with("bluetooth-") {
+                            bluetooth_errors.insert(component, detail);
+                            let snapshot = lan_state.borrow().clone();
+                            events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors))).await.ok();
+                        } else {
+                            events.send(BackendEvent::StateChanged(BackendState { id: "quickshare".into(), state: "error".into(), detail: format!("Quick Share {component} stopped: {detail}. Restart the backend from Settings.") })).await.ok();
+                            break;
+                        }
                     }
                     Ok(ChannelMessage {id, msg:Message::Client(message)}) => {
                         let incoming = message.kind == TransferKind::Inbound;
@@ -262,6 +259,46 @@ pub async fn start_with_budget(
         drop(staging);
     });
     Ok(commands)
+}
+
+fn network_status(
+    lan: &rqs_lib::lan_policy::LanSnapshot,
+    bluetooth: &Result<String>,
+    ble_enabled: bool,
+    failures: &std::collections::BTreeMap<String, String>,
+) -> BackendState {
+    let lan_ready = lan.available();
+    let ble_ready = ble_enabled && bluetooth.is_ok() && failures.is_empty();
+    let mut detail = if lan_ready {
+        "Quick Share LAN active".to_string()
+    } else {
+        "Quick Share has no enabled IPv4 LAN interface; waiting for a network connection"
+            .to_string()
+    };
+    if !lan.errors.is_empty() {
+        detail.push_str(&format!("; LAN listener errors: {}", lan.errors.join("; ")));
+    }
+    match bluetooth {
+        Ok(name) if ble_enabled && failures.is_empty() => detail.push_str(&format!("; Bluetooth discovery on {name}")),
+        Ok(name) if ble_enabled => detail.push_str(&format!("; Bluetooth controller {name}")),
+        Ok(_) => detail.push_str("; Bluetooth discovery disabled in settings"),
+        Err(error) => detail.push_str(&format!("; Bluetooth unavailable: {error}. Enable a BlueZ controller and restart LinuxDrop to use Bluetooth discovery")),
+    }
+    for (component, reason) in failures {
+        detail.push_str(&format!("; {component} unavailable: {reason}"));
+    }
+    BackendState {
+        id: "quickshare".into(),
+        state: if lan_ready || ble_ready {
+            "ready"
+        } else if !lan.errors.is_empty() || !failures.is_empty() {
+            "error"
+        } else {
+            "unavailable"
+        }
+        .into(),
+        detail,
+    }
 }
 
 async fn bluetooth_ready(name: Option<&str>) -> Result<String> {
@@ -411,6 +448,67 @@ async fn publish_received(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn signed_curve_coordinates_preserve_leading_zeroes_and_reject_truncation() {
+        fn bytes(hex: &str) -> Vec<u8> {
+            hex.as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect()
+        }
+        // Public point 379*G: x needs left-padding after signed-integer encoding;
+        // y needs a sign-protection byte. These exercise both wire encodings.
+        let x = bytes("005543894af3d00ed7d740abdbd75c96b06877b787db5f70eea78b90a8d7c00a");
+        let y = bytes("bb4c85a3d8ea29efaafa24406912dd84d5b14dc32bf656ef6c6bd58a5d943f92");
+        let mut signed_y = vec![0];
+        signed_y.extend_from_slice(&y);
+        let decoded = rqs_lib::utils::decode_p256_public_key(&x[1..], &signed_y).unwrap();
+        let mut expected = vec![4];
+        expected.extend_from_slice(&x);
+        expected.extend_from_slice(&y);
+        assert_eq!(decoded.to_sec1_bytes().as_ref(), expected);
+        assert!(
+            rqs_lib::utils::decode_p256_public_key(&x, &y).is_err(),
+            "Negative signed coordinate"
+        );
+        assert!(rqs_lib::utils::decode_p256_public_key(&[], &signed_y).is_err());
+        assert!(rqs_lib::utils::decode_p256_public_key(&[0; 34], &signed_y).is_err());
+        assert!(rqs_lib::utils::decode_p256_public_key(&[1; 33], &signed_y).is_err());
+        assert!(
+            rqs_lib::utils::decode_p256_public_key(&[0], &[0]).is_err(),
+            "Not on the curve"
+        );
+    }
+    #[test]
+    fn network_recovery_keeps_bluetooth_failures_visible() {
+        let mut lan = rqs_lib::lan_policy::LanSnapshot::default();
+        let bluetooth = Ok("hci0".to_owned());
+        let mut failures = std::collections::BTreeMap::new();
+        failures.insert("bluetooth-gatt".into(), "No advertisement slots".into());
+        assert_eq!(
+            super::network_status(&lan, &bluetooth, true, &failures).state,
+            "error"
+        );
+        lan.interfaces.push(linuxdrop_network::InterfaceAddress {
+            name: "eth0".into(),
+            address: "192.0.2.1".parse().unwrap(),
+            netmask: "255.255.255.0".parse().unwrap(),
+            index: 1,
+            loopback: false,
+        });
+        let recovered = super::network_status(&lan, &bluetooth, true, &failures);
+        assert_eq!(recovered.state, "ready");
+        assert!(recovered.detail.contains("LAN active"));
+        assert!(recovered.detail.contains("No advertisement slots"));
+        assert!(!recovered.detail.contains("Bluetooth discovery on"));
+        lan.interfaces.clear();
+        assert_eq!(
+            super::network_status(&lan, &Ok(String::new()), false, &Default::default()).state,
+            "unavailable"
+        );
+    }
     use super::*;
     use rqs_lib::hdl::{InboundRequest, OutboundRequest};
     use rqs_lib::utils::RemoteDeviceInfo;

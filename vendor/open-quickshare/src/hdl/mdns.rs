@@ -38,6 +38,10 @@ pub struct MDnsServer {
     ble_receiver: Receiver<()>,
     visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
     visibility_receiver: watch::Receiver<Visibility>,
+    lan_state: watch::Receiver<crate::lan_policy::LanSnapshot>,
+    endpoint_id: [u8; 4],
+    service_port: u16,
+    registered: bool,
 }
 
 impl Drop for MDnsServer {
@@ -53,27 +57,38 @@ impl MDnsServer {
         ble_receiver: Receiver<()>,
         visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
         visibility_receiver: watch::Receiver<Visibility>,
+        lan_state: watch::Receiver<crate::lan_policy::LanSnapshot>,
     ) -> Result<Self, anyhow::Error> {
-        let service_info = Self::build_service(endpoint_id, service_port, DeviceType::Laptop)?;
+        let snapshot = lan_state.borrow().clone();
+        let service_info = Self::build_service_on(
+            endpoint_id,
+            service_port,
+            DeviceType::Laptop,
+            &snapshot.interfaces,
+        )?;
 
         let daemon = ServiceDaemon::new()?;
-        crate::lan_policy::configure_mdns(&daemon)?;
+        crate::lan_policy::configure_mdns_on(&daemon, &snapshot.interfaces)?;
         Ok(Self {
             daemon,
             service_info,
             ble_receiver,
             visibility_sender,
             visibility_receiver,
+            lan_state,
+            endpoint_id,
+            service_port,
+            registered: false,
         })
     }
 
     pub async fn run(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
         let monitor = self.daemon.monitor()?;
-        let ble_receiver = &mut self.ble_receiver;
         let mut visibility = *self.visibility_receiver.borrow();
-        if visibility != Visibility::Invisible {
+        if visibility != Visibility::Invisible && !self.service_info.get_addresses().is_empty() {
             self.daemon.register(self.service_info.clone())?;
+            self.registered = true;
         }
         let mut interval = interval_at(Instant::now() + TICK_INTERVAL, TICK_INTERVAL);
 
@@ -90,22 +105,33 @@ impl MDnsServer {
                         Err(err) => return Err(err.into()),
                     }
                 },
-                _ = self.visibility_receiver.changed() => {
+                changed = self.lan_state.changed() => {
+                    if changed.is_err() { break; }
+                    let snapshot = self.lan_state.borrow_and_update().clone();
+                    self.unregister().await?;
+                    crate::lan_policy::configure_mdns_on(&self.daemon, &snapshot.interfaces)?;
+                    self.service_info = Self::build_service_on(self.endpoint_id, self.service_port, DeviceType::Laptop, &snapshot.interfaces)?;
+                    if *self.visibility_receiver.borrow() != Visibility::Invisible && !self.service_info.get_addresses().is_empty() {
+                        self.daemon.register(self.service_info.clone())?;
+                        self.registered = true;
+                    }
+                },
+                changed = self.visibility_receiver.changed() => {
+                    if changed.is_err() { break; }
                     visibility = *self.visibility_receiver.borrow_and_update();
 
                     debug!("{INNER_NAME}: visibility changed: {visibility:?}");
-                    if visibility == Visibility::Visible {
+                    if visibility != Visibility::Invisible && !self.service_info.get_addresses().is_empty() {
                         self.daemon.register(self.service_info.clone())?;
-                    } else if visibility == Visibility::Invisible {
-                        let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-                        let _ = receiver.recv();
-                    } else if visibility == Visibility::Temporarily {
-                        self.daemon.register(self.service_info.clone())?;
-                        interval.reset();
+                        self.registered = true;
+                    } else {
+                        self.unregister().await?;
                     }
+                    if visibility == Visibility::Temporarily { interval.reset(); }
                 }
-                _ = ble_receiver.recv() => {
-                    if visibility == Visibility::Invisible {
+                signal = self.ble_receiver.recv() => {
+                    if matches!(signal, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
+                    if *self.visibility_receiver.borrow() == Visibility::Invisible || !self.registered {
                         continue;
                     }
 
@@ -124,19 +150,25 @@ impl MDnsServer {
                         continue;
                     }
 
-                    let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-                    let _ = receiver.recv();
+                    self.unregister().await?;
+                    visibility = Visibility::Invisible;
                     let _ = self.visibility_sender.lock().unwrap().send(Visibility::Invisible);
                 }
             }
         }
 
         // Unregister the mDNS service - we're shutting down
-        let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
-        if let Ok(event) = receiver.recv() {
-            info!("MDnsServer: service unregistered: {:?}", &event);
-        }
+        self.unregister().await?;
 
+        Ok(())
+    }
+
+    async fn unregister(&mut self) -> Result<(), anyhow::Error> {
+        if self.registered {
+            let receiver = self.daemon.unregister(self.service_info.get_fullname())?;
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv_async()).await??;
+            self.registered = false;
+        }
         Ok(())
     }
 
@@ -144,6 +176,20 @@ impl MDnsServer {
         endpoint_id: [u8; 4],
         service_port: u16,
         device_type: DeviceType,
+    ) -> Result<ServiceInfo, anyhow::Error> {
+        Self::build_service_on(
+            endpoint_id,
+            service_port,
+            device_type,
+            &crate::lan_policy::interfaces(false)?,
+        )
+    }
+
+    pub fn build_service_on(
+        endpoint_id: [u8; 4],
+        service_port: u16,
+        device_type: DeviceType,
+        interfaces: &[linuxdrop_network::InterfaceAddress],
     ) -> Result<ServiceInfo, anyhow::Error> {
         // This `name` is going to be random every time RQS service restarts.
         // If that is not desired, derive host_name, etc. via some other means
@@ -153,9 +199,9 @@ impl MDnsServer {
         let endpoint_info = gen_mdns_endpoint_info(device_type as u8, &device_name);
 
         let properties = [("n", endpoint_info)];
-        let addresses = crate::lan_policy::interfaces(false)?
-            .into_iter()
-            .filter(|interface| interface.address.is_ipv4())
+        let addresses = interfaces
+            .iter()
+            .filter(|interface| interface.address.is_ipv4() && !interface.loopback)
             .map(|interface| interface.address.to_string())
             .collect::<Vec<_>>()
             .join(",");

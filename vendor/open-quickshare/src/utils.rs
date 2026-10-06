@@ -149,6 +149,28 @@ pub fn encode_point(unsigned: Bytes) -> Result<Vec<u8>, anyhow::Error> {
     Ok(big_int.to_signed_bytes_be())
 }
 
+/// SecureMessage uses signed big-endian integer coordinates, whereas SEC1 uses
+/// two fixed-width unsigned 32-byte coordinates. Never truncate oversized input.
+pub fn decode_p256_public_key(x: &[u8], y: &[u8]) -> Result<PublicKey, anyhow::Error> {
+    fn coordinate(input: &[u8]) -> Result<[u8; 32], anyhow::Error> {
+        if input.is_empty() || input.len() > 33 || input[0] & 0x80 != 0 {
+            return Err(anyhow!("Invalid signed P-256 coordinate"));
+        }
+        let magnitude = input.strip_prefix(&[0]).unwrap_or(input);
+        if magnitude.len() > 32 {
+            return Err(anyhow!("Oversized P-256 coordinate"));
+        }
+        let mut result = [0; 32];
+        result[32 - magnitude.len()..].copy_from_slice(magnitude);
+        Ok(result)
+    }
+    let mut sec1 = [0u8; 65];
+    sec1[0] = 4;
+    sec1[1..33].copy_from_slice(&coordinate(x)?);
+    sec1[33..].copy_from_slice(&coordinate(y)?);
+    Ok(PublicKey::from_sec1_bytes(&sec1)?)
+}
+
 pub fn hkdf_extract_expand(
     salt: &[u8],
     input: &[u8],
