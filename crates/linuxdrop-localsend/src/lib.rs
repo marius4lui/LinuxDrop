@@ -843,7 +843,7 @@ async fn cancel(
     StatusCode::OK
 }
 
-async fn send(s: SharedState, id: String, peer_id: String, paths: Vec<PathBuf>) {
+async fn send(s: SharedState, id: String, peer_id: String, paths: Vec<SendSource>) {
     let peer = s
         .peers
         .lock()
@@ -886,7 +886,7 @@ async fn send(s: SharedState, id: String, peer_id: String, paths: Vec<PathBuf>) 
 async fn send_files(
     s: &SharedState,
     transfer: &mut Transfer,
-    paths: Vec<PathBuf>,
+    paths: Vec<SendSource>,
     peer: Option<(DeviceInfo, SocketAddr)>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -901,20 +901,12 @@ async fn send_files(
     let base = format!("{}://{address}/api/localsend/v2", info.protocol);
     let mut files = HashMap::new();
     let mut opened = Vec::new();
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("Invalid UTF-8 file name")?
-            .to_string();
+    for source in paths {
+        let name = source.name().to_owned();
         validate_name(&name)?;
-        let file = tokio::fs::File::open(&path).await?;
-        let metadata = file.metadata().await?;
-        if !metadata.is_file() {
-            bail!("Only regular files can be sent");
-        }
+        let file = tokio::fs::File::from_std(source.reader()?);
+        let size = source.size();
         let file_id = Uuid::new_v4().to_string();
-        let size = metadata.len();
         transfer.total_bytes = transfer
             .total_bytes
             .checked_add(size)
@@ -1190,7 +1182,10 @@ mod tests {
         st.send(BackendCommand::Send {
             transfer_id: "pin-and-partial".into(),
             peer_id: format!("localsend:{rf}"),
-            files: vec![keep, skip],
+            files: [keep, skip]
+                .iter()
+                .map(|path| linuxdrop_core::SendSource::open(path).unwrap())
+                .collect(),
         })
         .await
         .unwrap();
@@ -1288,10 +1283,16 @@ mod tests {
         tokio::fs::write(bc.download_dir.join("Grüße.txt"), b"keep me")
             .await
             .unwrap();
+        let sources = [source.clone(), empty, duplicate]
+            .iter()
+            .map(|path| linuxdrop_core::SendSource::open(path).unwrap())
+            .collect();
+        std::fs::rename(&source, a.path().join("moved-source")).unwrap();
+        std::fs::write(&source, b"replacement must never be sent").unwrap();
         atx.send(BackendCommand::Send {
             transfer_id: "send-one".into(),
             peer_id: format!("localsend:{bf}"),
-            files: vec![source.clone(), empty, duplicate],
+            files: sources,
         })
         .await
         .unwrap();
@@ -1322,7 +1323,7 @@ mod tests {
         atx.send(BackendCommand::Send {
             transfer_id: "reject-two".into(),
             peer_id: format!("localsend:{bf}"),
-            files: vec![source],
+            files: vec![linuxdrop_core::SendSource::open(&source).unwrap()],
         })
         .await
         .unwrap();
@@ -1487,7 +1488,7 @@ mod tests {
                 .send(BackendCommand::Send {
                     transfer_id: behavior.into(),
                     peer_id: format!("localsend:{fingerprint}"),
-                    files: vec![source],
+                    files: vec![linuxdrop_core::SendSource::open(&source).unwrap()],
                 })
                 .await
                 .unwrap();

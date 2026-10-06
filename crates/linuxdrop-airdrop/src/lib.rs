@@ -673,10 +673,23 @@ mod tests {
             1,
             "unsolicited upload cannot create files"
         );
-        let files = vec![
+        let files = [
             source.path().join("photo.bin"),
             source.path().join("empty.txt"),
-        ];
+        ]
+        .iter()
+        .map(|path| linuxdrop_core::SendSource::open(path).unwrap())
+        .collect();
+        std::fs::rename(
+            source.path().join("photo.bin"),
+            source.path().join("moved-photo.bin"),
+        )
+        .unwrap();
+        std::fs::write(
+            source.path().join("photo.bin"),
+            b"replacement must never be sent",
+        )
+        .unwrap();
         let sender = tokio::spawn(async move {
             let mut transfer = empty_transfer("sender", "loopback", "Receiver", "outgoing");
             transport::send(
@@ -728,14 +741,17 @@ mod tests {
         let cancel = CancellationToken::new();
         let sender_cancel = cancel.clone();
         let sender_events = shared.events.clone();
-        let second_files = vec![source.path().join("photo.bin")];
+        let second_files = [source.path().join("photo.bin")];
         let interrupted = tokio::spawn(async move {
             let mut transfer = empty_transfer("interrupted", "loopback", "Receiver", "outgoing");
             assert!(
                 transport::send(
                     address,
                     "Sender",
-                    second_files,
+                    second_files
+                        .iter()
+                        .map(|path| linuxdrop_core::SendSource::open(path).unwrap())
+                        .collect(),
                     &mut transfer,
                     &sender_events,
                     sender_cancel,

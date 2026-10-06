@@ -12,7 +12,6 @@ use rustls::{
 };
 use std::{
     net::SocketAddr,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -178,7 +177,7 @@ async fn connect_on_awdl(address: SocketAddr) -> Result<tokio::net::TcpStream> {
 pub async fn send(
     address: SocketAddr,
     name: &str,
-    files: Vec<PathBuf>,
+    files: Vec<linuxdrop_core::SendSource>,
     transfer: &mut Transfer,
     events: &mpsc::Sender<BackendEvent>,
     cancel: CancellationToken,
@@ -189,7 +188,7 @@ pub async fn send(
 async fn send_inner(
     address: SocketAddr,
     name: &str,
-    files: Vec<PathBuf>,
+    files: Vec<linuxdrop_core::SendSource>,
     transfer: &mut Transfer,
     events: &mpsc::Sender<BackendEvent>,
     cancel: CancellationToken,
@@ -200,27 +199,20 @@ async fn send_inner(
     }
     let mut metadata = vec![];
     let mut names = std::collections::HashSet::new();
-    for path in &files {
-        let stat = tokio::fs::metadata(path).await?;
-        if !stat.is_file() {
-            bail!("Only regular files can be shared");
-        }
-        let name = path
-            .file_name()
-            .context("Missing filename")?
-            .to_str()
-            .context("AirDrop needs UTF-8 filenames")?;
+    for source in &files {
+        source.verify()?;
+        let name = source.name();
         linuxdrop_storage::validate_name(name)?;
         if !names.insert(name.to_owned()) {
             bail!("Files in one AirDrop transfer must have distinct names");
         }
         transfer.total_bytes = transfer
             .total_bytes
-            .checked_add(stat.len())
+            .checked_add(source.size())
             .context("Size overflow")?;
         transfer.files.push(TransferFile {
             name: name.into(),
-            size: stat.len(),
+            size: source.size(),
             transferred: 0,
         });
         let mut file = plist::Dictionary::new();
@@ -229,7 +221,10 @@ async fn send_inner(
             "FileType".into(),
             plist::Value::String("public.data".into()),
         );
-        file.insert("FileSize".into(), plist::Value::Integer(stat.len().into()));
+        file.insert(
+            "FileSize".into(),
+            plist::Value::Integer(source.size().into()),
+        );
         file.insert(
             "FileBomPath".into(),
             plist::Value::String(format!("./{name}")),
@@ -242,9 +237,10 @@ async fn send_inner(
         .await
         .ok();
     let archive_cancel = cancel.clone();
-    let (archive, size) =
-        tokio::task::spawn_blocking(move || super::archive::encode(&files, Some(&archive_cancel)))
-            .await??;
+    let (archive, size) = tokio::task::spawn_blocking(move || {
+        super::archive::encode_sources(&files, Some(&archive_cancel))
+    })
+    .await??;
     let config = Arc::new(
         rustls::ClientConfig::builder()
             .dangerous()

@@ -6,7 +6,6 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
-    path::PathBuf,
 };
 
 pub fn inflate(
@@ -156,32 +155,36 @@ pub fn index(input: &mut File, expected: &[AskFile]) -> Result<Vec<Entry>> {
 }
 
 /// Create independently compressed 1 MiB frames, keeping memory bounded.
+#[cfg(test)]
 pub fn encode(
-    files: &[PathBuf],
+    files: &[std::path::PathBuf],
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<(File, u64)> {
+    let sources = files
+        .iter()
+        .map(linuxdrop_core::SendSource::open)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    encode_sources(&sources, cancel)
+}
+pub fn encode_sources(
+    files: &[linuxdrop_core::SendSource],
     cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<(File, u64)> {
     let mut cpio = tempfile::tempfile()?;
-    for (index, path) in files.iter().enumerate() {
-        let mut file = File::open(path)?;
-        let meta = file.metadata()?;
-        if !meta.is_file() {
-            bail!("Only regular files can be shared");
-        }
-        let name = path
-            .file_name()
-            .context("Missing filename")?
-            .to_str()
-            .context("Filename must be UTF-8")?;
+    for (index, source) in files.iter().enumerate() {
+        let mut file = source.reader()?;
+        let name = source.name();
         linuxdrop_storage::validate_name(name)?;
-        write_header(&mut cpio, name, meta.len(), index as u32)?;
+        write_header(&mut cpio, name, source.size(), index as u32)?;
         let copied = checked_copy(
-            &mut Read::by_ref(&mut file).take(meta.len() + 1),
+            &mut Read::by_ref(&mut file).take(source.size() + 1),
             &mut cpio,
             cancel,
         )?;
-        if copied != meta.len() {
+        if copied != source.size() {
             bail!("Source file changed during preparation");
         }
+        source.verify()?;
     }
     write_header(&mut cpio, "TRAILER!!!", 0, files.len() as u32)?;
     cpio.rewind()?;

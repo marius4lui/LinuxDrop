@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+mod source;
+pub use source::SendSource;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -92,7 +94,7 @@ pub enum BackendCommand {
     Send {
         transfer_id: String,
         peer_id: String,
-        files: Vec<PathBuf>,
+        files: Vec<SendSource>,
     },
     Accept {
         transfer_id: String,

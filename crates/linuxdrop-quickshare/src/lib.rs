@@ -334,7 +334,7 @@ fn empty_transfer(id: &str, peer_id: &str, name: &str, direction: &str) -> Trans
 fn prepare_send(
     id: &str,
     peer_id: &str,
-    files: &[PathBuf],
+    files: &[linuxdrop_core::SendSource],
     peers: &HashMap<String, EndpointInfo>,
 ) -> Result<(SendInfo, Transfer)> {
     let peer = peers
@@ -349,30 +349,17 @@ fn prepare_send(
         peer.name.as_deref().unwrap_or("Android device"),
         "outgoing",
     );
-    let mut paths = Vec::new();
-    for path in files {
-        let meta = std::fs::metadata(path)?;
-        if !meta.is_file() {
-            bail!("Only regular files can be shared");
-        }
+    for source in files {
+        source.verify()?;
         transfer.total_bytes = transfer
             .total_bytes
-            .checked_add(meta.len())
+            .checked_add(source.size())
             .context("File size overflow")?;
         transfer.files.push(TransferFile {
-            name: path
-                .file_name()
-                .context("Missing filename")?
-                .to_string_lossy()
-                .into(),
-            size: meta.len(),
+            name: source.name().into(),
+            size: source.size(),
             transferred: 0,
         });
-        paths.push(
-            path.to_str()
-                .context("Quick Share requires UTF-8 paths")?
-                .to_owned(),
-        );
     }
     Ok((
         SendInfo {
@@ -383,7 +370,7 @@ fn prepare_send(
                 peer.ip.as_deref().unwrap_or("0.0.0.0"),
                 peer.port.as_deref().unwrap_or("0")
             ),
-            ob: OutboundPayload::Files(paths),
+            ob: OutboundPayload::OpenedFiles(files.to_vec()),
             ble: peer.ble_addr.is_some(),
         },
         transfer,
@@ -579,14 +566,19 @@ mod tests {
         });
         let socket = tokio::net::TcpStream::connect(proxy_address).await.unwrap();
         let tx_messages = messages.clone();
-        let source_string = source.to_str().unwrap().to_owned();
+        let sources = vec![
+            linuxdrop_core::SendSource::open(&source).unwrap(),
+            linuxdrop_core::SendSource::open(&empty).unwrap(),
+        ];
+        std::fs::rename(&source, dir.path().join("moved-source")).unwrap();
+        std::fs::write(&source, b"replacement must never be sent").unwrap();
         let outgoing = tokio::spawn(async move {
             let mut protocol = OutboundRequest::new(
                 *b"TEST",
                 socket,
                 "outgoing-test".into(),
                 tx_messages,
-                OutboundPayload::Files(vec![source_string, empty.to_str().unwrap().to_owned()]),
+                OutboundPayload::OpenedFiles(sources),
                 RemoteDeviceInfo {
                     name: "Receiver".into(),
                     device_type: rqs_lib::DeviceType::Laptop,

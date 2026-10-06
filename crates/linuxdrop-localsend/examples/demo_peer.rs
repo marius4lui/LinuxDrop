@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
                         println!("Mit LinuxDrop verbunden: {}",remote["alias"].as_str().unwrap_or("LinuxDrop"));
                         if send_back {
                             send_back=false;
-                            commands.send(BackendCommand::Send{transfer_id:"demo-send-back".into(),peer_id:format!("localsend:{daemon_fingerprint}"),files:vec![sample.clone()]}).await?;
+                            commands.send(BackendCommand::Send{transfer_id:"demo-send-back".into(),peer_id:format!("localsend:{daemon_fingerprint}"),files:vec![linuxdrop_core::SendSource::open(&sample)?]}).await?;
                             println!("Explizit angeforderter Empfangstest gestartet; bitte in LinuxDrop annehmen.");
                         }
                     },

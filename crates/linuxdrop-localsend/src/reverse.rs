@@ -142,47 +142,34 @@ pub async fn start_offer_with_budget(
     if paths.is_empty() || paths.len() > config.max_files || paths.len() > 256 {
         bail!("Invalid download offer file count");
     }
+    let sources = paths
+        .into_iter()
+        .map(linuxdrop_core::SendSource::open)
+        .collect::<std::io::Result<Vec<_>>>()?;
+    start_sources_with_budget(config, sources, bandwidth).await
+}
+pub async fn start_sources_with_budget(
+    config: OfferConfig,
+    sources: Vec<linuxdrop_core::SendSource>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
+) -> Result<ReverseOffer> {
+    if sources.is_empty() || sources.len() > config.max_files || sources.len() > 256 {
+        bail!("Invalid download offer file count");
+    }
     if config.expires_after.is_zero() || config.expires_after > Duration::from_secs(3600) {
         bail!("Download offers must expire within one hour");
     }
     let mut files = HashMap::new();
     let mut total = 0u64;
-    for path in paths {
-        let metadata = std::fs::symlink_metadata(&path)
-            .with_context(|| format!("Cannot read {}", path.display()))?;
-        if !metadata.file_type().is_file() {
-            bail!("Only local regular files may be offered");
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let file = options.open(&path)?;
-        let opened = file.metadata()?;
-        if !opened.is_file() {
-            bail!("Source is not a regular file");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-                bail!("Source changed while preparing offer");
-            }
-        }
+    for source in sources {
+        let file = source.reader()?;
         total = total
-            .checked_add(opened.len())
+            .checked_add(source.size())
             .context("Offer size overflow")?;
         if total > config.max_bytes {
             bail!("Download offer exceeds configured size limit");
         }
-        let name = path
-            .file_name()
-            .context("File name missing")?
-            .to_string_lossy()
-            .into_owned();
+        let name = source.name().to_owned();
         linuxdrop_storage::validate_name(&name)?;
         let id = Uuid::new_v4().to_string();
         files.insert(
@@ -192,7 +179,7 @@ pub async fn start_offer_with_budget(
                 metadata: FileMetadata {
                     id,
                     file_name: name,
-                    size: opened.len(),
+                    size: source.size(),
                     file_type: "application/octet-stream".into(),
                     sha256: None,
                 },
@@ -453,7 +440,10 @@ mod tests {
         let path = dir.path().join("Grüße file.txt");
         let bytes = vec![42u8; 150_000];
         std::fs::write(&path, &bytes).unwrap();
-        let offer = start_offer_with_budget(
+        let source = linuxdrop_core::SendSource::open(&path).unwrap();
+        std::fs::rename(&path, dir.path().join("moved-source")).unwrap();
+        std::fs::write(&path, b"replacement must never be sent").unwrap();
+        let offer = start_sources_with_budget(
             OfferConfig {
                 alias: "Test".into(),
                 bind: "127.0.0.1:0".parse().unwrap(),
@@ -461,7 +451,7 @@ mod tests {
                 max_files: 10,
                 max_bytes: 1_000_000,
             },
-            vec![path],
+            vec![source],
             linuxdrop_network::BandwidthLimiter::new(Some(bytes.len() as u64)),
         )
         .await

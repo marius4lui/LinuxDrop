@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -127,6 +126,37 @@ const WIFI_PAYLOAD_CHUNK: usize = 512 * 1024;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum OutboundPayload {
     Files(Vec<String>),
+    #[serde(skip)]
+    OpenedFiles(Vec<linuxdrop_network::SendSource>),
+}
+impl OutboundPayload {
+    pub fn sources(&self) -> Result<Vec<linuxdrop_network::SendSource>, anyhow::Error> {
+        match self {
+            Self::Files(paths) => Ok(paths
+                .iter()
+                .map(linuxdrop_network::SendSource::open)
+                .collect::<std::io::Result<Vec<_>>>()?),
+            Self::OpenedFiles(sources) => Ok(sources.clone()),
+        }
+    }
+    pub fn names(&self) -> Vec<String> {
+        match self {
+            Self::Files(paths) => paths
+                .iter()
+                .map(|path| {
+                    Path::new(path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
+            Self::OpenedFiles(sources) => sources
+                .iter()
+                .map(|source| source.name().to_owned())
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -176,7 +206,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         rdi: RemoteDeviceInfo,
     ) -> Self {
         let receiver = sender.subscribe();
-        let OutboundPayload::Files(files) = &payload;
+        let files = payload.names();
 
         Self {
             endpoint_id,
@@ -849,89 +879,67 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
 
         let mut file_metadata: Vec<FileMetadata> = vec![];
         let mut transferred_files: HashMap<i64, InternalFileInfo> = HashMap::new();
-        let mut total_to_send = 0;
+        let mut total_to_send = 0u64;
         // TODO - Handle sending Text
-        match &self.payload {
-            OutboundPayload::Files(files) => {
-                for f in files {
-                    let path = Path::new(f);
-                    if !path.is_file() {
-                        warn!("Path is not a file: {}", f);
-                        continue;
-                    }
+        for source in self.payload.sources()? {
+            let path = Path::new(source.name());
+            let file = source.reader()?;
+            let fmetadata = file.metadata()?;
+            let ftype = mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .to_string();
 
-                    let file = match File::open(f) {
-                        Ok(_f) => _f,
-                        Err(e) => {
-                            error!("Failed to open file: {f}: {:?}", e);
-                            continue;
-                        }
-                    };
-                    let fmetadata = match file.metadata() {
-                        Ok(_fm) => _fm,
-                        Err(e) => {
-                            error!("Failed to get metadata for: {f}: {:?}", e);
-                            continue;
-                        }
-                    };
+            let meta_type = if ftype.starts_with("image/") {
+                file_metadata::Type::Image
+            } else if ftype.starts_with("video/") {
+                file_metadata::Type::Video
+            } else if ftype.starts_with("audio/") {
+                file_metadata::Type::Audio
+            } else if path.extension().unwrap_or_default() == "apk" {
+                file_metadata::Type::App
+            } else {
+                file_metadata::Type::Unknown
+            };
 
-                    let ftype = mime_guess::from_path(path)
-                        .first_or_octet_stream()
-                        .to_string();
-
-                    let meta_type = if ftype.starts_with("image/") {
-                        file_metadata::Type::Image
-                    } else if ftype.starts_with("video/") {
-                        file_metadata::Type::Video
-                    } else if ftype.starts_with("audio/") {
-                        file_metadata::Type::Audio
-                    } else if path.extension().unwrap_or_default() == "apk" {
-                        file_metadata::Type::App
-                    } else {
-                        file_metadata::Type::Unknown
-                    };
-
-                    info!("File type to send: {}", ftype);
-                    let fname = path
-                        .file_name()
-                        .ok_or_else(|| anyhow!("Failed to get file_name for {f}"))?;
-                    let fmeta = FileMetadata {
-                        // Positive like Google's own implementations generate —
-                        // a strict receiver (Windows) may discard payloads with
-                        // a negative id as invalid.
-                        payload_id: Some(
-                            rand::rng().random::<i64>().unsigned_abs() as i64 & i64::MAX,
-                        ),
-                        name: Some(fname.to_os_string().into_string().unwrap()),
-                        size: Some(fmetadata.size() as i64),
-                        mime_type: Some(ftype),
-                        r#type: Some(meta_type.into()),
-                        // The attachment uuid ("Should be unique across all
-                        // attachments"). Receivers key their transfer
-                        // bookkeeping on it — Android tolerates its absence,
-                        // Windows sits at "Connecting…" without it while the
-                        // payload still saves.
-                        id: Some(rand::rng().random::<i64>().unsigned_abs() as i64 & i64::MAX),
-                        ..Default::default()
-                    };
-                    info!(
-                        "introduction attachment: id={:?} payload_id={:?} name={:?} size={:?} mime={:?}",
-                        fmeta.id, fmeta.payload_id, fmeta.name, fmeta.size, fmeta.mime_type
-                    );
-                    transferred_files.insert(
-                        fmeta.payload_id(),
-                        InternalFileInfo {
-                            payload_id: fmeta.payload_id(),
-                            file_url: path.to_path_buf(),
-                            bytes_transferred: 0,
-                            total_size: fmeta.size(),
-                            file: Some(file),
-                        },
-                    );
-                    file_metadata.push(fmeta);
-                    total_to_send += fmetadata.size();
-                }
-            }
+            info!("File type to send: {}", ftype);
+            let fname = path
+                .file_name()
+                .ok_or_else(|| anyhow!("Missing source filename"))?;
+            let fmeta = FileMetadata {
+                // Positive like Google's own implementations generate —
+                // a strict receiver (Windows) may discard payloads with
+                // a negative id as invalid.
+                payload_id: Some(rand::rng().random::<i64>().unsigned_abs() as i64 & i64::MAX),
+                name: Some(fname.to_os_string().into_string().unwrap()),
+                size: Some(fmetadata.size() as i64),
+                mime_type: Some(ftype),
+                r#type: Some(meta_type.into()),
+                // The attachment uuid ("Should be unique across all
+                // attachments"). Receivers key their transfer
+                // bookkeeping on it — Android tolerates its absence,
+                // Windows sits at "Connecting…" without it while the
+                // payload still saves.
+                id: Some(rand::rng().random::<i64>().unsigned_abs() as i64 & i64::MAX),
+                ..Default::default()
+            };
+            info!(
+                "introduction attachment: id={:?} payload_id={:?} name={:?} size={:?} mime={:?}",
+                fmeta.id, fmeta.payload_id, fmeta.name, fmeta.size, fmeta.mime_type
+            );
+            transferred_files.insert(
+                fmeta.payload_id(),
+                InternalFileInfo {
+                    payload_id: fmeta.payload_id(),
+                    file_url: path.to_path_buf(),
+                    bytes_transferred: 0,
+                    total_size: fmeta.size(),
+                    file: Some(file),
+                },
+            );
+            file_metadata.push(fmeta);
+            total_to_send = total_to_send
+                .checked_add(fmetadata.size())
+                .ok_or_else(|| anyhow!("File size overflow"))?;
         }
 
         self.update_state(

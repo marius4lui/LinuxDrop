@@ -285,11 +285,10 @@ impl TransferConnector {
         // A payload that fits comfortably over BLE never needs a Wi-Fi
         // upgrade: a few bytes of pasted text shouldn't cost a multi-second
         // Wi-Fi Direct join that also drops this machine off its own network.
-        let OutboundPayload::Files(files) = &si.ob;
-        let total_bytes: u64 = files
-            .iter()
-            .filter_map(|f| std::fs::metadata(f).ok().map(|m| m.len()))
-            .sum();
+        let total_bytes = si.ob.sources()?.iter().try_fold(0u64, |sum, file| {
+            sum.checked_add(file.size())
+                .ok_or_else(|| anyhow::anyhow!("File size overflow"))
+        })?;
 
         // The UI knows this transfer by `si.id` (the `ble://<name>` endpoint
         // id) -- a Disconnected report under any other id renders as a

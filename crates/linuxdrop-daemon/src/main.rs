@@ -21,7 +21,7 @@ const OBJECT: &str = "/io/github/marius4lui/LinuxDrop";
 const INTERFACE: &str = "io.github.marius4lui.LinuxDrop.Manager1";
 
 struct Draft {
-    paths: Vec<PathBuf>,
+    files: Vec<SendSource>,
     created: Instant,
 }
 struct Data {
@@ -450,30 +450,34 @@ impl Manager {
         {
             return Err(failed("Invalid file selection"));
         }
-        let mut total = 0u64;
-        let mut files = Vec::new();
-        for path in paths {
-            let path = PathBuf::from(path);
-            if !path.is_absolute() {
-                return Err(failed("File paths must be absolute"));
+        let max_bytes = d.settings["receive"]["max_bytes"].as_u64().unwrap();
+        let files = tokio::task::spawn_blocking(move || -> Result<Vec<SendSource>> {
+            let mut total = 0u64;
+            let mut files = Vec::new();
+            for path in paths {
+                let path = PathBuf::from(path);
+                if !path.is_absolute() {
+                    anyhow::bail!("File paths must be absolute");
+                }
+                let source = SendSource::open(&path)?;
+                total = total
+                    .checked_add(source.size())
+                    .context("File size overflow")?;
+                if total > max_bytes {
+                    anyhow::bail!("Selection exceeds configured size limit");
+                }
+                files.push(source);
             }
-            let metadata = tokio::fs::metadata(&path).await.map_err(failed)?;
-            if !metadata.is_file() {
-                return Err(failed("Only regular files are currently supported"));
-            }
-            total = total
-                .checked_add(metadata.len())
-                .ok_or_else(|| failed("File size overflow"))?;
-            files.push(path);
-        }
-        if total > d.settings["receive"]["max_bytes"].as_u64().unwrap() {
-            return Err(failed("Selection exceeds configured size limit"));
-        }
+            Ok(files)
+        })
+        .await
+        .map_err(failed)?
+        .map_err(failed)?;
         let id = Uuid::new_v4().to_string();
         d.drafts.insert(
             id.clone(),
             Draft {
-                paths: files,
+                files,
                 created: Instant::now(),
             },
         );
@@ -511,7 +515,7 @@ impl Manager {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let budget = self.0.bandwidth.lock().await.clone();
         let offer =
-            linuxdrop_localsend::reverse::start_offer_with_budget(config, draft.paths, budget)
+            linuxdrop_localsend::reverse::start_sources_with_budget(config, draft.files, budget)
                 .await
                 .map_err(failed)?;
         let result=json!({"url":format!("http://{}",offer.address),"pin":offer.pin,"expires_in":600,"encrypted":false}).to_string();
@@ -600,11 +604,11 @@ impl Manager {
             .ok_or_else(|| failed("File selection expired"))?;
         let id = Uuid::new_v4().to_string();
         let mut files = Vec::new();
-        for p in &draft.paths {
-            let m = tokio::fs::metadata(p).await.map_err(failed)?;
+        for source in &draft.files {
+            source.verify().map_err(failed)?;
             files.push(TransferFile {
-                name: p.file_name().unwrap_or_default().to_string_lossy().into(),
-                size: m.len(),
+                name: source.name().into(),
+                size: source.size(),
                 transferred: 0,
             });
         }
@@ -632,7 +636,7 @@ impl Manager {
             .send(BackendCommand::Send {
                 transfer_id: id.clone(),
                 peer_id,
-                files: draft.paths,
+                files: draft.files,
             })
             .await
             .is_err()

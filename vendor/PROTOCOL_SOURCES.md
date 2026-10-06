@@ -23,6 +23,7 @@ Quick Share:
 - Constant-time HMAC verification, bounded metadata buffers, invalid curve-point rejection and AES frame dimension checks.
 - Persistent partial length-prefix state across control-channel wakeups; read timeout for complete frame bodies.
 - Zero-byte send framing and changed/truncated source detection.
+- LinuxDrop sends opened source descriptors into the outbound engine; logical names remain stable and path replacement cannot change which inode is read. Legacy upstream path inputs remain separate.
 - Independent tracked LAN sessions, shutdown cancellation, inbound terminal failure events and discovery connect timeout.
 - TCP/mDNS task health events, Bluetooth degradation diagnostics, initial mDNS registration and daemon shutdown on drop. Rust formatting is normalized for the repository's formatter gate.
 - IPv4 LAN listeners, source sockets, discovery probes and upgrades follow LinuxDrop's interface allowlist. mDNS uses explicit bound addresses instead of the library's unrestricted auto-address population. Listener reconciliation publishes one snapshot for advertisement, discovery and readiness; existing sessions survive unrelated address changes. Discovery probes are bounded, cancellable and discarded when superseded.

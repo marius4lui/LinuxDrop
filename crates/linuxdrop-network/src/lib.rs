@@ -15,7 +15,7 @@ pub trait P2pConnector: Send + Sync {
     fn disconnect(&self) -> futures_util::future::BoxFuture<'_, Result<()>>;
 }
 use anyhow::{bail, Result};
-pub use linuxdrop_core::TransferPolicy;
+pub use linuxdrop_core::{SendSource, TransferPolicy};
 use std::{
     ffi::CStr,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
