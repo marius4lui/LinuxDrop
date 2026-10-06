@@ -66,3 +66,50 @@ opened German dialog at 480x600 in
 `ui/completion/download-offer-review.png`; all text, input and actions fit.
 The visible desktop demo was not restarted. Existing broader desktop acceptance
 items above remain open.
+
+
+## Focused Astra UX/UI follow-up ? 2026-10-07
+
+Two Astra/high agents owned separate native-dialog/settings and Shell/style areas.
+Changes preserve the panel-first flow and leave the live demo untouched:
+
+- Failed incoming consent reopens the review with the same destination, selected
+  subset and collision rule. The error is visible without the D-Bus namespace.
+- Receiving PIN setup precedes the dependent switch; search focus and unsaved
+  entries survive rebuilds. Offline switch/choice edits restore persisted values.
+- Link/PIN dialogs have entry focus and Enter actions; folder-picker failures are
+  reported while ordinary dismissal remains quiet.
+- The Shell bubble replaces stale actions when offline, disables duplicate
+  mutations during requests, preserves progress actors/focus and restores panel
+  focus on close. Its scroll area, labels and progress track use allocated space.
+- Essential secondary GTK instructions have higher contrast. Symlink selections
+  receive a specific explanation matching daemon validation.
+
+Evidence: 48 workspace tests pass (three environment-specific scenarios skipped
+by that command), warning-free all-target workspace Clippy, and the separately run
+native GTK regression passes. The native scenario explicitly injects an incoming
+consent error, checks the retained choices and verifies a successful retry; it
+also checks PIN dependencies and settings search focus. Updated 480x600 captures
+were inspected after dialog animations settled, including
+`ui/completion/incoming-retry-review.png`.
+
+The real daemon D-Bus/HTTPS integration also passes. Source-descriptor regressions
+exercise LocalSend, Quick Share, AirDrop and reverse downloads after replacing the
+original path; they receive the original bytes. This pins file identity and does
+not promise an immutable snapshot during concurrent in-place writes.
+
+A separate, temporary GNOME 46 profile/private bus passes the reproducible
+`extensions/gnome-shell/tests/run-bubble-smoke.sh` scenario with normal text and
+German 150% text: hidden/open, native scroll, verification, transfer navigation,
+progress geometry, busy/offline actions and focus. This uncovered and fixed a real
+progress allocation bug. These checks do not claim physical mixed-DPI, complete
+screen-reader or later GNOME-version acceptance. Installed demo/packages remain
+unchanged and do not yet contain these source changes.
+
+
+Root also inspected the final German 150% text capture
+`ui/completion/shell-verification-large-review.png`. The full confirmation and
+secondary actions fit; long peer/file names use intentional ellipsis. Relative
+font sizes now respect the system text setting. The final Shell regression also
+changes each file's byte progress and verifies stable Quick Settings device
+actors, covering the two focus regressions found during root review.

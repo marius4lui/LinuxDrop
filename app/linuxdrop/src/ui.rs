@@ -824,11 +824,16 @@ impl Ui {
                     match file
                         .query_info_future(
                             "standard::type,standard::size,access::can-read",
-                            gio::FileQueryInfoFlags::NONE,
+                            gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
                             glib::Priority::DEFAULT,
                         )
                         .await
                     {
+                        Ok(info) if info.file_type() == gio::FileType::SymbolicLink => {
+                            FileCheck::Invalid(tr(
+                                "Select the original file instead of a symbolic link",
+                            ))
+                        }
                         Ok(info) if info.file_type() != gio::FileType::Regular => {
                             FileCheck::Invalid(tr(
                                 "Select regular files; folders need to be imported first",

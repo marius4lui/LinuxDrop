@@ -37,7 +37,11 @@ pub async fn call(
             },
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|mut error| {
+            // The transport namespace is diagnostic metadata, not user guidance.
+            gio::DBusError::strip_remote_error(&mut error);
+            crate::i18n::tr(error.message())
+        })
 }
 
 pub async fn json(proxy: &gio::DBusProxy, method: &str) -> Result<Value, String> {

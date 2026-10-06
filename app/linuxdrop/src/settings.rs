@@ -49,9 +49,11 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
     let search = gtk::SearchEntry::builder()
         .placeholder_text(tr("Search settings"))
         .build();
+    search.set_widget_name("setting:search");
     search.set_text(&ui.settings_query.borrow());
     ui.settings_body.append(&search);
     let category = gtk::DropDown::from_strings(&[&tr("All categories")]);
+    category.set_widget_name("setting:category");
     category.update_property(&[gtk::accessible::Property::Label(&tr("Settings category"))]);
     ui.settings_body.append(&category);
     let sections: &[(&str, &str, &str, &[Field])] = &[
@@ -156,8 +158,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "LocalSend",
             "Share with the LocalSend app on any platform",
             &[
+                field("pin", "Receiving PIN", "Use 4 to 12 digits. Apply the PIN before requiring it from senders.", Kind::Secret),
                 field("require_pin", "Require a receiving PIN", "LocalSend senders must enter your PIN before transferring", Kind::Toggle),
-                field("pin", "Receiving PIN", "Keep this PIN private; diagnostics never include it", Kind::Secret),
                 Field {
                     key: "enabled",
                     title: "Enable LocalSend",
@@ -335,6 +337,16 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                         .subtitle(tr(field.detail))
                         .active(value.as_bool().unwrap_or(false))
                         .build();
+                    if *section == "localsend"
+                        && field.key == "require_pin"
+                        && config["localsend"]["pin"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .is_empty()
+                    {
+                        row.set_sensitive(false);
+                        row.set_subtitle(&tr("Set and apply a receiving PIN first"));
+                    }
                     let weak = Rc::downgrade(ui);
                     let section = section.to_string();
                     let key = field.key.to_owned();
@@ -550,8 +562,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                             dialog.select_folder(
                                 Some(&ui.window),
                                 gio::Cancellable::NONE,
-                                move |result| {
-                                    if let Ok(file) = result {
+                                move |result| match result {
+                                    Ok(file) => {
                                         if let Some(path) = file.path() {
                                             update(
                                                 &owned,
@@ -563,6 +575,10 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                                             owned.toast("Choose a local folder");
                                         }
                                     }
+                                    Err(error)
+                                        if error.matches(gtk::DialogError::Dismissed)
+                                            || error.matches(gtk::DialogError::Cancelled) => {}
+                                    Err(error) => owned.toast(&error.to_string()),
                                 },
                             );
                         }
@@ -596,7 +612,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                         dialog.set_close_response("cancel");
                         dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
                         let weak = Rc::downgrade(&ui);
-                        dialog.connect_response(None, move |_, response| { if response == "clear" { if let Some(ui) = weak.upgrade() { let Some(proxy)=ui.proxy.borrow().clone() else{return;}; glib::MainContext::default().spawn_local(async move {match crate::ipc::call(&proxy,"ClearHistory",None).await {Ok(_)=>{ui.toast("Transfer history cleared");ui.refresh();},Err(error)=>ui.toast(&error)}}); } } });
+                        dialog.connect_response(None, move |_, response| { if response == "clear" { if let Some(ui) = weak.upgrade() { let Some(proxy)=ui.proxy.borrow().clone() else{ui.toast("The sharing service is not connected yet");return;}; glib::MainContext::default().spawn_local(async move {match crate::ipc::call(&proxy,"ClearHistory",None).await {Ok(_)=>{ui.toast("Transfer history cleared");ui.refresh();},Err(error)=>ui.toast(&error)}}); } } });
                         dialog.present(Some(&ui.window));
                     }
                 });
@@ -691,6 +707,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                         Err(error) => ui.toast(&error),
                     }
                 });
+            } else {
+                ui.toast("The sharing service is not connected yet");
             }
         }
     });
@@ -759,6 +777,17 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
 
 fn update(ui: &Rc<Ui>, section: &str, key: &str, value: Value) {
     if ui.settings.borrow()[section][key] == value {
+        return;
+    }
+    if ui.proxy.borrow().is_none() {
+        ui.toast("The sharing service is not connected yet");
+        let ui = ui.clone();
+        // Restore switches and choices even when no D-Bus call can be attempted.
+        // Entry drafts remain available for a retry after reconnecting.
+        glib::idle_add_local_once(move || {
+            let config = ui.settings.borrow().clone();
+            render(&ui, &config);
+        });
         return;
     }
     let patch = json!({ section: { key: value } });

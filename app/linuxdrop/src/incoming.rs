@@ -23,6 +23,8 @@ impl Ui {
             .extra_child(&list).build();
         dialog.add_responses(&[("cancel", &tr("Cancel")), ("open", &tr("Review offer"))]);
         dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("open"));
+        dialog.set_focus(Some(&entry));
         dialog.set_response_appearance("open", adw::ResponseAppearance::Suggested);
         dialog.set_response_enabled("open", !entry.text().trim().is_empty());
         let weak = dialog.downgrade();
@@ -39,11 +41,12 @@ impl Ui {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            let url = entry.text().trim().to_owned();
             let Some(proxy) = ui.proxy.borrow().clone() else {
+                ui.receive_link(Some(&url));
                 ui.toast("Background service unavailable");
                 return;
             };
-            let url = entry.text().trim().to_owned();
             glib::MainContext::default().spawn_local(async move {
                 match crate::ipc::call(
                     &proxy,
@@ -67,20 +70,45 @@ impl Ui {
         dialog
     }
     pub fn accept_request(self: &Rc<Self>, transfer: &Value) -> adw::AlertDialog {
+        self.review_request(transfer, None, None)
+    }
+
+    fn review_request(
+        self: &Rc<Self>,
+        transfer: &Value,
+        previous: Option<&Value>,
+        error: Option<&str>,
+    ) -> adw::AlertDialog {
         let id = transfer["id"].as_str().unwrap_or_default().to_owned();
         let files = transfer["files"].as_array().cloned().unwrap_or_default();
         let partial = transfer["selection_mode"].as_str() == Some("native")
             || transfer["protocol"].as_str() == Some("localsend");
-        let selected = Rc::new(RefCell::new(vec![true; files.len()]));
+        let selected = Rc::new(RefCell::new(
+            (0..files.len())
+                .map(|index| {
+                    previous
+                        .and_then(|options| options["selected_indices"].as_array())
+                        .is_none_or(|indices| {
+                            indices
+                                .iter()
+                                .any(|value| value.as_u64() == Some(index as u64))
+                        })
+                })
+                .collect::<Vec<_>>(),
+        ));
         let settings = self.settings.borrow().clone();
         let folder = Rc::new(RefCell::new(
-            transfer["receive_directory"]
-                .as_str()
+            previous
+                .and_then(|options| options["directory"].as_str())
+                .or_else(|| transfer["receive_directory"].as_str())
                 .or_else(|| settings["receive"]["directory"].as_str())
                 .unwrap_or_default()
                 .to_owned(),
         ));
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        if let Some(error) = error {
+            content.append(&label(error, "error"));
+        }
         let verification = transfer["state"].as_str() == Some("verification");
         if verification {
             content.append(&label("Compare this code on both devices", "compact-note"));
@@ -112,7 +140,7 @@ impl Ui {
         ]);
         dialog.set_close_response("cancel");
         dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
-        dialog.set_response_enabled("accept", !files.is_empty());
+        dialog.set_response_enabled("accept", selected.borrow().iter().any(|value| *value));
         let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
         for (index, file) in files.iter().enumerate() {
             let name = file["name"].as_str().unwrap_or_default();
@@ -121,7 +149,7 @@ impl Ui {
                 bytes(file["size"].as_u64().unwrap_or(0))
             ));
             check.set_widget_name(&format!("incoming-file-{index}"));
-            check.set_active(true);
+            check.set_active(selected.borrow()[index]);
             let selected = selected.clone();
             let weak = dialog.downgrade();
             check.connect_toggled(move |check| {
@@ -153,6 +181,7 @@ impl Ui {
             .title(tr("Save files to"))
             .subtitle(folder.borrow().as_str())
             .build();
+        destination.set_widget_name("incoming-destination");
         let choose = gtk::Button::from_icon_name("folder-open-symbolic");
         choose.set_valign(gtk::Align::Center);
         choose.set_tooltip_text(Some(&tr("Choose a receiving folder")));
@@ -174,13 +203,19 @@ impl Ui {
             let row = destination.clone();
             let ui_copy = ui.clone();
             picker.select_folder(Some(&ui.window), gio::Cancellable::NONE, move |result| {
-                if let Ok(file) = result {
-                    if let Some(path) = file.path() {
-                        *folder.borrow_mut() = path.to_string_lossy().into_owned();
-                        row.set_subtitle(&folder.borrow());
-                    } else {
-                        ui_copy.toast("Choose a local folder");
+                match result {
+                    Ok(file) => {
+                        if let Some(path) = file.path() {
+                            *folder.borrow_mut() = path.to_string_lossy().into_owned();
+                            row.set_subtitle(&folder.borrow());
+                        } else {
+                            ui_copy.toast("Choose a local folder");
+                        }
                     }
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) => {}
+                    Err(error) => ui_copy.toast(&error.to_string()),
                 }
             });
         });
@@ -191,22 +226,40 @@ impl Ui {
                 &tr("Reject conflicting files"),
             ]))
             .selected(u32::from(
-                settings["receive"]["collision_policy"].as_str() == Some("reject"),
+                previous
+                    .and_then(|options| options["collision_policy"].as_str())
+                    .or_else(|| settings["receive"]["collision_policy"].as_str())
+                    == Some("reject"),
             ))
             .build();
+        collision.set_widget_name("incoming-collision");
         box_list.append(&collision);
         content.append(&label(
             "Nothing is saved until you accept. Existing files are never overwritten.",
             "compact-note",
         ));
         let weak = Rc::downgrade(self);
+        let request = transfer.clone();
         dialog.connect_response(None, move |_, response| {
             if response != "accept" { return; }
             let Some(ui) = weak.upgrade() else { return; };
             let mut options = json!({"collision_policy": if collision.selected() == 1 {"reject"} else {"rename"}});
             options["selected_indices"] = json!(selected.borrow().iter().enumerate().filter_map(|(index, value)| value.then_some(index)).collect::<Vec<_>>());
             options["directory"] = json!(folder.borrow().as_str());
-            ui.mutate("AcceptTransferWithOptions", (id.clone(), options.to_string()).to_variant());
+            let proxy = ui.proxy.borrow().clone();
+            let id = id.clone();
+            let request = request.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let result = match proxy {
+                    Some(proxy) => crate::ipc::call(&proxy, "AcceptTransferWithOptions", Some((id, options.to_string()).to_variant())).await.map(|_| ()),
+                    None => Err(tr("The sharing service is not connected yet")),
+                };
+                if let Err(error) = result {
+                    // Failed consent must not discard the user's destination or subset.
+                    ui.review_request(&request, Some(&options), Some(&error));
+                }
+                ui.refresh();
+            });
         });
         dialog.present(Some(&self.window));
         dialog
@@ -228,6 +281,8 @@ impl Ui {
         let dialog = adw::AlertDialog::builder().heading(tr("Enter PIN")).body(tr(if download { "Enter the PIN supplied by the sender for this download link." } else { "Enter the PIN shown in the receiving device's LocalSend settings. This is separate from Quick Share code verification." })).extra_child(&list).build();
         dialog.add_responses(&[("cancel", &tr("Cancel")), ("send", &tr("Continue"))]);
         dialog.set_close_response("cancel");
+        dialog.set_default_response(Some("send"));
+        dialog.set_focus(Some(&pin));
         dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
         dialog.set_response_enabled("send", false);
         let weak = dialog.downgrade();

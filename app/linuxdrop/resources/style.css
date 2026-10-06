@@ -5,7 +5,7 @@ button.suggested-action:not(:disabled):hover { background: #1a65c2; color: #ffff
 button.suggested-action:not(:disabled):active { background: #15539e; color: #ffffff; }
 .brand-mark { color: @accent_color; }
 .hero-title { font-size: 28px; font-weight: 800; letter-spacing: -0.7px; }
-.hero-subtitle { font-size: 14px; color: @window_fg_color; opacity: 0.62; }
+.hero-subtitle { font-size: 14px; color: @window_fg_color; opacity: 0.78; }
 .drop-zone { border: 2px dashed alpha(@accent_color, 0.28); border-radius: 18px; background: alpha(@accent_color, 0.045); padding: 16px 12px; transition: background 180ms, border-color 180ms; }
 .drop-zone.drag-active { border-color: @accent_color; background: alpha(@accent_color, 0.14); }
 .drop-zone.has-files { padding: 10px; border-radius: 16px; }
@@ -18,14 +18,14 @@ button.suggested-action:not(:disabled):active { background: #15539e; color: #fff
 .device-icon { color: @accent_color; border-radius: 14px; background: alpha(@accent_color, 0.08); padding: 12px; }
 .protocol-badge { font-size: 11px; font-weight: 600; opacity: 0.66; }
 .empty-icon { opacity: 0.25; }
-.empty-text { opacity: 0.6; }
+.empty-text { opacity: 0.78; }
 .send-bar { padding: 14px 18px; border-radius: 18px; background: @card_bg_color; border: 1px solid alpha(@window_fg_color, 0.07); }
 .file-row { padding: 8px 10px; border-radius: 10px; background: alpha(@window_fg_color, 0.035); }
 .transfer-card { padding: 18px; border-radius: 18px; background: @card_bg_color; border: 1px solid alpha(@window_fg_color, 0.07); }
 .verification-code { font-size: 30px; font-weight: 800; letter-spacing: 5px; font-feature-settings: "tnum"; }
 .status-chip { font-size: 12px; border-radius: 99px; padding: 5px 10px; background: alpha(@accent_color, 0.1); color: @accent_color; }
 .service-error { padding: 12px; border-radius: 12px; background: alpha(@error_color, 0.09); color: @error_color; }
-.compact-note { font-size: 12px; opacity: 0.65; }
+.compact-note { font-size: 12px; opacity: 0.78; }
 .hardware-card { padding: 16px; border-radius: 16px; background: @card_bg_color; }
 progressbar trough { min-height: 5px; border-radius: 99px; }
 progressbar progress { min-height: 5px; border-radius: 99px; }

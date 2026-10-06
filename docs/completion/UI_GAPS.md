@@ -47,3 +47,9 @@ items retain their remaining acceptance scope even where code now exists.
 The user's current demo session must not be restarted or modified for these
 checks. Native tests use isolated runtime/config/data directories and disabled
 or separately bound protocol listeners.
+
+
+2026-10-07 follow-up: the acceptance record above now includes a second targeted
+Astra UX/UI pass, failed-consent retry preservation, PIN dependency/search focus,
+and a real isolated GNOME 46 bubble smoke at normal and German 150% text. Broad
+unchecked rows remain open where their full acceptance scope exceeds those checks.

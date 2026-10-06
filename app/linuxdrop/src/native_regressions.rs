@@ -73,17 +73,19 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     .unwrap();
     let snapshot = Rc::new(RefCell::new(json!({
         "epoch":"native-test", "revision":1,
-        "settings":{"general":{"device_name":"Native review","appearance":"dark","language":"system","close_behavior":"background","autostart":false},"visibility":{"mode":"hidden"},"receive":{"directory":"/tmp","ask_directory":true,"collision_policy":"rename"},"localsend":{"enabled":false}},
+        "settings":{"general":{"device_name":"Native review","appearance":"dark","language":"system","close_behavior":"background","autostart":false},"visibility":{"mode":"hidden"},"receive":{"directory":"/tmp","ask_directory":true,"collision_policy":"rename"},"localsend":{"enabled":false,"pin":"","require_pin":false}},
         "hardware":{"radios":[],"bluetooth":[]},"backends":[],
         "peers":[{"id":"pixel","name":"Pixel test fixture","platform":"android","available":true,"protocols":["localsend","quickshare"]}],
         "transfers":[{"id":"progress","peer_id":"pixel","peer_name":"Pixel test fixture","protocol":"localsend","direction":"outgoing","state":"transferring","total_bytes":100,"transferred_bytes":10,"files":[{"name":"progress.txt","size":100,"transferred":10}]}]
     })));
     let sent_protocol = Rc::new(RefCell::new(String::new()));
     let accepted_options = Rc::new(RefCell::new(Value::Null));
+    let fail_next_accept = Rc::new(Cell::new(false));
     let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSend'><arg type='as' direction='in'/><arg type='s' direction='out'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
     let accepted = accepted_options.clone();
+    let fail_accept = fail_next_accept.clone();
     let registration = bus
         .register_object(ipc::PATH, &info.interfaces()[0])
         .method_call(
@@ -102,6 +104,13 @@ fn native_draft_focus_protocol_and_settings_regressions() {
                     invocation.return_value(Some(&("sent",).to_variant()));
                 }
                 "AcceptTransferWithOptions" => {
+                    if fail_accept.replace(false) {
+                        invocation.return_dbus_error(
+                            "io.github.marius4lui.Error",
+                            "Destination is not writable",
+                        );
+                        return;
+                    }
                     let (_, options) = parameters.get::<(String, String)>().unwrap();
                     *accepted.borrow_mut() = serde_json::from_str(&options).unwrap();
                     invocation.return_value(None);
@@ -220,6 +229,21 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             "Unapplied text survives another setting update"
         );
         capture(&ui, "settings-compact-review.png");
+        let require_pin = find(&ui.settings_body, "setting:localsend.require_pin").unwrap();
+        assert!(!require_pin.is_sensitive(), "A receiving PIN must be saved before it can be required");
+        config["localsend"]["pin"] = json!("1234");
+        settings::render(&ui, &config);
+        assert!(find(&ui.settings_body, "setting:localsend.require_pin").unwrap().is_sensitive());
+        let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
+        search.set_text("Device");
+        search.grab_focus();
+        glib::timeout_future(Duration::from_millis(300)).await;
+        settings::render(&ui, &config);
+        settle().await;
+        let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
+        assert_eq!(search.text(), "Device");
+        let focused = gtk::prelude::GtkWindowExt::focus(&ui.window).unwrap();
+        assert!(focused == search.clone().upcast::<gtk::Widget>() || focused.is_ancestor(&search), "Search keeps keyboard focus across a settings resync");
         ui.stack.set_visible_child_name("send");
         ui.window.set_default_size(1100, 760);
         settle().await;
@@ -229,13 +253,26 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         let dialog = ui.accept_request(&json!({"id":"incoming-verification","peer_name":"Prüfgerät","protocol":"quickshare","direction":"incoming","state":"verification","verification_code":"1234","total_bytes":100,"receive_directory":"/tmp/Reviewed-Sender","selection_mode":"publish_selected","files":[{"name":"fixture.txt","size":75},{"name":"excluded.txt","size":25}]}));
         settle().await;
         find(&dialog,"incoming-file-1").unwrap().downcast::<gtk::CheckButton>().unwrap().set_active(false);
+        glib::timeout_future(Duration::from_millis(400)).await;
         capture(&ui,"incoming-verification-review.png");
         assert_eq!(dialog.response_label("accept"),tr("Codes match — accept"));
+        find(&dialog,"incoming-collision").unwrap().downcast::<adw::ComboRow>().unwrap().set_selected(1);
+        fail_next_accept.set(true);
         dialog.emit_by_name::<()>("response",&[&"accept"]);
+        dialog.force_close();
+        settle().await;
+        let retry = ui.window.visible_dialog().expect("Failed acceptance must reopen the review").downcast::<adw::AlertDialog>().unwrap();
+        assert!(!find(&retry,"incoming-file-1").unwrap().downcast::<gtk::CheckButton>().unwrap().is_active(), "Retry must preserve excluded files");
+        assert_eq!(find(&retry,"incoming-destination").unwrap().downcast::<adw::ActionRow>().unwrap().subtitle().as_deref(),Some("/tmp/Reviewed-Sender"));
+        assert_eq!(find(&retry,"incoming-collision").unwrap().downcast::<adw::ComboRow>().unwrap().selected(),1,"Retry must preserve collision policy");
+        glib::timeout_future(Duration::from_millis(400)).await;
+        capture(&ui, "incoming-retry-review.png");
+        retry.emit_by_name::<()>("response",&[&"accept"]);
         settle().await;
         assert_eq!(accepted_options.borrow()["directory"],"/tmp/Reviewed-Sender","Acceptance must preserve the exact previewed destination, including automatic subfolders");
         assert_eq!(accepted_options.borrow()["selected_indices"],json!([0]),"Quick Share publishes only the selected files");
-        dialog.force_close();
+        assert_eq!(accepted_options.borrow()["collision_policy"],"reject");
+        retry.force_close();
         settle().await;
         let download = ui.receive_link(Some("http://192.168.1.20:53317"));
         glib::timeout_future(Duration::from_millis(400)).await;

@@ -11,6 +11,8 @@ const de = {
     'Send files…': 'Dateien senden …', 'LinuxDrop settings': 'LinuxDrop-Einstellungen',
     'Notch preferences': 'Notch-Einstellungen', 'LinuxDrop sharing controls': 'LinuxDrop-Freigabe',
     'Offline': 'Offline', 'Service unavailable': 'Dienst nicht verfügbar', 'Needs attention': 'Problem aufgetreten',
+    'Open LinuxDrop to check the sharing service.': 'Öffne LinuxDrop, um den Freigabedienst zu prüfen.', 'Opening…': 'Wird geöffnet …',
+    'Working…': 'Wird ausgeführt …', 'Could not open the drop area. Try again.': 'Die Ablagefläche konnte nicht geöffnet werden. Versuche es erneut.',
     'Compare code': 'Code vergleichen', 'Request': 'Anfrage', 'Waiting': 'Warten',
     'Visible to everyone': 'Für alle sichtbar', 'Hidden': 'Unsichtbar', 'No devices nearby': 'Keine Geräte in der Nähe',
     'Compare this code on both devices': 'Vergleiche diesen Code auf beiden Geräten',
