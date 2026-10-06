@@ -1,0 +1,507 @@
+#[macro_use]
+extern crate log;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
+
+use anyhow::anyhow;
+use channel::ChannelMessage;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+use hdl::BleAdvertiser;
+use hdl::MDnsDiscovery;
+use once_cell::sync::Lazy;
+use rand::Rng;
+use rand::distr::Alphanumeric;
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+
+#[cfg(feature = "experimental")]
+use crate::hdl::BleListener;
+use crate::hdl::MDnsServer;
+use crate::manager::TcpServer;
+
+pub mod channel;
+pub mod errors;
+pub mod hdl;
+pub mod manager;
+pub mod utils;
+
+static SESSION_SHUTDOWN: Lazy<RwLock<CancellationToken>> =
+    Lazy::new(|| RwLock::new(CancellationToken::new()));
+pub fn session_shutdown() -> CancellationToken {
+    SESSION_SHUTDOWN.read().unwrap().clone()
+}
+
+static RECEIVE_LIMITS: RwLock<(u64, usize)> = RwLock::new((10 * 1024 * 1024 * 1024, 1000));
+pub fn set_receive_limits(bytes: u64, files: usize) {
+    *RECEIVE_LIMITS.write().unwrap() = (bytes.min(1 << 40), files.min(1000));
+}
+
+fn backend_failure(
+    sender: &broadcast::Sender<ChannelMessage>,
+    component: &str,
+    detail: impl std::fmt::Display,
+) {
+    let _ = sender.send(ChannelMessage {
+        id: "backend".into(),
+        msg: channel::Message::Backend {
+            component: component.into(),
+            detail: detail.to_string(),
+        },
+    });
+}
+
+pub use hdl::{EndpointInfo, OutboundPayload, TransferState, Visibility};
+pub use manager::SendInfo;
+pub use utils::DeviceType;
+
+pub mod sharing_nearby {
+    include!(concat!(env!("OUT_DIR"), "/sharing.nearby.rs"));
+}
+
+pub mod securemessage {
+    include!(concat!(env!("OUT_DIR"), "/securemessage.rs"));
+}
+
+pub mod securegcm {
+    include!(concat!(env!("OUT_DIR"), "/securegcm.rs"));
+}
+
+pub mod location_nearby_connections {
+    include!(concat!(env!("OUT_DIR"), "/location.nearby.connections.rs"));
+}
+
+static CUSTOM_DOWNLOAD: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
+static DEVICE_NAME: Lazy<RwLock<String>> =
+    Lazy::new(|| RwLock::new(sys_metrics::host::get_hostname().unwrap_or("Unknown device".into())));
+
+#[derive(Debug)]
+pub struct RQS {
+    pub ble_enabled: bool,
+    tracker: Option<TaskTracker>,
+    ctoken: Option<CancellationToken>,
+    // Discovery token is different than ctoken because he is on his own
+    // - can be cancelled while the ctoken is still active
+    discovery_ctk: Option<CancellationToken>,
+
+    // Used to trigger a change in the mDNS visibility (and later on, BLE)
+    pub visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
+    visibility_receiver: watch::Receiver<Visibility>,
+
+    // Only used to send the info "a nearby device is sharing"
+    ble_sender: broadcast::Sender<()>,
+
+    pub port_number: Option<u32>,
+
+    pub message_sender: broadcast::Sender<ChannelMessage>,
+}
+
+impl Default for RQS {
+    fn default() -> Self {
+        Self::new(
+            Visibility::Visible,
+            None,
+            None,
+            Some(sys_metrics::host::get_hostname().unwrap_or("Unknown device".into())),
+        )
+    }
+}
+
+impl RQS {
+    pub fn new(
+        visibility: Visibility,
+        port_number: Option<u32>,
+        download_path: Option<PathBuf>,
+        device_name: Option<String>,
+    ) -> Self {
+        {
+            let mut guard = CUSTOM_DOWNLOAD.write().unwrap();
+            *guard = download_path;
+        }
+        {
+            let mut guard = DEVICE_NAME.write().unwrap();
+            if let Some(device_name) = device_name {
+                *guard = device_name.clone();
+            }
+        }
+
+        let (message_sender, _) = broadcast::channel(1024);
+        let (ble_sender, _) = broadcast::channel(5);
+
+        // Define default visibility as per the args inside the new()
+        let (visibility_sender, visibility_receiver) = watch::channel(Visibility::Invisible);
+        let _ = visibility_sender.send(visibility);
+
+        Self {
+            ble_enabled: true,
+            tracker: None,
+            ctoken: None,
+            discovery_ctk: None,
+            visibility_sender: Arc::new(Mutex::new(visibility_sender)),
+            visibility_receiver,
+            ble_sender,
+            port_number,
+            message_sender,
+        }
+    }
+
+    pub async fn run(
+        &mut self,
+    ) -> Result<(mpsc::Sender<SendInfo>, broadcast::Receiver<()>), anyhow::Error> {
+        *SESSION_SHUTDOWN.write().unwrap() = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let ctoken = CancellationToken::new();
+        self.tracker = Some(tracker.clone());
+        self.ctoken = Some(ctoken.clone());
+
+        let endpoint_id: Vec<u8> = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(4)
+            .map(u8::from)
+            .collect();
+        let tcp_listener =
+            TcpListener::bind(format!("0.0.0.0:{}", self.port_number.unwrap_or(0))).await?;
+        let binded_addr = tcp_listener.local_addr()?;
+        info!("TcpListener on: {}", binded_addr);
+
+        // So the random port can be accessed from the user if needed.
+        // This does have a difference in behaviour however when port_number is Some.
+        // .stop() and .run() will reuse the port number instead of generating a new one.
+        self.port_number = Some(binded_addr.port() as u32);
+
+        // MPSC for the TcpServer
+        let send_channel = mpsc::channel(10);
+        // Start TcpServer in own "task"
+        let mut server = TcpServer::new(
+            endpoint_id[..4].try_into()?,
+            tcp_listener,
+            self.message_sender.clone(),
+            send_channel.1,
+        )?;
+        let ctk = ctoken.clone();
+        let lifetime = ctk.clone();
+        let status = self.message_sender.clone();
+        tracker.spawn(async move {
+            let result = server.run(ctk).await;
+            if !lifetime.is_cancelled() {
+                let _ = status.send(channel::ChannelMessage {
+                    id: "backend".into(),
+                    msg: channel::Message::Backend {
+                        component: "tcp".into(),
+                        detail: result
+                            .as_ref()
+                            .err()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "Service task ended unexpectedly".into()),
+                    },
+                });
+            }
+            result
+        });
+
+        #[cfg(feature = "experimental")]
+        if self.ble_enabled {
+            match BleListener::new(self.ble_sender.clone()).await {
+                Ok(ble) => {
+                    let ctk = ctoken.clone();
+                    let status = self.message_sender.clone();
+                    tracker.spawn(async move {
+                        if let Err(error) = ble.run(ctk).await {
+                            backend_failure(&status, "bluetooth-listener", error);
+                        }
+                    });
+                }
+                Err(error) => backend_failure(&self.message_sender, "bluetooth-listener", error),
+            }
+        }
+
+        // Start MDnsServer in own "task"
+        let mut mdns = MDnsServer::new(
+            endpoint_id[..4].try_into()?,
+            binded_addr.port(),
+            self.ble_sender.subscribe(),
+            self.visibility_sender.clone(),
+            self.visibility_receiver.clone(),
+        )?;
+        let ctk = ctoken.clone();
+        let lifetime = ctk.clone();
+        let status = self.message_sender.clone();
+        tracker.spawn(async move {
+            let result = mdns.run(ctk).await;
+            if !lifetime.is_cancelled() {
+                let _ = status.send(channel::ChannelMessage {
+                    id: "backend".into(),
+                    msg: channel::Message::Backend {
+                        component: "mdns".into(),
+                        detail: result
+                            .as_ref()
+                            .err()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "Service task ended unexpectedly".into()),
+                    },
+                });
+            }
+            result
+        });
+
+        // Advertise as a discoverable QuickShare receiver over BLE (0xFEF3) so a
+        // phone that drops off Wi-Fi during its browse phase (the Pixel "AirDrop
+        // update" behaviour) can still list us as a target. Uses the SAME
+        // endpoint_id as mDNS, so once selected the phone reconnects to Wi-Fi and
+        // completes the transfer over the normal Wi-Fi-LAN (mDNS + TCP) path.
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        if self.ble_enabled {
+            // The BLE advertiser is always spawned; it self-gates on the live
+            // visibility watch (off while Invisible, on otherwise) so the
+            // "Hidden from everyone" toggle takes effect immediately and a
+            // start-Invisible session can still become visible without a restart.
+            {
+                let rx_endpoint_id: [u8; 4] = endpoint_id[..4].try_into()?;
+                let rx_device_name = DEVICE_NAME.read().unwrap().clone();
+
+                // L2CAP CoC listener: phones that support it connect straight
+                // to this PSM and skip GATT service discovery -- the slow part
+                // of every BLE connect. `PACKET_BLE_L2CAP=off` disables it.
+                let l2cap = if std::env::var("PACKET_BLE_L2CAP")
+                    .map(|v| v.eq_ignore_ascii_case("off"))
+                    .unwrap_or(false)
+                {
+                    info!("L2capServer: disabled by PACKET_BLE_L2CAP=off");
+                    None
+                } else {
+                    match crate::hdl::L2capServer::bind().await {
+                        Ok((server, psm)) => {
+                            info!("L2capServer: listening on PSM {psm}");
+                            Some((server, psm))
+                        }
+                        Err(e) => {
+                            warn!("Couldn't start the L2CAP server ({e}); phones will use GATT");
+                            None
+                        }
+                    }
+                };
+                let l2cap_psm = l2cap.as_ref().map(|(_, psm)| *psm);
+
+                // Same advertisement bytes are used for the BLE advert and served
+                // over GATT slot 0, so the phone reads a consistent endpoint.
+                let advert = crate::hdl::receiver_service_data(
+                    rx_endpoint_id,
+                    crate::utils::DeviceType::Laptop as u8,
+                    &rx_device_name,
+                    l2cap_psm,
+                );
+
+                if let Some((server, _)) = l2cap {
+                    let l2cap_advert = advert.clone();
+                    let l2cap_sender = self.message_sender.clone();
+                    let l2cap_tcp_port = binded_addr.port();
+                    let lctk = ctoken.clone();
+                    tracker.spawn(async move {
+                        server
+                            .run(l2cap_advert, l2cap_sender, l2cap_tcp_port, lctk)
+                            .await;
+                    });
+                }
+
+                // GATT server: when the phone selects us it opens a GATT connection,
+                // reads slot 0 for our advertisement, then drives the weave data
+                // socket which we bridge to the inbound handshake.
+                let gatt_advert = advert.clone();
+                let gatt_sender = self.message_sender.clone();
+                let gatt_tcp_port = binded_addr.port();
+                let gctk = ctoken.clone();
+                let status = self.message_sender.clone();
+                tracker.spawn(async move {
+                    match crate::hdl::ReceiverGattServer::new(
+                        gatt_advert,
+                        gatt_sender,
+                        gatt_tcp_port,
+                    )
+                    .await
+                    {
+                        Ok(srv) => {
+                            if let Err(e) = srv.run(gctk).await {
+                                error!("ReceiverGattServer: {}", e);
+                                backend_failure(&status, "bluetooth-gatt", e);
+                            }
+                        }
+                        Err(e) => backend_failure(&status, "bluetooth-gatt", e),
+                    }
+                });
+
+                // BLE receiver advertisement (0xFEF3).
+                let ctk = ctoken.clone();
+                let adv_vis = self.visibility_receiver.clone();
+                let status = self.message_sender.clone();
+                tracker.spawn(async move {
+                    match crate::hdl::ReceiverAdvertiser::new(
+                        rx_endpoint_id,
+                        crate::utils::DeviceType::Laptop as u8,
+                        &rx_device_name,
+                        l2cap_psm,
+                    )
+                    .await
+                    {
+                        Ok(adv) => {
+                            if let Err(e) = adv.run(adv_vis, ctk).await {
+                                error!("ReceiverAdvertiser: {}", e);
+                                backend_failure(&status, "bluetooth-receiver", e);
+                            }
+                        }
+                        Err(e) => backend_failure(&status, "bluetooth-receiver", e),
+                    }
+                });
+            }
+        }
+
+        tracker.close();
+
+        Ok((send_channel.0, self.ble_sender.subscribe()))
+    }
+
+    pub fn discovery(
+        &mut self,
+        sender: broadcast::Sender<EndpointInfo>,
+    ) -> Result<(), anyhow::Error> {
+        let tracker = self
+            .tracker
+            .as_ref()
+            .ok_or_else(|| anyhow!("The service wasn't first started"))?;
+
+        let ctk = CancellationToken::new();
+        self.discovery_ctk = Some(ctk.clone());
+
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        if self.ble_enabled {
+            let ctk_blea = ctk.clone();
+            let status = self.message_sender.clone();
+            tracker.spawn(async move {
+                let blea = match BleAdvertiser::new().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        error!("Couldn't init BleAdvertiser: {}", e);
+                        backend_failure(&status, "bluetooth-discovery", e);
+                        return;
+                    }
+                };
+
+                if let Err(e) = blea.run(ctk_blea).await {
+                    error!("Couldn't start BleAdvertiser: {}", e);
+                    backend_failure(&status, "bluetooth-discovery", e);
+                }
+            });
+
+            // Discover phones on their Quick Share receive screen over BLE, so
+            // they can be sent to without both devices being on the same Wi-Fi.
+            // `PACKET_BLE_SEND=off` disables it.
+            if std::env::var("PACKET_BLE_SEND")
+                .map(|v| v.eq_ignore_ascii_case("off"))
+                .unwrap_or(false)
+            {
+                info!("BLE recipient discovery: disabled by PACKET_BLE_SEND=off");
+            } else {
+                let ble_sender = sender.clone();
+                let ctk_bled = ctk.clone();
+                tracker.spawn(async move {
+                    crate::hdl::ble_discovery(ble_sender, ctk_bled).await;
+                });
+            }
+        }
+
+        // `PACKET_PREFER_BLE=on` disables mDNS discovery so recipients are found
+        // over BLE only — the send then starts on L2CAP and (with the phone on
+        // Wi-Fi) exercises the BLE→Wi-Fi bandwidth upgrade. Test/demo toggle.
+        if std::env::var("PACKET_PREFER_BLE")
+            .map(|v| v.eq_ignore_ascii_case("on") || v == "1")
+            .unwrap_or(false)
+        {
+            info!("MDnsDiscovery: disabled by PACKET_PREFER_BLE=on (BLE-only recipient discovery)");
+        } else {
+            let discovery = MDnsDiscovery::new(sender)?;
+            let status = self.message_sender.clone();
+            tracker.spawn(async move {
+                let result = discovery.run(ctk.clone()).await;
+                if !ctk.is_cancelled() {
+                    let _ = status.send(channel::ChannelMessage {
+                        id: "backend".into(),
+                        msg: channel::Message::Backend {
+                            component: "discovery".into(),
+                            detail: result
+                                .as_ref()
+                                .err()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "Discovery task ended unexpectedly".into()),
+                        },
+                    });
+                }
+                result
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn stop_discovery(&mut self) {
+        if let Some(discovert_ctk) = &self.discovery_ctk {
+            discovert_ctk.cancel();
+            self.discovery_ctk = None;
+        }
+    }
+
+    pub fn change_visibility(&mut self, nv: Visibility) {
+        self.visibility_sender
+            .lock()
+            .unwrap()
+            .send_modify(|state| *state = nv);
+    }
+
+    pub async fn stop(&mut self) {
+        session_shutdown().cancel();
+        let _ = self.message_sender.send(channel::ChannelMessage {
+            id: "*".into(),
+            msg: channel::Message::Lib {
+                action: channel::TransferAction::TransferCancel,
+            },
+        });
+        self.stop_discovery();
+
+        if let Some(ctoken) = &self.ctoken {
+            ctoken.cancel();
+        }
+
+        if let Some(tracker) = &self.tracker {
+            // Inorder for TaskTracker::wait to return, close() must be called
+            // and the count of tasks being watched should be 0 (i.e. they've all closed).
+            //
+            // If not, the TaskTracker may forever wait if task count is 0 when wait() was called
+            tracker.close();
+            tracker.wait().await;
+        }
+
+        self.ctoken = None;
+        self.tracker = None;
+    }
+
+    // Setting None here will resume the default settings
+    pub fn set_download_path(&self, p: Option<PathBuf>) {
+        debug!("Setting the download path to {:?}", p);
+        let mut guard = CUSTOM_DOWNLOAD.write().unwrap();
+        *guard = p;
+    }
+
+    /// For this to properly take effect,
+    /// `MdnsServer` would need to be reset which is done by `RQS::stop` followed by `RQS::run`.
+    ///
+    /// So only do this when no data transfer is going on.
+    pub fn set_device_name(&self, name: String) {
+        debug!("Setting the device name {:?}", name);
+        let mut guard = DEVICE_NAME.write().unwrap();
+        *guard = name;
+    }
+
+    pub fn get_device_name(&self) -> String {
+        DEVICE_NAME.read().unwrap().clone()
+    }
+}

@@ -1,0 +1,9 @@
+{
+  "uuid": "linuxdrop@marius4lui.github.io",
+  "name": "LinuxDrop",
+  "description": "Open nearby sharing from the top-panel LinuxDrop button, with a file-drop bubble and separate Quick Settings.",
+  "shell-version": ["46"],
+  "version": 1,
+  "url": "https://github.com/marius4lui/LinuxDrop",
+  "settings-schema": "org.gnome.shell.extensions.linuxdrop"
+}

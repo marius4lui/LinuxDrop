@@ -1,0 +1,26 @@
+[package]
+name = "linuxdrop-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "linuxdropd"
+path = "src/main.rs"
+
+[dependencies]
+linuxdrop-core = { path = "../linuxdrop-core" }
+linuxdrop-localsend = { path = "../linuxdrop-localsend" }
+linuxdrop-hardware = { path = "../linuxdrop-hardware" }
+linuxdrop-quickshare = { path = "../linuxdrop-quickshare" }
+linuxdrop-airdrop = { path = "../linuxdrop-airdrop" }
+linuxdrop-netd = { path = "../linuxdrop-netd" }
+futures-util = "0.3"
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+zbus.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

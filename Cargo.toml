@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["crates/linuxdrop-core", "crates/linuxdrop-storage", "crates/linuxdrop-localsend", "crates/linuxdrop-daemon", "crates/linuxdrop-hardware", "crates/linuxdrop-netd", "crates/linuxdrop-quickshare", "crates/linuxdrop-airdrop", "app/linuxdrop"]
+exclude = ["vendor/opendrop-rs", "vendor/open-quickshare"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/marius4lui/LinuxDrop"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+strip = true
+lto = "thin"

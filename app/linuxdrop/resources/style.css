@@ -1,0 +1,31 @@
+window.linuxdrop { background: @window_bg_color; }
+.brand-mark { color: @accent_color; }
+.hero-title { font-size: 28px; font-weight: 800; letter-spacing: -0.7px; }
+.hero-subtitle { font-size: 14px; color: @window_fg_color; opacity: 0.62; }
+.drop-zone { border: 2px dashed alpha(@accent_color, 0.28); border-radius: 24px; background: alpha(@accent_color, 0.045); padding: 30px 22px; transition: background 180ms, border-color 180ms; }
+.drop-zone.drag-active { border-color: @accent_color; background: alpha(@accent_color, 0.14); }
+.drop-zone.has-files { padding: 10px; border-radius: 16px; }
+.drop-icon { color: @accent_color; padding: 12px; border-radius: 20px; background: alpha(@accent_color, 0.10); }
+.drop-title { font-size: 18px; font-weight: 700; }
+.section-heading { font-size: 16px; font-weight: 700; }
+.eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 1.3px; opacity: 0.5; }
+.peer-card { padding: 6px; border-radius: 16px; background: @card_bg_color; border: 1px solid alpha(@window_fg_color, 0.08); box-shadow: 0 2px 5px alpha(black, 0.025); }
+.peer-card.selected { border-color: @accent_color; background: alpha(@accent_color, 0.08); }
+.device-icon { color: @accent_color; border-radius: 14px; background: alpha(@accent_color, 0.08); padding: 12px; }
+.protocol-badge { font-size: 11px; font-weight: 600; opacity: 0.66; }
+.empty-icon { opacity: 0.25; }
+.empty-text { opacity: 0.6; }
+.send-bar { padding: 14px 18px; border-radius: 18px; background: @card_bg_color; border: 1px solid alpha(@window_fg_color, 0.07); }
+.file-row { padding: 8px 10px; border-radius: 10px; background: alpha(@window_fg_color, 0.035); }
+.transfer-card { padding: 18px; border-radius: 18px; background: @card_bg_color; border: 1px solid alpha(@window_fg_color, 0.07); }
+.verification-code { font-size: 30px; font-weight: 800; letter-spacing: 5px; font-feature-settings: "tnum"; }
+.status-chip { font-size: 12px; border-radius: 99px; padding: 5px 10px; background: alpha(@accent_color, 0.1); color: @accent_color; }
+.service-error { padding: 12px; border-radius: 12px; background: alpha(@error_color, 0.09); color: @error_color; }
+.compact-note { font-size: 12px; opacity: 0.65; }
+.hardware-card { padding: 16px; border-radius: 16px; background: @card_bg_color; }
+progressbar trough { min-height: 5px; border-radius: 99px; }
+progressbar progress { min-height: 5px; border-radius: 99px; }
+.notch-surface { background: transparent; color: #fafafa; }
+.notch-surface > box { background: #18191f; border-radius: 22px; border: 1px solid alpha(white,0.12); margin: 0; padding: 18px 20px; }
+.notch-surface button { border-radius: 12px; }
+.notch-surface .brand-mark { color: #8ab4f8; }

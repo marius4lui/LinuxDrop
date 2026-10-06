@@ -1,0 +1,53 @@
+Name:           linuxdrop
+Version:        0.1.0
+Release:        1%{?dist}
+Summary:        Nearby file sharing for Linux
+License:        GPL-3.0-only
+URL:            https://github.com/marius4lui/LinuxDrop
+Source0:        LinuxDrop-%{version}.tar.gz
+BuildRequires:  cargo rust gcc pkgconfig(gtk4) pkgconfig(libadwaita-1) pkgconfig(openssl) pkgconfig(dbus-1) pkgconfig(libudev) pkgconfig(libnl-3.0) pkgconfig(libnl-genl-3.0) libpcap-devel libev-devel protobuf-compiler glib2-devel
+Requires:       gtk4 libadwaita openssl-libs systemd dbus polkit iw iproute
+%{?systemd_requires}
+
+%description
+Native desktop nearby file sharing. Experimental AirDrop requires a dedicated wireless adapter.
+
+%prep
+%autosetup -n LinuxDrop-%{version}
+
+%build
+cargo build --release --locked --workspace
+cargo build --release --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs
+
+%install
+DESTDIR=%{buildroot} sh packaging/install.sh
+install -Dm644 packaging/linuxdrop.sysusers %{buildroot}%{_sysusersdir}/linuxdrop.conf
+
+%pre
+%sysusers_create_compat packaging/linuxdrop.sysusers
+
+%post
+%systemd_post linuxdrop-netd.service
+
+%preun
+%systemd_preun linuxdrop-netd.service
+
+%postun
+%systemd_postun_with_restart linuxdrop-netd.service
+
+%files
+%{_bindir}/linuxdrop
+%{_bindir}/linuxdropd
+%{_libexecdir}/linuxdrop/
+/usr/lib/systemd/user/linuxdropd.service
+/usr/lib/systemd/system/linuxdrop-netd.service
+%{_sysusersdir}/linuxdrop.conf
+%{_datadir}/applications/io.github.marius4lui.LinuxDrop.desktop
+%{_datadir}/metainfo/io.github.marius4lui.LinuxDrop.metainfo.xml
+%{_datadir}/dbus-1/services/io.github.marius4lui.LinuxDrop.service
+%{_datadir}/polkit-1/actions/io.github.marius4lui.LinuxDrop.policy
+%{_datadir}/nautilus-python/extensions/linuxdrop.py
+%{_datadir}/kio/servicemenus/linuxdrop.desktop
+%{_datadir}/gnome-shell/extensions/linuxdrop@marius4lui.github.io/
+%{_datadir}/icons/hicolor/scalable/apps/io.github.marius4lui.LinuxDrop.svg
+%{_datadir}/doc/linuxdrop/

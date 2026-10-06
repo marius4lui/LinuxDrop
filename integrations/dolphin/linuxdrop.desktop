@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Service
+MimeType=application/octet-stream;
+Actions=LinuxDropSend;
+X-KDE-Priority=TopLevel
+X-KDE-Protocols=file
+
+[Desktop Action LinuxDropSend]
+Name=Send with LinuxDrop
+Name[de]=Mit LinuxDrop senden
+Icon=io.github.marius4lui.LinuxDrop
+Exec=linuxdrop send -- %F

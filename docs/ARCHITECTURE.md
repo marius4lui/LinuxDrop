@@ -1,0 +1,62 @@
+# Implemented architecture
+
+This describes 0.1.0 source behavior. The original plan is design history; acceptance records determine what has been tested.
+
+```mermaid
+flowchart TD
+  App[GTK app and notch drop surface] --> Bus[Session D-Bus Manager1]
+  Shell[GNOME notch and Quick Settings] --> Bus
+  Files[File-manager actions / CLI] --> App
+  Bus --> Daemon[linuxdropd user daemon]
+  Daemon --> LS[LocalSend HTTPS / UDP]
+  Daemon --> QS[Quick Share UKEY2 / LAN / BLE]
+  Daemon --> AD[AirDrop TLS / mDNS]
+  Daemon --> HW[Passive hardware inventory]
+  Daemon --> Netd[Authorized socket to linuxdrop-netd]
+  Netd --> AWDL[Owned monitor interface / Filin / AWDL TAP]
+  AD --> AWDL
+  LS --> Store[Private staging and no-replace publication]
+  QS --> Store
+  AD --> Store
+```
+
+## Ownership
+
+`linuxdrop-core` contains peers, transfers and backend commands/events. Backends are actors with bounded channels and no GTK objects. `linuxdrop-storage` owns directory-descriptor publication. `linuxdrop-daemon` owns settings, drafts, history, notifications, visibility and backend lifetime. `linuxdrop-hardware` inventories devices and selects eligible radios. `linuxdrop-netd` authorizes radio leases and launches the AWDL helper.
+
+The app ID is `io.github.marius4lui.LinuxDrop.App`; the daemon exclusively owns `io.github.marius4lui.LinuxDrop`. Clients reconnect using a snapshot epoch/revision. GNOME owns a top-panel button, the explicitly opened bubble and Quick Settings; an undecorated, shell-positioned GTK surface receives actual external Wayland file payloads and passes the selection to the ordinary app. Incoming requests and progress update state without automatically opening a closed bubble. The panel button, Escape and outside clicks control its lifetime.
+
+## Session IPC
+
+Service `io.github.marius4lui.LinuxDrop`, object `/io/github/marius4lui/LinuxDrop`, interface `io.github.marius4lui.LinuxDrop.Manager1`:
+
+| Method | Input | Result |
+|---|---|---|
+| GetSnapshot | none | JSON epoch, revision, peers, transfers, backends, hardware, settings |
+| GetSettings / GetDiagnostics | none | JSON configuration / operational state |
+| PrepareSend | absolute file paths | temporary draft ID |
+| DiscardDraft | draft ID | release selection |
+| StartSend | draft ID, peer ID, protocol ID | transfer ID |
+| AcceptTransfer / RejectTransfer / CancelTransfer | transfer ID | consent / terminal action |
+| SetVisibility | hidden / everyone | bounded-duration visibility |
+| UpdateSettings | JSON patch | validated persistence and backend restart |
+| ClearHistory | none | remove terminal metadata; keep downloaded files |
+| CreateDownloadOffer | draft ID | JSON URL, PIN, expiry, encryption flag |
+| StopDownloadOffer | none | revoke download server |
+| OpenApplication | none | open native app |
+
+Signal `Changed(revision: u64)` invalidates snapshots. JSON shapes follow `linuxdrop-core` and `settings.rs`. Unknown settings/types are rejected. Incompatible contract changes require Manager2.
+
+## Lifecycle
+
+Settings live in `$XDG_CONFIG_HOME/linuxdrop/settings.json`; TLS identity and terminal history in `$XDG_DATA_HOME/linuxdrop/`, falling back to `~/.config` and `~/.local/share`. Settings/history writes use private mode-0600 temporary files and atomic rename. Public visibility never survives a daemon restart. Autostart is opt-in; ordinary app launches activate the service over D-Bus.
+
+Drafts expire after 30 minutes and are bounded. Terminal transfers cannot be resurrected by stale updates. The history limit bounds finished records. Clearing history retains active transfers and downloaded files. Settings changes during active transfers are rejected.
+
+Hardware refresh follows debounced udev events, with a five-second fallback. An eligible newly inserted radio retries an enabled but unavailable AirDrop backend when no transfer is active. Selection excludes active/default-route radios and forbidden channels. Quick Share upgrades require an explicitly selected idle interface. The helper owns created interfaces and its recovery journal; unrelated interfaces are preserved.
+
+## Compatibility boundaries
+
+Quick Share/Nearby Share use one backend. Direct Wi-Fi is a negotiated upgrade, not universal independent P2P discovery. AirDrop Everyone does not implement Apple Contacts Only. Display names/IPs are not used to merge peer identities. Folder trees, text/contact payloads, resumable transfers and trusted-contact auto-accept are outside 0.1.0.
+
+See [protocol ADR](adr/0002-protocol-engines.md), [hardware design](HARDWARE_AND_PACKAGING.md) and [security policy](../SECURITY.md).

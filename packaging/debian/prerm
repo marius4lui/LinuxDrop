@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+case "$1" in
+    remove|deconfigure)
+        if [ -d /run/systemd/system ]; then systemctl disable --now linuxdrop-netd.service; fi
+        ;;
+    upgrade)
+        if [ -d /run/systemd/system ]; then systemctl stop linuxdrop-netd.service; fi
+        ;;
+esac

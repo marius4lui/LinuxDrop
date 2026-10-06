@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    if ! getent passwd linuxdrop-netd >/dev/null; then
+        adduser --system --group --no-create-home --home /nonexistent linuxdrop-netd
+    fi
+    if [ -d /run/systemd/system ]; then systemctl daemon-reload; systemctl enable --now linuxdrop-netd.service; fi
+    if command -v update-desktop-database >/dev/null; then update-desktop-database -q; fi
+    if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true; fi
+fi

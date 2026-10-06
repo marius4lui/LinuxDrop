@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.linuxdrop" path="/org/gnome/shell/extensions/linuxdrop/">
+    <key name="show-notch" type="b"><default>true</default><summary>Show the top-panel button; the bubble opens only on click</summary></key>
+    <key name="hide-fullscreen" type="b"><default>true</default><summary>Hide in full screen</summary></key>
+    <key name="monitor" type="i"><default>-1</default><range min="-1" max="32"/><summary>Monitor index; -1 uses the primary monitor</summary></key>
+    <key name="top-offset" type="i"><default>8</default><range min="0" max="200"/><summary>Distance below the top panel</summary></key>
+    <key name="compact-width" type="i"><default>240</default><range min="160" max="360"/><summary>Legacy compact width, retained for settings migration</summary></key>
+    <key name="animations" type="b"><default>true</default><summary>Animate notch transitions</summary></key>
+    <key name="auto-collapse" type="i"><default>12</default><range min="0" max="120"/><summary>Seconds before an unfocused menu closes; zero disables</summary></key>
+  </schema>
+</schemalist>

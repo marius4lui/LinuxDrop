@@ -1,0 +1,23 @@
+# Build from a reviewed LinuxDrop source checkout including vendored protocol cores.
+pkgname=linuxdrop
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Nearby file sharing for Linux'
+arch=('x86_64' 'aarch64')
+url='https://github.com/marius4lui/LinuxDrop'
+license=('GPL-3.0-only')
+depends=('gtk4' 'libadwaita' 'openssl' 'systemd' 'dbus' 'polkit' 'iw' 'iproute2')
+makedepends=('rust' 'pkgconf' 'protobuf' 'libnl' 'libpcap' 'libev')
+optdepends=('networkmanager: network state and Wi-Fi Direct' 'bluez: Bluetooth discovery' 'python-nautilus: Nautilus file action')
+source=("LinuxDrop-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+build() {
+    cd "$srcdir/LinuxDrop-${pkgver}"
+    cargo build --release --locked --workspace
+    cargo build --release --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs
+}
+package() {
+    cd "$srcdir/LinuxDrop-${pkgver}"
+    DESTDIR="$pkgdir" sh packaging/install.sh
+    install -Dm644 packaging/linuxdrop.sysusers "$pkgdir/usr/lib/sysusers.d/linuxdrop.conf"
+}

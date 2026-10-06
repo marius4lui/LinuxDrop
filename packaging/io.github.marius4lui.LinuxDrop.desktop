@@ -1,0 +1,27 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=LinuxDrop
+GenericName=Nearby sharing
+GenericName[de]=Dateien in der Nähe teilen
+Comment=Share files with nearby devices
+Comment[de]=Dateien mit Geräten in der Nähe teilen
+Exec=linuxdrop send %F
+Icon=io.github.marius4lui.LinuxDrop
+Terminal=false
+Categories=Network;FileTransfer;GTK;
+Keywords=AirDrop;Quick Share;Nearby Share;LocalSend;Share;Files;
+StartupNotify=true
+StartupWMClass=io.github.marius4lui.LinuxDrop.App
+DBusActivatable=false
+Actions=Settings;Hardware;
+
+[Desktop Action Settings]
+Name=Settings
+Name[de]=Einstellungen
+Exec=linuxdrop --settings
+
+[Desktop Action Hardware]
+Name=Wireless hardware
+Name[de]=Funkhardware
+Exec=linuxdrop --hardware

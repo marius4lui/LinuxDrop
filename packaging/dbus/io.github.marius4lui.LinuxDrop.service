@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=io.github.marius4lui.LinuxDrop
+Exec=/usr/bin/linuxdropd
+SystemdService=linuxdropd.service

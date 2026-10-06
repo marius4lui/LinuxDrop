@@ -1,0 +1,55 @@
+name: Linux
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi
+      - name: Rust tools
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
+      - name: Unit and integration tests
+        run: |
+          cargo test --workspace --locked
+          cargo test --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs linuxdrop_policy_tests --lib
+      - name: Native resources
+        run: |
+          desktop-file-validate packaging/io.github.marius4lui.LinuxDrop.desktop
+          appstreamcli validate --no-net packaging/io.github.marius4lui.LinuxDrop.metainfo.xml
+          glib-compile-schemas --strict --dry-run extensions/gnome-shell/schemas
+          python3 -m py_compile integrations/nautilus/linuxdrop.py
+          node --check extensions/gnome-shell/extension.js
+          sh -n packaging/install.sh packaging/build-deb.sh
+      - name: Build installable package
+        run: sh packaging/build-deb.sh
+      - name: Daemon session and HTTPS integration
+        run: dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
+      - name: Package smoke test
+        run: |
+          sudo apt-get install -y ./dist/linuxdrop_*.deb
+          dpkg-query -W linuxdrop
+          test -x /usr/bin/linuxdrop
+          test -x /usr/bin/linuxdropd
+          test -x /usr/libexec/linuxdrop/filin
+          systemd-analyze verify /usr/lib/systemd/system/linuxdrop-netd.service
+          sudo apt-get remove -y linuxdrop
+          test ! -e /usr/lib/systemd/system/linuxdrop-netd.service
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linuxdrop-ubuntu-24.04
+          path: |
+            dist/*.deb
+            dist/*_source.tar.gz
+          if-no-files-found: error

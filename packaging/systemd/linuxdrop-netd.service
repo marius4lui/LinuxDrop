@@ -1,0 +1,39 @@
+[Unit]
+Description=LinuxDrop restricted radio helper
+After=dbus.service NetworkManager.service
+
+[Service]
+Type=simple
+User=linuxdrop-netd
+Group=linuxdrop-netd
+ExecStart=/usr/libexec/linuxdrop/linuxdrop-netd
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=linuxdrop
+RuntimeDirectoryMode=0755
+StateDirectory=linuxdrop-netd
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+PrivateDevices=no
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+SystemCallArchitectures=native
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

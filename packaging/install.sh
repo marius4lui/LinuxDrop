@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+# Stages into DESTDIR for packages; default /usr, never starts a service.
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+dest=${DESTDIR:-}
+prefix=${PREFIX:-/usr}
+target=${LINUXDROP_TARGET_DIR:-"${CARGO_TARGET_DIR:-$root/target}/release"}
+if [ "$prefix" != /usr ]; then printf '%s\n' 'Native packaging requires PREFIX=/usr' >&2; exit 1; fi
+install -Dm755 "$target/linuxdrop" "$dest$prefix/bin/linuxdrop"
+install -Dm755 "$target/linuxdropd" "$dest$prefix/bin/linuxdropd"
+install -Dm755 "$target/linuxdrop-netd" "$dest$prefix/libexec/linuxdrop/linuxdrop-netd"
+filin=${LINUXDROP_FILIN:-"${CARGO_TARGET_DIR:-$root/vendor/opendrop-rs/target}/release/filin"}
+install -Dm755 "$filin" "$dest$prefix/libexec/linuxdrop/filin"
+install -Dm644 "$root/packaging/systemd/linuxdropd.service" "$dest$prefix/lib/systemd/user/linuxdropd.service"
+install -Dm644 "$root/packaging/systemd/linuxdrop-netd.service" "$dest$prefix/lib/systemd/system/linuxdrop-netd.service"
+install -Dm644 "$root/packaging/dbus/io.github.marius4lui.LinuxDrop.service" "$dest$prefix/share/dbus-1/services/io.github.marius4lui.LinuxDrop.service"
+install -Dm644 "$root/packaging/polkit/io.github.marius4lui.LinuxDrop.policy" "$dest$prefix/share/polkit-1/actions/io.github.marius4lui.LinuxDrop.policy"
+install -Dm644 "$root/packaging/io.github.marius4lui.LinuxDrop.desktop" "$dest$prefix/share/applications/io.github.marius4lui.LinuxDrop.desktop"
+install -Dm644 "$root/packaging/io.github.marius4lui.LinuxDrop.metainfo.xml" "$dest$prefix/share/metainfo/io.github.marius4lui.LinuxDrop.metainfo.xml"
+install -Dm644 "$root/integrations/nautilus/linuxdrop.py" "$dest$prefix/share/nautilus-python/extensions/linuxdrop.py"
+install -Dm644 "$root/integrations/dolphin/linuxdrop.desktop" "$dest$prefix/share/kio/servicemenus/linuxdrop.desktop"
+install -Dm644 "$root/integrations/thunar/uca.xml.example" "$dest$prefix/share/doc/linuxdrop/thunar-uca.xml.example"
+install -Dm644 "$root/LICENSE" "$dest$prefix/share/doc/linuxdrop/copyright"
+install -Dm644 "$root/vendor/open-quickshare/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/open-quickshare-LICENSE"
+install -Dm644 "$root/vendor/opendrop-rs/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/opendrop-rs-LICENSE"
+for document in "$root"/vendor/*.md "$root"/docs/adr/*; do
+    if [ -f "$document" ]; then install -Dm644 "$document" "$dest$prefix/share/doc/linuxdrop/provenance/$(basename "$document")"; fi
+done
+revision=$(git -C "$root" rev-parse HEAD 2>/dev/null || printf unknown)
+printf 'LinuxDrop source: https://github.com/marius4lui/LinuxDrop\nSource base revision: %s\nLocal builds can include uncommitted changes. The matching source archive distributed alongside this package is authoritative.\nThird-party license texts are in licenses/, and protocol provenance is in provenance/.\n' "$revision" > "$dest$prefix/share/doc/linuxdrop/SOURCE"
+if [ -d "$root/extensions/gnome-shell" ]; then
+    extension="$dest$prefix/share/gnome-shell/extensions/linuxdrop@marius4lui.github.io"
+    install -d "$extension"
+    cp -R "$root/extensions/gnome-shell/." "$extension/"
+    if [ -d "$extension/schemas" ]; then glib-compile-schemas "$extension/schemas"; fi
+fi
+icon=$(find "$root/app/linuxdrop" -name 'io.github.marius4lui.LinuxDrop.svg' -print -quit)
+if [ -n "$icon" ]; then install -Dm644 "$icon" "$dest$prefix/share/icons/hicolor/scalable/apps/io.github.marius4lui.LinuxDrop.svg"; fi
