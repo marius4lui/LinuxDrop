@@ -23,8 +23,18 @@ struct Network {
     tls: Option<RustlsConfig>,
     listeners: HashMap<InterfaceAddress, Listener>,
     last_status: Option<(String, String)>,
+    tasks: tokio_util::task::TaskTracker,
 }
 impl Network {
+    async fn shutdown(&mut self) {
+        for listener in self.listeners.values() {
+            listener.handle.shutdown();
+        }
+        self.listeners.clear(); // Aborts discovery and closes listeners.
+        self.tasks.close();
+        self.tasks.wait().await; // Includes listeners retired during reconciliation.
+    }
+
     fn reconcile(&mut self, interfaces: Vec<InterfaceAddress>) -> Result<Vec<String>> {
         self.listeners.retain(|interface, listener| {
             interfaces.contains(interface) && !listener.task.is_finished()
@@ -64,18 +74,25 @@ impl Network {
                 let routes = self.routes.clone();
                 let tls = self.tls.clone();
                 let state = self.state.clone();
-                let task = tokio::spawn(async move {
+                let task = self.tasks.spawn(async move {
                     let result = if let Some(tls) = tls {
                         axum_server::from_tcp_rustls(listener, tls)
-                            .handle(task_handle)
+                            .handle(task_handle.clone())
                             .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
                             .await
                     } else {
                         axum_server::from_tcp(listener)
-                            .handle(task_handle)
+                            .handle(task_handle.clone())
                             .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
                             .await
                     };
+                    // axum-server returns before detached connections finish on
+                    // forced shutdown (including TLS handshakes). Keep this task
+                    // alive until their watcher guards have actually been dropped.
+                    task_handle.shutdown();
+                    while task_handle.connection_count() != 0 {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
                     if let Err(error) = result {
                         state.error(format!("LocalSend server: {error}")).await;
                     }
@@ -100,7 +117,7 @@ impl Network {
                 match discovery::socket(&interface, self.state.config.port) {
                     Ok(udp) => {
                         let state = self.state.clone();
-                        entry.discovery = Some(tokio::spawn(discovery::on_interface(
+                        entry.discovery = Some(self.tasks.spawn(discovery::on_interface(
                             state,
                             interface.clone(),
                             udp,
@@ -178,12 +195,12 @@ impl Network {
     }
 }
 
-pub(super) fn start(
+pub(super) async fn start(
     state: SharedState,
     routes: Router,
     tls: Option<RustlsConfig>,
     bind: Ipv4Addr,
-) -> Result<()> {
+) -> Result<tokio::task::JoinHandle<()>> {
     let selected = move |state: &SharedState| -> Result<Vec<InterfaceAddress>> {
         Ok(linuxdrop_network::interfaces(&state.config.policy, true)?
             .into_iter()
@@ -199,13 +216,15 @@ pub(super) fn start(
         tls,
         listeners: HashMap::new(),
         last_status: None,
+        tasks: tokio_util::task::TaskTracker::new(),
     };
     let failures = network.reconcile(selected(&state)?)?;
     // At startup, an occupied configured port is actionable, not silently ignored.
     if !failures.is_empty() {
+        network.shutdown().await;
         bail!("{}", failures.join("; "));
     }
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         network.report(failures).await;
         let mut changes = tokio::time::interval(Duration::from_secs(3));
         changes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -220,13 +239,61 @@ pub(super) fn start(
                 }
             }
         }
-    });
-    Ok(())
+        network.shutdown().await;
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_an_accepted_tls_connection_before_rebinding() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().unwrap();
+        let state = discovery::tests::local_state(root.path());
+        let interface = state
+            .interfaces()
+            .into_iter()
+            .find(|entry| entry.loopback && entry.address.is_ipv4())
+            .unwrap();
+        let address = SocketAddr::new(interface.address, state.config.port);
+        let (cert, key, _) = tls::identity(&state.config.identity_dir).unwrap();
+        let mut network = Network {
+            state,
+            routes: Router::new(),
+            tls: Some(RustlsConfig::from_pem(cert, key).await.unwrap()),
+            listeners: HashMap::new(),
+            last_status: None,
+            tasks: tokio_util::task::TaskTracker::new(),
+        };
+        assert!(network
+            .reconcile(vec![interface.clone()])
+            .unwrap()
+            .is_empty());
+        // TCP is accepted, but the peer deliberately does not finish TLS.
+        let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        let handle = network.listeners[&interface].handle.clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.connection_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let shutdown = tokio::spawn(async move {
+            network.shutdown().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(2), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(handle.connection_count(), 0);
+        let _rebound = tokio::net::TcpListener::bind(address).await.unwrap();
+    }
 
     #[tokio::test]
     async fn address_changes_preserve_other_connections_and_remove_stale_peers() {
@@ -248,6 +315,7 @@ mod tests {
             tls: None,
             listeners: HashMap::new(),
             last_status: None,
+            tasks: tokio_util::task::TaskTracker::new(),
         };
         assert!(network.reconcile(vec![first.clone()]).unwrap().is_empty());
         let mut retained = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, state.config.port))

@@ -129,7 +129,58 @@ pub enum BackendEvent {
 }
 
 pub type EventSender = tokio::sync::mpsc::Sender<BackendEvent>;
-pub type CommandSender = tokio::sync::mpsc::Sender<BackendCommand>;
+/// Commands and a persistent receipt for the backend's complete cleanup.
+#[derive(Debug, Clone)]
+pub struct CommandSender {
+    commands: tokio::sync::mpsc::Sender<BackendCommand>,
+    completion: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
+}
+impl std::ops::Deref for CommandSender {
+    type Target = tokio::sync::mpsc::Sender<BackendCommand>;
+    fn deref(&self) -> &Self::Target {
+        &self.commands
+    }
+}
+impl CommandSender {
+    pub fn track(
+        commands: tokio::sync::mpsc::Sender<BackendCommand>,
+        task: tokio::task::JoinHandle<Result<(), String>>,
+    ) -> Self {
+        let (finished, completion) = tokio::sync::watch::channel(None);
+        tokio::spawn(async move {
+            let result = task
+                .await
+                .unwrap_or_else(|error| Err(format!("Backend cleanup task failed: {error}")));
+            finished.send_replace(Some(result));
+        });
+        Self {
+            commands,
+            completion,
+        }
+    }
+    pub async fn shutdown(&self) -> Result<(), String> {
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let mut completion = self.completion.clone();
+            if completion.borrow().is_none() {
+                let _ = self.commands.send(BackendCommand::Shutdown).await;
+            }
+            loop {
+                if let Some(result) = completion.borrow().clone() {
+                    return result;
+                }
+                completion
+                    .changed()
+                    .await
+                    .map_err(|_| "Backend ended without a cleanup receipt".to_owned())?;
+            }
+        })
+        .await
+        .map_err(|_| {
+            "Backend resources have not stopped within 20 seconds; retry after cleanup finishes"
+                .to_owned()
+        })?
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -156,5 +207,54 @@ mod tests {
         assert!(!transfer("transferring", 25).accepts_update(&transfer("transferring", 24)));
         assert!(!transfer("transferring", 25).accepts_update(&transfer("completed", 101)));
         assert!(transfer("transferring", 25).accepts_update(&transfer("completed", 100)));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use tokio::sync::{mpsc, oneshot};
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_receipt_waits_for_cleanup_and_survives_timeout() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        let (entered, entering) = oneshot::channel();
+        let (release, cleanup) = oneshot::channel();
+        let backend = tokio::spawn(async move {
+            assert!(matches!(
+                receiver.recv().await,
+                Some(BackendCommand::Shutdown)
+            ));
+            entered.send(()).unwrap();
+            cleanup.await.unwrap();
+            Ok(())
+        });
+        let handle = CommandSender::track(commands, backend);
+        let retiring = handle.clone();
+        let shutdown = tokio::spawn(async move { retiring.shutdown().await });
+        entering.await.unwrap();
+        assert!(
+            !shutdown.is_finished(),
+            "Command receipt is not resource cleanup"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(21)).await;
+        assert!(shutdown.await.unwrap().unwrap_err().contains("retry"));
+        // A timeout must not abort the backend or lose the eventual receipt.
+        release.send(()).unwrap();
+        handle.shutdown().await.unwrap();
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_panic_cannot_claim_successful_cleanup() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        let backend = tokio::spawn(async move {
+            receiver.recv().await;
+            panic!("simulated cleanup failure");
+        });
+        let handle = CommandSender::track(commands, backend);
+        let error = handle.shutdown().await.unwrap_err();
+        assert!(error.contains("cleanup task failed"));
+        assert_eq!(handle.shutdown().await.unwrap_err(), error);
     }
 }

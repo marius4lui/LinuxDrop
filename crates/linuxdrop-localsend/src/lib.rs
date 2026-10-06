@@ -250,10 +250,31 @@ async fn start_bound_with_budget(
     } else {
         None
     };
-    server::start(shared.clone(), routes, tls, bind)?;
+    let server = server::start(shared.clone(), routes, tls, bind).await?;
+    let s = shared.clone();
+    let maintenance = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tokio::select! {
+                _ = s.stop.cancelled() => break,
+                _ = interval.tick() => {
+                    let mut sessions = s.sessions.lock().await;
+                    let expired:Vec<_>=sessions.iter().filter(|(_,entry)|entry.created.elapsed()>Duration::from_secs(3600)||(!entry.files.values().any(|file|file.started)&&entry.created.elapsed()>Duration::from_secs(180))).map(|(id,_)|id.clone()).collect();
+                    let mut expiry_events=Vec::new();
+                    for id in expired {if let Some(mut entry)=sessions.remove(&id){entry.cancel.cancel();if !entry.transfer.is_terminal(){entry.transfer.state="failed".into();entry.transfer.error=Some("Transfer session expired".into());expiry_events.push(entry.transfer);}}}
+                    drop(sessions);
+                    for transfer in expiry_events{let _=s.events.send(BackendEvent::TransferUpdated(transfer)).await;}
+                    let mut peers = s.peers.lock().await;
+                    let expired: Vec<String> = peers.iter().filter(|(_, p)| p.seen.elapsed() > Duration::from_secs(90)).map(|(id, _)| id.clone()).collect();
+                    for id in expired { peers.remove(&id); let _ = s.events.send(BackendEvent::PeerRemoved {peer_id:id}).await; }
+                }
+            }
+        }
+    });
     let (tx, mut rx) = mpsc::channel(64);
     let s = shared.clone();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
+        let workers = tokio_util::task::TaskTracker::new();
         while let Some(command) = rx.recv().await {
             match command {
                 BackendCommand::ReceiveOffer { transfer_id, url } => {
@@ -263,7 +284,7 @@ async fn start_bound_with_budget(
                         .await
                         .insert(transfer_id.clone(), cancel.clone());
                     let state = s.clone();
-                    tokio::spawn(async move {
+                    workers.spawn(async move {
                         download::run(state, transfer_id, url, cancel).await;
                     });
                 }
@@ -273,7 +294,7 @@ async fn start_bound_with_budget(
                     files,
                 } => {
                     let s = s.clone();
-                    tokio::spawn(async move {
+                    workers.spawn(async move {
                         send(s, transfer_id, peer_id, files).await;
                     });
                 }
@@ -307,28 +328,13 @@ async fn start_bound_with_budget(
         for token in s.outgoing.lock().await.values() {
             token.cancel();
         }
+        workers.close();
+        workers.wait().await;
+        server.await.map_err(|error| error.to_string())?;
+        maintenance.await.map_err(|error| error.to_string())?;
+        Ok(())
     });
-    let s = shared.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(15));
-        loop {
-            tokio::select! {
-                _ = s.stop.cancelled() => break,
-                _ = interval.tick() => {
-                    let mut sessions = s.sessions.lock().await;
-                    let expired:Vec<_>=sessions.iter().filter(|(_,entry)|entry.created.elapsed()>Duration::from_secs(3600)||(!entry.files.values().any(|file|file.started)&&entry.created.elapsed()>Duration::from_secs(180))).map(|(id,_)|id.clone()).collect();
-                    let mut expiry_events=Vec::new();
-                    for id in expired {if let Some(mut entry)=sessions.remove(&id){entry.cancel.cancel();if !entry.transfer.is_terminal(){entry.transfer.state="failed".into();entry.transfer.error=Some("Transfer session expired".into());expiry_events.push(entry.transfer);}}}
-                    drop(sessions);
-                    for transfer in expiry_events{let _=s.events.send(BackendEvent::TransferUpdated(transfer)).await;}
-                    let mut peers = s.peers.lock().await;
-                    let expired: Vec<String> = peers.iter().filter(|(_, p)| p.seen.elapsed() > Duration::from_secs(90)).map(|(id, _)| id.clone()).collect();
-                    for id in expired { peers.remove(&id); let _ = s.events.send(BackendEvent::PeerRemoved {peer_id:id}).await; }
-                }
-            }
-        }
-    });
-    Ok(tx)
+    Ok(CommandSender::track(tx, task))
 }
 
 impl Shared {

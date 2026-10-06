@@ -26,3 +26,25 @@ These results cover current completion changes, not the old release artifact.
 No live-demo restart, physical radio mutation, Android or Apple-device acceptance
 was performed by these checks. Native GTK/Shell acceptance is recorded separately.
 The existing 0.1.0 release packages must be rebuilt before delivering these changes.
+
+## 2026-10-07: confirmed backend restart
+
+- Replaced the fixed 500 ms restart delay with retained backend completion receipts.
+  A timeout preserves cleanup and blocks replacement; repeated shutdown observes
+  the same receipt. Backend actor panic cannot count as successful teardown.
+- LocalSend waits for accepted TLS sockets as well as retired network listeners,
+  discovery, maintenance and outgoing jobs. AirDrop tracks connection-cancellation
+  guards and awaits mDNS shutdown; Quick Share no longer ignores stop timeouts.
+- Workspace tests passed: 51 executed, 3 environment-dependent tests skipped.
+  The skipped native GTK regression then passed separately in its private
+  Xvfb/session bus. Full-workspace/all-target Clippy passed with warnings denied.
+- The actual D-Bus/HTTPS integration passed with a deliberately stalled accepted
+  TLS socket. It holds restart admission closed until the client disconnects,
+  retains the selected file descriptor, rejects duplicate restart/settings/send
+  admissions, and then resumes normal validation on the replacement listener.
+- The actual document-portal/Unix-FD integration passed again, including revoked
+  portal exports, original bytes after path replacement, 25-file batches and
+  invalid-descriptor rejection.
+
+These checks do not cover BlueZ unregister acknowledgement, helper-loss recovery,
+reverse-offer drain or installed-package acceptance. No live demo was restarted.

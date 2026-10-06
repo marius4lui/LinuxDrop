@@ -36,7 +36,7 @@ pub struct DirectWifiLease {
 pub async fn start(
     config: Config,
     events: mpsc::Sender<BackendEvent>,
-) -> Result<mpsc::Sender<BackendCommand>> {
+) -> Result<linuxdrop_core::CommandSender> {
     let budget = linuxdrop_network::BandwidthLimiter::new(config.policy.bandwidth_bytes_per_second);
     start_with_budget(config, events, budget).await
 }
@@ -44,7 +44,7 @@ pub async fn start_with_budget(
     config: Config,
     events: mpsc::Sender<BackendEvent>,
     bandwidth: linuxdrop_network::BandwidthLimiter,
-) -> Result<mpsc::Sender<BackendCommand>> {
+) -> Result<linuxdrop_core::CommandSender> {
     std::fs::create_dir_all(&config.download_dir)?;
     let staging = tempfile::Builder::new()
         .prefix(".linuxdrop-quickshare-")
@@ -95,14 +95,14 @@ pub async fn start_with_budget(
     let (send, _) = match engine.run().await {
         Ok(channels) => channels,
         Err(error) => {
-            let _ = tokio::time::timeout(Duration::from_secs(10), engine.stop()).await;
+            engine.stop().await;
             return Err(error);
         }
     };
     let mut lan_state = engine.lan_state()?;
     let (discovery, mut peers_rx) = broadcast::channel::<EndpointInfo>(128);
     if let Err(error) = engine.discovery(discovery) {
-        let _ = tokio::time::timeout(Duration::from_secs(10), engine.stop()).await;
+        engine.stop().await;
         return Err(error);
     }
     let (commands, mut rx) = mpsc::channel(32);
@@ -117,7 +117,7 @@ pub async fn start_with_budget(
         )))
         .await
         .ok();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut peers = HashMap::<String, EndpointInfo>::new();
         let mut transfers = HashMap::<String, Transfer>::new();
         let mut destinations = HashMap::<String, PathBuf>::new();
@@ -243,7 +243,7 @@ pub async fn start_with_budget(
                 _ = expiry.tick() => {let expired:Vec<_>=pending.iter().filter(|(_,t)|t.elapsed()>Duration::from_secs(120)).map(|(id,_)|id.clone()).collect(); for id in expired {pending.remove(&id);action(&engine,&id,TransferAction::ConsentDecline);}}
             }
         }
-        let _ = tokio::time::timeout(Duration::from_secs(10), engine.stop()).await;
+        engine.stop().await;
         for (_, mut transfer) in transfers {
             if !matches!(
                 transfer.state.as_str(),
@@ -258,8 +258,9 @@ pub async fn start_with_budget(
             }
         }
         drop(staging);
+        Ok(())
     });
-    Ok(commands)
+    Ok(linuxdrop_core::CommandSender::track(commands, task))
 }
 
 fn network_status(

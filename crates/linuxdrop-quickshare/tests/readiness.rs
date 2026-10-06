@@ -1,4 +1,4 @@
-use linuxdrop_core::{BackendCommand, BackendEvent};
+use linuxdrop_core::BackendEvent;
 use linuxdrop_quickshare::{Config, start};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -41,8 +41,8 @@ async fn lan_starts_without_bluetooth_and_port_conflicts_fail() {
             }
         }
     }
-    commands.send(BackendCommand::Shutdown).await.unwrap();
-    // Closing the event stream proves the actor completed engine.stop().
+    commands.shutdown().await.unwrap();
+    // The receipt and closed event stream both confirm engine.stop completed.
     tokio::time::timeout(Duration::from_secs(12), async {
         while receiver.recv().await.is_some() {}
     })
@@ -59,7 +59,7 @@ async fn lan_starts_without_bluetooth_and_port_conflicts_fail() {
     };
     assert_eq!(state.state, "unavailable");
     assert!(state.detail.contains("no enabled IPv4 LAN interface"));
-    commands.send(BackendCommand::Shutdown).await.unwrap();
+    commands.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(12), async {
         while receiver.recv().await.is_some() {}
     })

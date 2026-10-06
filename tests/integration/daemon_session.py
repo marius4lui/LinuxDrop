@@ -90,6 +90,19 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         selected = root / "restart-selection.txt"
         selected.write_bytes(b"retain across restart")
         draft = call("PrepareSend", "(as)", ([str(selected)],))
+        # Hold an accepted TLS handshake open. This makes admission testing
+        # deterministic while exercising real connection drain, not a restart sleep.
+        stalled = socket.create_connection(("127.0.0.1", port))
+        remote_port = stalled.getsockname()[1]
+        def accepted_stalled_connection():
+            inodes = set()
+            for line in Path(f"/proc/{daemon.pid}/net/tcp").read_text().splitlines()[1:]:
+                fields = line.split()
+                if (int(fields[1].split(":")[1], 16) == port
+                        and int(fields[2].split(":")[1], 16) == remote_port):
+                    inodes.add(f"socket:[{fields[9]}]")
+            return any(os.readlink(fd) in inodes for fd in Path(f"/proc/{daemon.pid}/fd").iterdir())
+        wait(accepted_stalled_connection)
         call("RestartBackends")
         assert snapshot()["restarting"]
         for method, signature, args in [
@@ -104,6 +117,7 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
                 raise AssertionError(f"{method} bypassed restart admission")
             except GLib.Error as error:
                 assert "restarting" in str(error), str(error)
+        stalled.close()
         wait(lambda: not snapshot()["restarting"])
         assert snapshot()["settings"]["general"]["device_name"] == "Session test"
         # The selected descriptor is still owned after every rejected admission.

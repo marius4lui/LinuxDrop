@@ -11,4 +11,5 @@ tokio.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

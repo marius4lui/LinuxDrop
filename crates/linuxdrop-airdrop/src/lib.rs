@@ -70,6 +70,7 @@ struct Offer {
     store: ReceiveStore,
 }
 struct Shared {
+    tasks: tokio_util::task::TaskTracker,
     bandwidth: linuxdrop_network::BandwidthLimiter,
     name: String,
     events: mpsc::Sender<BackendEvent>,
@@ -108,7 +109,7 @@ fn reserve_ask(shared: &Shared, remote: IpAddr) -> Result<AskGuard<'_>> {
 pub async fn start(
     config: Config,
     events: mpsc::Sender<BackendEvent>,
-) -> Result<mpsc::Sender<BackendCommand>> {
+) -> Result<linuxdrop_core::CommandSender> {
     let budget = linuxdrop_network::BandwidthLimiter::new(config.policy.bandwidth_bytes_per_second);
     start_with_budget(config, events, budget).await
 }
@@ -116,7 +117,7 @@ pub async fn start_with_budget(
     config: Config,
     events: mpsc::Sender<BackendEvent>,
     bandwidth: linuxdrop_network::BandwidthLimiter,
-) -> Result<mpsc::Sender<BackendCommand>> {
+) -> Result<linuxdrop_core::CommandSender> {
     let address = luftlift_rs::netutil::get_ipv6_for_interface(&config.interface)
         .context("AirDrop needs an active AWDL interface from the hardware helper")?;
     let index = luftlift_rs::netutil::if_index_for(&config.interface)
@@ -127,6 +128,7 @@ pub async fn start_with_budget(
     let tls =
         tokio_rustls::TlsAcceptor::from(Arc::new(luftlift_rs::tls::build_server_config(&cert)?));
     let shared = Arc::new(Shared {
+        tasks: tokio_util::task::TaskTracker::new(),
         bandwidth,
         name: config.name.clone(),
         events: events.clone(),
@@ -159,7 +161,9 @@ pub async fn start_with_budget(
     let stop = CancellationToken::new();
     let server_stop = stop.clone();
     let server_shared = shared.clone();
-    tokio::spawn(async move {
+    let workers = shared.tasks.clone();
+    let connections = workers.clone();
+    let server = tokio::spawn(async move {
         let slots = Arc::new(Semaphore::new(8));
         loop {
             tokio::select! {
@@ -168,7 +172,7 @@ pub async fn start_with_budget(
                 let (socket,remote)=match accepted {Ok(pair)=>pair,Err(error)=>{server_shared.events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"error".into(),detail:format!("AirDrop listener stopped: {error}")})).await.ok();server_stop.cancel();break;}};
                 let Ok(slot)=slots.clone().try_acquire_owned() else {continue};
                     let acceptor=tls.clone();let shared=server_shared.clone();let stop=server_stop.clone();
-                    tokio::spawn(async move {let _slot=slot;
+                    connections.spawn(async move {let _slot=slot;
                         let connection=async {let tls=tokio::time::timeout(Duration::from_secs(10),acceptor.accept(socket)).await??;
                             hyper::server::conn::http1::Builder::new().max_buf_size(32*1024).serve_connection(TokioIo::new(tls),hyper::service::service_fn(move |request|{let shared=shared.clone();async move {Ok::<_,Infallible>(match route(shared,remote.ip(),request).await {Ok(r)=>r,Err(_)=>response(StatusCode::BAD_REQUEST,b"Transfer request failed".to_vec())})}})).await?;Ok::<_,anyhow::Error>(())};
                         tokio::select! {_=stop.cancelled()=>{},_=tokio::time::timeout(Duration::from_secs(1800),connection)=>{}}
@@ -178,7 +182,7 @@ pub async fn start_with_budget(
         }
     });
     events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:"Experimental AirDrop on leased AWDL hardware. Everyone mode; Apple device verification pending.".into()})).await.ok();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let mut peers = HashMap::<String, (SocketAddr, Instant)>::new();
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         let mut advertisement = None;
@@ -214,7 +218,7 @@ pub async fn start_with_budget(
                         let peer=peers.get(&peer_id).map(|(address,_)|*address);
                         let cancel=stop.child_token();shared.jobs.lock().await.insert(transfer_id.clone(),cancel.clone());
                         let shared=shared.clone();let name=config.name.clone();
-                        tokio::spawn(async move {
+                        workers.spawn(async move {
                             let mut transfer=empty_transfer(&transfer_id,&peer_id,"Apple device","outgoing");
                             let result=async {let address=peer.context("This AirDrop device is no longer nearby")?;transport::send(address,&name,files,&mut transfer,&shared.events,cancel.clone(),shared.bandwidth.clone()).await}.await;
                             match result {Ok(())=>{transfer.state="completed".into();transfer.transferred_bytes=transfer.total_bytes;},Err(error)=>{transfer.state=if cancel.is_cancelled(){"cancelled"}else{"failed"}.into();transfer.error=Some(error.to_string());}}
@@ -251,10 +255,18 @@ pub async fn start_with_budget(
                 .await
                 .ok();
         }
-        let _ = mdns.shutdown();
         drop(advertisement);
+        server.await.map_err(|error| error.to_string())?;
+        workers.close();
+        workers.wait().await;
+        let stopped = mdns.shutdown().map_err(|error| error.to_string())?;
+        stopped
+            .recv_async()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     });
-    Ok(tx)
+    Ok(linuxdrop_core::CommandSender::track(tx, task))
 }
 
 fn empty_transfer(id: &str, peer_id: &str, name: &str, direction: &str) -> Transfer {
@@ -298,7 +310,8 @@ impl Drop for TransferGuard {
             transfer.error =
                 Some("The AirDrop connection ended before the transfer completed.".into());
             let shared = self.shared.clone();
-            tokio::spawn(async move {
+            let tasks = shared.tasks.clone();
+            tasks.spawn(async move {
                 shared.pending.lock().await.remove(&transfer.id);
                 shared.jobs.lock().await.remove(&transfer.id);
                 shared
@@ -622,6 +635,7 @@ mod tests {
         .1;
         let (events, mut rx) = mpsc::channel(128);
         let shared = Arc::new(Shared {
+            tasks: tokio_util::task::TaskTracker::new(),
             bandwidth: linuxdrop_network::BandwidthLimiter::new(Some(wire_size)),
             name: "Receiver".into(),
             events: events.clone(),

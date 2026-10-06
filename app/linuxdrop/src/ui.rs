@@ -1544,7 +1544,9 @@ impl Ui {
         let snapshot = self.snapshot.borrow();
         for backend in array(&snapshot, "backends") {
             let detail = text(&backend, "detail");
-            let summary = if text(&backend, "id") == "quickshare"
+            let summary = if detail.starts_with("Sharing restart could not finish:") {
+                tr("Sharing could not restart. Retry in Settings after cleanup finishes.")
+            } else if text(&backend, "id") == "quickshare"
                 && text(&backend, "state") == "ready"
                 && detail.contains("Bluetooth unavailable")
             {

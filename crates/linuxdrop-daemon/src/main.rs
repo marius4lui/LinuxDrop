@@ -37,6 +37,7 @@ struct Data {
     hardware: Value,
     drafts: HashMap<String, Draft>,
     commands: HashMap<String, CommandSender>,
+    retiring: HashMap<String, CommandSender>,
     visibility_since: Option<Instant>,
     decisions: HashSet<String>,
     stop_when_idle: bool,
@@ -986,13 +987,43 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
                 },
             );
         }
-        (d.settings.clone(), std::mem::take(&mut d.commands))
+        let mut previous = std::mem::take(&mut d.retiring);
+        previous.extend(std::mem::take(&mut d.commands));
+        (d.settings.clone(), previous)
     };
     shared.changed().await;
-    for (_, tx) in previous {
-        let _ = tx.send(BackendCommand::Shutdown).await;
+    shared.data.lock().await.retiring = previous.clone();
+    let mut stopping = tokio::task::JoinSet::new();
+    for (id, commands) in previous {
+        stopping.spawn(async move {
+            let result = commands.shutdown().await;
+            (id, commands, result)
+        });
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut failures = Vec::new();
+    while let Some(stopped) = stopping.join_next().await {
+        match stopped {
+            Ok((id, commands, Err(error))) => {
+                failures.push(format!("{id}: {error}"));
+                shared.data.lock().await.retiring.insert(id, commands);
+            }
+            Err(error) => failures.push(format!("Backend shutdown failed: {error}")),
+            Ok((id, _, Ok(()))) => {
+                shared.data.lock().await.retiring.remove(&id);
+            }
+        }
+    }
+    if !failures.is_empty() {
+        let mut d = shared.data.lock().await;
+        for state in d.backends.values_mut() {
+            state.state = "error".into();
+            state.detail = format!("Sharing restart could not finish: {}", failures.join("; "));
+        }
+        d.restarting = false;
+        drop(d);
+        shared.changed().await;
+        return;
+    }
     shared.helper.lock().await.take();
     shared.quickshare_helper.lock().await.take();
     shared.download_offer.lock().await.take();
@@ -1354,6 +1385,7 @@ async fn main() -> Result<()> {
             hardware: json!({"radios":[],"interfaces":[],"bluetooth":[],"warnings":[]}),
             drafts: HashMap::new(),
             commands: HashMap::new(),
+            retiring: HashMap::new(),
             visibility_since: None,
             decisions: HashSet::new(),
             stop_when_idle: false,

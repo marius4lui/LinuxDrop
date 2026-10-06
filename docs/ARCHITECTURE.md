@@ -63,3 +63,22 @@ Hardware refresh follows debounced udev events, with a five-second fallback. An 
 Quick Share/Nearby Share use one backend. Direct Wi-Fi is a negotiated upgrade, not universal independent P2P discovery. AirDrop Everyone does not implement Apple Contacts Only. Display names/IPs are not used to merge peer identities. Folder trees, text/contact payloads, resumable transfers and trusted-contact auto-accept are outside 0.1.0.
 
 See [protocol ADR](adr/0002-protocol-engines.md), [hardware design](HARDWARE_AND_PACKAGING.md) and [security policy](../SECURITY.md).
+
+### Backend restart receipts
+
+`CommandSender::shutdown()` waits for a persistent completion receipt from the
+backend actor, with a 20-second caller deadline. The deadline does not abort
+cleanup. The supervisor stops all old backends concurrently and only starts a
+replacement after successful receipts. Failed/timed-out handles stay in a
+separate retiring map so a retry can observe their completion without admitting
+new transfers into a draining backend. A failed cleanup leaves service status
+in error and keeps helper leases alive until a successful retry.
+
+LocalSend tracks its listener/discovery tasks and outgoing jobs. Its axum-server
+listener task also waits for the connection watcher count to reach zero: the
+server's forced-shutdown return alone does not prove that accepted TLS sockets
+have closed. Quick Share waits for its engine tracker; AirDrop waits for its
+connection/transfer tracker, cancellation guards and mDNS shutdown response.
+BlueZ unregister acknowledgements, helper-loss recovery and reverse-download
+listener shutdown remain separate lifecycle work; this receipt is not a claim
+that those outstanding paths have been verified.
