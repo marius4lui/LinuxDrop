@@ -132,3 +132,17 @@ handles, replaces the original path and receives all 25 offered files byte-for-b
 from the retained descriptors. Write-only descriptors, directories, pipes, invalid
 names and combined-count overflow are rejected without partially appending a batch.
 No installed Flatpak or physical device acceptance is inferred from this test.
+
+## 2026-10-07: saved settings and effective service status
+
+The Settings page now keeps a persistent status card above search. It distinguishes
+saved choices while services apply, enabled services that failed or lack a usable
+network, and the last-known settings shown while disconnected. Details opens the
+Hardware page; successful recovery removes the warning. Backend-only updates do
+not rebuild the settings form or erase the search query.
+
+The native private-session GTK regression passed in German after exercising
+applying -> error -> offline -> recovered states, the Details navigation and
+search-widget identity. The rendered 480x600 view was inspected:
+`ui/completion/settings-apply-error.png`. All status text, actions, search and
+bottom navigation fit. No running user demo was restarted.

@@ -27,7 +27,7 @@ items retain their remaining acceptance scope even where code now exists.
 - [x] Per-request destination and partial file acceptance using daemon contract.
 - [ ] Full settings inventory from final schema: language/close behavior, receive policy/subfolders, public duration, protocol ports/modes, adapters/controllers, network filters, notifications/privacy/sound, limits/history, diagnosis/restart/reset/export.
 - [ ] Settings search survives edits and includes desktop/diagnostic rows; clear categories and advanced grouping.
-- [ ] Desired/effective settings differences and backend apply errors visible.
+- [x] Desired/effective settings differences and backend apply errors visible: persistent applying/error/offline status in Settings, per-service details and recovery; native German 480x600 acceptance.
 - [ ] Icon-only actions have translated accessible names; selected states/progress exposed; keyboard navigation/actions documented.
 - [ ] Notch multiple-transfer selection remains stable; completion/error/open-folder actions; summary does not randomly change peer.
 - [ ] Pointer-monitor option, position pinned during interaction, monitor removal recovery; configurable drag dwell and keyboard shortcut without conflict.

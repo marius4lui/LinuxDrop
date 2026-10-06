@@ -66,6 +66,13 @@ pub fn tr(message: &str) -> String {
     }
     match message {
         "Language" => "Sprache",
+        "Details" => "Details",
+        "Show sharing service details" => "Status der Freigabedienste anzeigen",
+        "Your choices are saved. Sharing resumes when the services are ready." => "Deine Auswahl ist gespeichert. Sobald die Dienste bereit sind, kannst du wieder Dateien teilen.",
+        "Sharing needs attention" => "Freigabedienste prüfen",
+        "Your choices are saved, but these services are not ready. Check their status before sending." => "Deine Auswahl ist gespeichert, aber diese Dienste sind noch nicht bereit. Prüfe vor dem Senden ihren Status.",
+        "Sharing service is offline" => "Freigabedienst ist offline",
+        "The last known settings are shown. LinuxDrop will reconnect automatically." => "Du siehst die zuletzt bekannten Einstellungen. LinuxDrop stellt die Verbindung automatisch wieder her.",
         "Applies when the app next opens" => "Gilt beim nächsten Öffnen der App",
         "When closing the window" => "Beim Schließen des Fensters",
         "Background keeps sharing available; quit when idle never interrupts active transfers" => "Im Hintergrund bleiben Freigaben verfügbar; Beenden wartet auf laufende Übertragungen",

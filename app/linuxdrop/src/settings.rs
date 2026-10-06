@@ -46,6 +46,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         "Device, receiving, network, and desktop preferences.",
         "hero-subtitle",
     ));
+    ui.settings_body.append(&ui.settings_status);
     let search = gtk::SearchEntry::builder()
         .placeholder_text(tr("Search settings"))
         .build();

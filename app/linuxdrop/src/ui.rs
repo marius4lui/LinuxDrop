@@ -34,6 +34,9 @@ pub struct Ui {
     transfers: gtk::Box,
     hardware: gtk::Box,
     pub settings_body: gtk::Box,
+    pub settings_status: adw::PreferencesGroup,
+    settings_status_row: adw::ActionRow,
+    settings_status_details: gtk::Button,
     busy: Cell<bool>,
     refreshing: Cell<bool>,
     refresh_again: Cell<bool>,
@@ -311,6 +314,16 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         "network-wireless-symbolic",
     );
     let settings_body = padded(24, 20, 20);
+    let settings_status = adw::PreferencesGroup::new();
+    settings_status.set_widget_name("settings:service-status");
+    settings_status.set_visible(false);
+    let settings_status_row = adw::ActionRow::builder().subtitle_lines(0).build();
+    settings_status_row.add_prefix(&gtk::Image::from_icon_name("dialog-information-symbolic"));
+    let settings_status_details = gtk::Button::with_label(&tr("Details"));
+    settings_status_details.set_valign(gtk::Align::Center);
+    settings_status_details.set_tooltip_text(Some(&tr("Show sharing service details")));
+    settings_status_row.add_suffix(&settings_status_details);
+    settings_status.add(&settings_status_row);
     stack.add_titled_with_icon(
         &page(&settings_body),
         Some("settings"),
@@ -349,6 +362,9 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         transfers,
         hardware,
         settings_body,
+        settings_status,
+        settings_status_row,
+        settings_status_details,
         busy: Cell::new(false),
         refreshing: Cell::new(false),
         refresh_again: Cell::new(false),
@@ -365,6 +381,12 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         transfer_progress: RefCell::new(HashMap::new()),
     });
 
+    let weak = Rc::downgrade(&ui);
+    ui.settings_status_details.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.stack.set_visible_child_name("hardware");
+        }
+    });
     let weak = Rc::downgrade(&ui);
     ui.window.connect_close_request(move |_| {
         let Some(ui) = weak.upgrade() else {
@@ -648,6 +670,40 @@ impl Ui {
         self.status.set_label(&tr("Offline"));
         self.send.set_sensitive(false);
         self.share_link.set_sensitive(false);
+        self.settings_status.set_visible(true);
+        self.settings_status_details.set_visible(false);
+        self.settings_status_row
+            .set_title(&tr("Sharing service is offline"));
+        self.settings_status_row.set_subtitle(&tr(
+            "The last known settings are shown. LinuxDrop will reconnect automatically.",
+        ));
+    }
+    fn update_settings_status(&self) {
+        let snapshot = self.snapshot.borrow();
+        let applying = snapshot["restarting"] == true;
+        let affected: Vec<_> = array(&snapshot, "backends")
+            .into_iter()
+            .filter(|backend| {
+                snapshot["settings"][text(backend, "id")]["enabled"] == true
+                    && matches!(text(backend, "state"), "error" | "unavailable")
+            })
+            .map(|backend| protocol_name(text(&backend, "id")).to_owned())
+            .collect();
+        self.settings_status
+            .set_visible(applying || !affected.is_empty());
+        self.settings_status_details
+            .set_visible(!applying && !affected.is_empty());
+        if applying {
+            self.settings_status_row
+                .set_title(&tr("Applying sharing settings"));
+            self.settings_status_row.set_subtitle(&tr(
+                "Your choices are saved. Sharing resumes when the services are ready.",
+            ));
+        } else if !affected.is_empty() {
+            self.settings_status_row
+                .set_title(&tr("Sharing needs attention"));
+            self.settings_status_row.set_subtitle(&format!("{}: {}", affected.join(", "), tr("Your choices are saved, but these services are not ready. Check their status before sending.")));
+        }
     }
     fn install_proxy(self: &Rc<Self>, proxy: &gio::DBusProxy) {
         // Every new proxy subscribes before its first snapshot, including reconnects.
@@ -754,6 +810,7 @@ impl Ui {
                         "light" => adw::ColorScheme::ForceLight,
                         _ => adw::ColorScheme::Default,
                     });
+                    ui.update_settings_status();
                     ui.update_send();
                 }
                 Err(error) => {
