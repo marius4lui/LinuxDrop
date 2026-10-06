@@ -2,6 +2,8 @@
 
 Stand: 6. Oktober 2026. Dieser Report konkretisiert die Projektidee; er dokumentiert noch keine implementierte oder getestete Produktfunktion.
 
+Ergänzung: Der [vollständige Agentenplan](AGENT_IMPLEMENTATION_PLAN.md) konkretisiert die Notch, getrennte Bedienflächen, das Einstellungsinventar, Hardwareerkennung und ausführbare Arbeitspakete. Für diese Details ist der Agentenplan maßgeblich.
+
 ## 1. Verifizierter Ausgangspunkt
 
 Repository: https://github.com/marius4lui/LinuxDrop. Beim Klonen enthält `main` am Commit `6a62038` nur README.md. Es gibt keine bestehende Anwendung, Build-Konfiguration oder Lizenzdatei. Es ist ein Neuaufbau, kein Umbau vorhandener Software.
