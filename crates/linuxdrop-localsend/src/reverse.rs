@@ -91,6 +91,8 @@ struct FileMetadata {
     size: u64,
     file_type: String,
     sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<crate::metadata::Metadata>,
 }
 struct Source {
     file: Arc<std::fs::File>,
@@ -203,6 +205,7 @@ pub async fn start_sources_with_budget(
     let mut total = 0u64;
     for source in sources {
         let file = source.reader()?;
+        let metadata = Some(crate::metadata::Metadata::read(&file)?);
         total = total
             .checked_add(source.size())
             .context("Offer size overflow")?;
@@ -222,6 +225,7 @@ pub async fn start_sources_with_budget(
                     size: source.size(),
                     file_type: "application/octet-stream".into(),
                     sha256: None,
+                    metadata,
                 },
             },
         );

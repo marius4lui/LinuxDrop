@@ -8,6 +8,7 @@ license.workspace = true
 linuxdrop-core = { path = "../linuxdrop-core" }
 linuxdrop-network = { path = "../linuxdrop-network" }
 linuxdrop-storage = { path = "../linuxdrop-storage" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

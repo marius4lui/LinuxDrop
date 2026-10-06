@@ -133,7 +133,10 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         offer = {
             "info": {"alias": "Integration sender", "version": "2.1", "fingerprint": "f" * 64,
                      "port": 53317, "protocol": "https", "deviceType": "desktop"},
-            "files": {"file": {"id": "file", "fileName": "integration.txt", "size": len(payload), "fileType": "text/plain"}},
+            "files": {"file": {"id": "file", "fileName": "integration.txt", "size": len(payload), "fileType": "text/plain",
+                               "metadata": {"modified": "2021-01-01T14:34:56.123456789+02:00",
+                                            "accessed": "2021-01-01T12:34:57.987654321Z", "futureOptional": True},
+                               "futureFileField": {"ignored": True}}},
         }
         with concurrent.futures.ThreadPoolExecutor() as executor:
             pending = executor.submit(request, "/prepare-upload", offer)
@@ -153,6 +156,9 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             request(f'/upload?sessionId={accepted["sessionId"]}&fileId=file&token={accepted["files"]["file"]}', raw=payload)
             done = wait(lambda: next((t for t in snapshot()["transfers"] if t["state"] == "completed"), None))
             assert done["transferred_bytes"] == len(payload)
+            saved_stat = (root / "received/integration.txt").stat()
+            assert saved_stat.st_mtime_ns == 1609504496123456789
+            assert saved_stat.st_atime_ns == 1609504497987654321
             assert (root / "received/integration.txt").read_bytes() == payload
             call("CancelTransfer", "(s)", (transfer["id"],))
             assert snapshot()["transfers"][0]["state"] == "completed"
@@ -269,7 +275,7 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             thread.join(timeout=2)
         call("StopWhenIdle")
         assert daemon.wait(timeout=5) == 0
-        print("PASS restart admission/quiescing and active-request protection, actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, reverse-download PIN and consent while hidden, idle shutdown")
+        print("PASS restart admission/quiescing and active-request protection, actual D-Bus/HTTPS consent and timestamp/forward-field interoperability, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, reverse-download PIN and consent while hidden, idle shutdown")
     finally:
         daemon.terminate()
         try:

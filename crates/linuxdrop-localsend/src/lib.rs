@@ -1,5 +1,6 @@
 mod discovery;
 pub mod download;
+mod metadata;
 mod rate;
 pub mod reverse;
 mod server;
@@ -97,6 +98,8 @@ struct WireFile {
     file_type: String,
     #[serde(default)]
     sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<metadata::Metadata>,
 }
 #[derive(Deserialize, Serialize)]
 struct Prepare {
@@ -815,6 +818,9 @@ async fn receive_body(
     if cancel.is_cancelled() {
         bail!("Transfer cancelled");
     }
+    if let Some(metadata) = &meta.metadata {
+        metadata.apply(&mut pending).await?;
+    }
     pending.commit_with_policy(policy).await
 }
 
@@ -910,7 +916,9 @@ async fn send_files(
     for source in paths {
         let name = source.name().to_owned();
         validate_name(&name)?;
-        let file = tokio::fs::File::from_std(source.reader()?);
+        let reader = source.reader()?;
+        let metadata = Some(metadata::Metadata::read(&reader)?);
+        let file = tokio::fs::File::from_std(reader);
         let size = source.size();
         let file_id = Uuid::new_v4().to_string();
         transfer.total_bytes = transfer
@@ -930,6 +938,7 @@ async fn send_files(
                 size,
                 file_type: "application/octet-stream".into(),
                 sha256: None,
+                metadata,
             },
         );
         opened.push((file_id, file, size));
@@ -1289,6 +1298,9 @@ mod tests {
         tokio::fs::write(bc.download_dir.join("Grüße.txt"), b"keep me")
             .await
             .unwrap();
+        for path in [&source, &empty, &duplicate] {
+            metadata::tests::set_test_times(path);
+        }
         let sources = [source.clone(), empty, duplicate]
             .iter()
             .map(|path| linuxdrop_core::SendSource::open(path).unwrap())
@@ -1315,6 +1327,9 @@ mod tests {
         .unwrap();
         let completed = next_transfer(&mut br, "completed").await;
         assert_eq!(completed.saved_paths.len(), 3);
+        for path in &completed.saved_paths {
+            metadata::tests::assert_test_times(std::path::Path::new(path));
+        }
         assert_eq!(completed.transferred_bytes, completed.total_bytes);
         let sent = next_transfer(&mut ar, "completed").await;
         assert_eq!(sent.id, "send-one");
@@ -1372,6 +1387,7 @@ mod tests {
             size: 1,
             file_type: "text/plain".into(),
             sha256: None,
+            metadata: None,
         };
         let result = client
             .post(format!("{base}/prepare-upload"))

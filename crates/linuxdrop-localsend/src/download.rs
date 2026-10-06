@@ -317,6 +317,9 @@ async fn receive(
         if cancel.is_cancelled() {
             bail!("Download cancelled");
         }
+        if let Some(metadata) = &file.metadata {
+            metadata.apply(&mut pending).await?;
+        }
         transfer.saved_paths.push(
             pending
                 .commit_with_policy(options.collision_policy)
@@ -344,6 +347,7 @@ mod tests {
             ("skip.txt", b"unselected"),
         ] {
             std::fs::write(source.path().join(name), data).unwrap();
+            crate::metadata::tests::set_test_times(&source.path().join(name));
         }
         let offer = crate::reverse::start_offer(
             crate::reverse::OfferConfig {
@@ -431,6 +435,7 @@ mod tests {
         );
         assert!(!destination.join("skip.txt").exists());
         for path in completed.saved_paths {
+            crate::metadata::tests::assert_test_times(std::path::Path::new(&path));
             let contents = std::fs::read(path).unwrap();
             assert!(contents.is_empty() || contents == b"exact bytes");
         }

@@ -12,7 +12,7 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Advertise protocol 2.2 consistently; native partial-acceptance tokens and sender partial-success accounting.
 - [x] Per-request destination and collision policy using shared ReceiveOptions/storage policy.
 - [x] Upload PIN policy and sender PIN challenge/retry with bounded attempts (401/429).
-- [ ] Metadata timestamps preserved safely when present; unknown optional fields remain forward-compatible.
+- [x] Metadata timestamps preserved safely when present; unknown optional fields remain forward-compatible.
 - [x] HTTP registration reply to multicast announcement, with UDP fallback; interface-scoped multicast and LAN-only reachability policy.
 - [x] Allowed network interfaces, VPN/virtual exclusions, upload request rate limits, shared bandwidth policy.
 - [x] Live IPv4 address/interface reconciliation with listener and discovery retirement, stale-peer removal and preservation of connections on unaffected interfaces.
@@ -309,3 +309,31 @@ daemon all-target Clippy; actual SIGTERM/SIGINT with an accepted stalled TLS upl
 D-Bus/HTTPS consent/restart/idle tests; real portal/descriptor plus active-download
 idle-exit test. The staged systemd user unit validates. The signal integration is
 now part of CI. No running demo or installed package was changed.
+
+
+## LocalSend timestamps, 2026-10-07
+
+Source descriptors now supply optional RFC3339 `metadata.modified` and
+`metadata.accessed` fields before reading payload bytes. Upload receive and the
+explicit download client apply valid times only after size/checksum validation,
+before no-replace publication. The storage layer flushes buffered writes and sets
+times on a cloned descriptor of the private pending inode; remote names never
+become metadata-update paths. Missing/null fields and unknown optional fields
+remain compatible. Invalid date strings and non-representable leap seconds are
+ignored independently, leaving otherwise valid contents and times usable.
+
+Normal LocalSend upload metadata follows the primary v2.2 specification:
+https://github.com/localsend/protocol/blob/main/README.md#41-preparation-metadata-only
+Download offers also include these optional fields; clients that understand them
+can retain the same timestamps, while clients ignoring them keep their existing
+behavior. Filesystem timestamp range/precision still applies.
+
+Passed: all 17 LocalSend and three storage tests, including real pinned-TLS
+send/receive with empty files, collisions and a renamed/replaced source path;
+reverse-offer timestamp preservation; UTC offsets, nanoseconds, a pre-epoch date,
+invalid/null/unknown metadata; symlink collision without changing the original
+file's timestamp. All-target LocalSend/storage Clippy passed. A separate actual
+D-Bus/HTTPS daemon test sends explicitly written metadata JSON (including future
+fields) and checks exact saved nanosecond timestamps before reading the contents.
+This is software acceptance, not official mobile-client or physical-device proof.
+The installed demo/packages remain unchanged pending final builds.

@@ -97,6 +97,20 @@ pub struct PendingFile {
 }
 
 impl PendingFile {
+    /// Apply metadata to the held private inode, before atomic publication.
+    /// Flush Tokio's pending writes first so they cannot overwrite the timestamp.
+    pub async fn set_times(&mut self, times: std::fs::FileTimes) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.file.flush().await?;
+        self.file
+            .try_clone()
+            .await?
+            .into_std()
+            .await
+            .set_times(times)?;
+        Ok(())
+    }
+
     pub async fn commit(self) -> Result<PathBuf> {
         self.commit_with_policy(linuxdrop_core::CollisionPolicy::Rename)
             .await
@@ -172,10 +186,25 @@ mod tests {
         let outside = temp.path().join("important.txt");
         std::fs::write(&outside, "original").unwrap();
         std::os::unix::fs::symlink(&outside, temp.path().join("photo.txt")).unwrap();
+        let original_modified = std::fs::metadata(&outside).unwrap().modified().unwrap();
+        let incoming_modified =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234567890);
         let mut incoming = store.create("photo.txt").unwrap();
         incoming.file.write_all(b"received").await.unwrap();
+        incoming
+            .set_times(std::fs::FileTimes::new().set_modified(incoming_modified))
+            .await
+            .unwrap();
         let saved = incoming.commit().await.unwrap();
         assert_eq!(saved.file_name().unwrap(), "photo (1).txt");
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().modified().unwrap(),
+            original_modified
+        );
+        assert_eq!(
+            std::fs::metadata(&saved).unwrap().modified().unwrap(),
+            incoming_modified
+        );
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "original");
         assert_eq!(std::fs::read_to_string(saved).unwrap(), "received");
     }
