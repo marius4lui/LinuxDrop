@@ -16,7 +16,10 @@ async fn lan_starts_without_bluetooth_and_port_conflicts_fail() {
         max_files: 1,
         upgrade_lease: None,
         p2p_connector: None,
-        policy: Default::default(),
+        policy: linuxdrop_core::TransferPolicy {
+            allow_virtual_interfaces: true,
+            ..Default::default()
+        },
     };
     let (events, mut receiver) = mpsc::channel(128);
     let commands = start(configuration(None), events).await.unwrap();
@@ -40,6 +43,23 @@ async fn lan_starts_without_bluetooth_and_port_conflicts_fail() {
     }
     commands.send(BackendCommand::Shutdown).await.unwrap();
     // Closing the event stream proves the actor completed engine.stop().
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while receiver.recv().await.is_some() {}
+    })
+    .await
+    .unwrap();
+
+    let mut restricted = configuration(None);
+    restricted.ble = false;
+    restricted.policy.allowed_interfaces = vec!["lo".into()];
+    let (events, mut receiver) = mpsc::channel(128);
+    let commands = start(restricted, events).await.unwrap();
+    let BackendEvent::StateChanged(state) = receiver.recv().await.unwrap() else {
+        panic!("Expected startup status");
+    };
+    assert_eq!(state.state, "unavailable");
+    assert!(state.detail.contains("no enabled IPv4 LAN interface"));
+    commands.send(BackendCommand::Shutdown).await.unwrap();
     tokio::time::timeout(Duration::from_secs(12), async {
         while receiver.recv().await.is_some() {}
     })

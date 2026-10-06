@@ -25,6 +25,8 @@ Quick Share:
 - Zero-byte send framing and changed/truncated source detection.
 - Independent tracked LAN sessions, shutdown cancellation, inbound terminal failure events and discovery connect timeout.
 - TCP/mDNS task health events, Bluetooth degradation diagnostics, initial mDNS registration and daemon shutdown on drop. Rust formatting is normalized for the repository's formatter gate.
+- IPv4 LAN listeners, source sockets, discovery probes and upgrades follow LinuxDrop's interface allowlist. mDNS uses explicit allowed addresses instead of the library's unrestricted auto-address population. Live interface reconciliation remains completion work.
+- File payloads consume the daemon-provided shared bandwidth budget in both directions; matching cancellation remains responsive during a budget wait. The outbound BLE connector uses the explicitly selected controller too.
 
 AirDrop / AWDL:
 
@@ -32,5 +34,6 @@ AirDrop / AWDL:
 - LinuxDrop does not invoke Luftlift's auto-accept server or salvage archive decoder. It uses its plist builders/parser, mDNS metadata and self-signed server certificate generation behind a separate consent-aware server.
 - LinuxDrop's AirDrop HTTPS client verifies the TLS signature and pins the receiver certificate across the whole transfer. This does not verify an Apple account or contacts identity.
 - Strict bounded dvzip/CPIO processing, regular-file-only extraction, advertised filename matching, private spool files and no-replace publication.
+- Upload streams share the daemon payload budget; outbound IPv6 sockets bind the source address/device of the scoped leased AWDL interface instead of relying on the default route.
 
 The upstream library and CLI sources are retained for attribution and reproducible builds. Only LinuxDrop's adapter paths and the netd-launched Filin binary form the product runtime.

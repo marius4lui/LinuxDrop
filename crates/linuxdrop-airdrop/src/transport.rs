@@ -103,11 +103,7 @@ async fn post(
     body: Body,
     length: Option<u64>,
 ) -> Result<Vec<u8>> {
-    let tcp = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::net::TcpStream::connect(address),
-    )
-    .await??;
+    let tcp = tokio::time::timeout(Duration::from_secs(10), connect_on_awdl(address)).await??;
     let tls = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_rustls::TlsConnector::from(config).connect(ServerName::try_from("airdrop")?, tcp),
@@ -145,6 +141,40 @@ async fn post(
     result
 }
 
+async fn connect_on_awdl(address: SocketAddr) -> Result<tokio::net::TcpStream> {
+    match address {
+        SocketAddr::V4(peer) if peer.ip().is_loopback() => {
+            // Local protocol harnesses only; production discovery supplies an
+            // IPv6 address scoped to the netd-leased AWDL interface.
+            Ok(tokio::net::TcpStream::connect(address).await?)
+        }
+        SocketAddr::V6(peer) if peer.scope_id() != 0 => {
+            let interfaces = linuxdrop_network::interfaces(
+                &linuxdrop_core::TransferPolicy {
+                    allow_virtual_interfaces: true,
+                    ..Default::default()
+                },
+                false,
+            )?;
+            let local = interfaces.into_iter().find(|interface| interface.index == peer.scope_id() && matches!(interface.address, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local()))
+                .context("The leased AWDL interface no longer has its IPv6 address")?;
+            let std::net::IpAddr::V6(ip) = local.address else {
+                unreachable!()
+            };
+            let socket = tokio::net::TcpSocket::new_v6()?;
+            socket.bind_device(Some(local.name.as_bytes()))?;
+            socket.bind(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                0,
+                0,
+                local.index,
+            )))?;
+            Ok(socket.connect(address).await?)
+        }
+        _ => bail!("AirDrop requires an IPv6 peer on the leased AWDL interface"),
+    }
+}
+
 pub async fn send(
     address: SocketAddr,
     name: &str,
@@ -152,8 +182,9 @@ pub async fn send(
     transfer: &mut Transfer,
     events: &mpsc::Sender<BackendEvent>,
     cancel: CancellationToken,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
 ) -> Result<()> {
-    tokio::select! {_=cancel.cancelled()=>bail!("Transfer cancelled"),result=send_inner(address,name,files,transfer,events,cancel.clone())=>result}
+    tokio::select! {_=cancel.cancelled()=>bail!("Transfer cancelled"),result=send_inner(address,name,files,transfer,events,cancel.clone(),bandwidth)=>result}
 }
 async fn send_inner(
     address: SocketAddr,
@@ -162,6 +193,7 @@ async fn send_inner(
     transfer: &mut Transfer,
     events: &mpsc::Sender<BackendEvent>,
     cancel: CancellationToken,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
 ) -> Result<()> {
     if files.is_empty() || files.len() > 1000 {
         bail!("Choose between 1 and 1000 files");
@@ -209,8 +241,9 @@ async fn send_inner(
         .send(BackendEvent::TransferUpdated(transfer.clone()))
         .await
         .ok();
+    let archive_cancel = cancel.clone();
     let (archive, size) =
-        tokio::task::spawn_blocking(move || super::archive::encode(&files, Some(&cancel)))
+        tokio::task::spawn_blocking(move || super::archive::encode(&files, Some(&archive_cancel)))
             .await??;
     let config = Arc::new(
         rustls::ClientConfig::builder()
@@ -293,8 +326,20 @@ async fn send_inner(
     let progress = events.clone();
     let mut transferred = 0u64;
     let mut last = Instant::now();
-    let stream = ReaderStream::with_capacity(tokio::fs::File::from_std(archive), 128 * 1024).map(
-        move |chunk| {
+    let stream = ReaderStream::with_capacity(tokio::fs::File::from_std(archive), 128 * 1024)
+        .then(move |chunk| {
+            let bandwidth = bandwidth.clone();
+            let cancel = cancel.clone();
+            async move {
+                let bytes = chunk?;
+                bandwidth
+                    .acquire(bytes.len(), &cancel)
+                    .await
+                    .map_err(std::io::Error::other)?;
+                Ok::<_, std::io::Error>(bytes)
+            }
+        })
+        .map(move |chunk| {
             if let Ok(bytes) = &chunk {
                 transferred += bytes.len() as u64;
                 if last.elapsed() > Duration::from_millis(200) {
@@ -306,8 +351,7 @@ async fn send_inner(
                 }
             }
             chunk.map(Frame::data)
-        },
-    );
+        });
     let body = StreamBody::new(stream).boxed_unsync();
     tokio::time::timeout(
         Duration::from_secs(1800),
@@ -361,4 +405,18 @@ pub(super) async fn unsolicited_upload(address: SocketAddr) -> Result<Vec<u8>> {
         Some(4),
     )
     .await
+}
+
+#[cfg(test)]
+mod scope_tests {
+    #[tokio::test]
+    async fn unscoped_remote_airdrop_addresses_cannot_use_the_default_route() {
+        for address in ["192.0.2.1:8771", "[2001:db8::1]:8771", "[fe80::1]:8771"] {
+            assert!(
+                super::connect_on_awdl(address.parse().unwrap())
+                    .await
+                    .is_err()
+            );
+        }
+    }
 }

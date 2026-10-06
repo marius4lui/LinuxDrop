@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
-use tokio::net::TcpStream;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +38,7 @@ impl Drop for MDnsDiscovery {
 impl MDnsDiscovery {
     pub fn new(sender: broadcast::Sender<EndpointInfo>) -> Result<Self, anyhow::Error> {
         let daemon = ServiceDaemon::new()?;
+        crate::lan_policy::configure_mdns(&daemon)?;
 
         Ok(Self { daemon, sender })
     }
@@ -76,7 +76,7 @@ impl MDnsDiscovery {
                                         continue;
                                     }
 
-                                    let ip = match ip_hash.iter().next() {
+                                    let ip = match ip_hash.iter().copied().find(|ip| crate::lan_policy::source_for(std::net::IpAddr::V4(**ip)).is_ok()) {
                                         Some(i) => i,
                                         None => continue,
                                     };
@@ -100,7 +100,7 @@ impl MDnsDiscovery {
 
                                     let ip_port = format!("{ip}:{port}");
                                     let fullname = info.get_fullname().to_string();
-                                    if matches!(tokio::time::timeout(std::time::Duration::from_secs(3), TcpStream::connect(&ip_port)).await, Ok(Ok(_))) {
+                                    if matches!(tokio::time::timeout(std::time::Duration::from_secs(3), crate::lan_policy::connect(std::net::SocketAddr::new(std::net::IpAddr::V4(*ip), port))).await, Ok(Ok(_))) {
                                         let ei = EndpointInfo {
                                             fullname: fullname.clone(),
                                             id: ip_port,

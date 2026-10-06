@@ -70,6 +70,7 @@ struct Offer {
     store: ReceiveStore,
 }
 struct Shared {
+    bandwidth: linuxdrop_network::BandwidthLimiter,
     name: String,
     events: mpsc::Sender<BackendEvent>,
     store: ReceiveStore,
@@ -108,6 +109,14 @@ pub async fn start(
     config: Config,
     events: mpsc::Sender<BackendEvent>,
 ) -> Result<mpsc::Sender<BackendCommand>> {
+    let budget = linuxdrop_network::BandwidthLimiter::new(config.policy.bandwidth_bytes_per_second);
+    start_with_budget(config, events, budget).await
+}
+pub async fn start_with_budget(
+    config: Config,
+    events: mpsc::Sender<BackendEvent>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
+) -> Result<mpsc::Sender<BackendCommand>> {
     let address = luftlift_rs::netutil::get_ipv6_for_interface(&config.interface)
         .context("AirDrop needs an active AWDL interface from the hardware helper")?;
     let index = luftlift_rs::netutil::if_index_for(&config.interface)
@@ -118,6 +127,7 @@ pub async fn start(
     let tls =
         tokio_rustls::TlsAcceptor::from(Arc::new(luftlift_rs::tls::build_server_config(&cert)?));
     let shared = Arc::new(Shared {
+        bandwidth,
         name: config.name.clone(),
         events: events.clone(),
         store: ReceiveStore::open(&config.download_dir)?,
@@ -205,7 +215,7 @@ pub async fn start(
                         let shared=shared.clone();let name=config.name.clone();
                         tokio::spawn(async move {
                             let mut transfer=empty_transfer(&transfer_id,&peer_id,"Apple device","outgoing");
-                            let result=async {let address=peer.context("This AirDrop device is no longer nearby")?;transport::send(address,&name,files,&mut transfer,&shared.events,cancel.clone()).await}.await;
+                            let result=async {let address=peer.context("This AirDrop device is no longer nearby")?;transport::send(address,&name,files,&mut transfer,&shared.events,cancel.clone(),shared.bandwidth.clone()).await}.await;
                             match result {Ok(())=>{transfer.state="completed".into();transfer.transferred_bytes=transfer.total_bytes;},Err(error)=>{transfer.state=if cancel.is_cancelled(){"cancelled"}else{"failed"}.into();transfer.error=Some(error.to_string());}}
                             shared.events.send(BackendEvent::TransferUpdated(transfer)).await.ok();shared.jobs.lock().await.remove(&transfer_id);
                         });
@@ -528,6 +538,7 @@ async fn receive_upload(
             if received > archive_limit + archive_limit / 100 + 65536 {
                 bail!("Compressed upload too large");
             }
+            shared.bandwidth.acquire(bytes.len(), &cancel).await?;
             spool.write_all(&bytes).await?;
             if last.elapsed() > Duration::from_millis(200) {
                 shared
@@ -599,8 +610,18 @@ mod tests {
         std::fs::write(source.path().join("photo.bin"), vec![42; 400_123]).unwrap();
         std::fs::write(source.path().join("empty.txt"), []).unwrap();
         std::fs::write(target.path().join("photo.bin"), b"existing").unwrap();
+        let wire_size = archive::encode(
+            &[
+                source.path().join("photo.bin"),
+                source.path().join("empty.txt"),
+            ],
+            None,
+        )
+        .unwrap()
+        .1;
         let (events, mut rx) = mpsc::channel(128);
         let shared = Arc::new(Shared {
+            bandwidth: linuxdrop_network::BandwidthLimiter::new(Some(wire_size)),
             name: "Receiver".into(),
             events: events.clone(),
             store: ReceiveStore::open(target.path()).unwrap(),
@@ -664,16 +685,19 @@ mod tests {
                 &mut transfer,
                 &events,
                 CancellationToken::new(),
+                linuxdrop_network::BandwidthLimiter::new(Some(wire_size)),
             )
             .await
             .unwrap();
         });
         let mut saw_offer = false;
+        let mut payload_started = None;
         tokio::time::timeout(Duration::from_secs(15), async {
             while let Some(event) = rx.recv().await {
                 match event {
                     BackendEvent::Incoming(transfer) => {
                         saw_offer = true;
+                        payload_started = Some(Instant::now());
                         assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 1);
                         shared
                             .pending
@@ -697,6 +721,9 @@ mod tests {
         .await
         .unwrap();
         sender.await.unwrap();
+        // The compressed archive consumes one second at each endpoint. Charging
+        // only uncompressed progress or wiring only one direction would fail.
+        assert!(payload_started.unwrap().elapsed() >= Duration::from_millis(1900));
         let cancel = CancellationToken::new();
         let sender_cancel = cancel.clone();
         let sender_events = shared.events.clone();
@@ -710,7 +737,8 @@ mod tests {
                     second_files,
                     &mut transfer,
                     &sender_events,
-                    sender_cancel
+                    sender_cancel,
+                    linuxdrop_network::BandwidthLimiter::new(None),
                 )
                 .await
                 .is_err()

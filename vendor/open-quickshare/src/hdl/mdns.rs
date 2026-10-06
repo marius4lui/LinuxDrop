@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mdns_sd::{AddrType, ServiceDaemon, ServiceInfo};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::watch;
 use tokio::time::{Instant, interval_at};
@@ -56,8 +56,10 @@ impl MDnsServer {
     ) -> Result<Self, anyhow::Error> {
         let service_info = Self::build_service(endpoint_id, service_port, DeviceType::Laptop)?;
 
+        let daemon = ServiceDaemon::new()?;
+        crate::lan_policy::configure_mdns(&daemon)?;
         Ok(Self {
-            daemon: ServiceDaemon::new()?,
+            daemon,
             service_info,
             ble_receiver,
             visibility_sender,
@@ -138,7 +140,7 @@ impl MDnsServer {
         Ok(())
     }
 
-    fn build_service(
+    pub fn build_service(
         endpoint_id: [u8; 4],
         service_port: u16,
         device_type: DeviceType,
@@ -151,15 +153,20 @@ impl MDnsServer {
         let endpoint_info = gen_mdns_endpoint_info(device_type as u8, &device_name);
 
         let properties = [("n", endpoint_info)];
+        let addresses = crate::lan_policy::interfaces(false)?
+            .into_iter()
+            .filter(|interface| interface.address.is_ipv4())
+            .map(|interface| interface.address.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let si = ServiceInfo::new(
             "_FC9F5ED42C8A._tcp.local.",
             &name,
             &name, // Needs to be ASCII?
-            "",
+            addresses.as_str(),
             service_port,
             &properties[..],
-        )?
-        .enable_addr_auto(AddrType::V4);
+        )?;
 
         Ok(si)
     }

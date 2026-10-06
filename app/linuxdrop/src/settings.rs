@@ -279,7 +279,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "Transfers and history",
             "Limits apply to new requests",
             &[
-                field("bandwidth_limit_mbps", "Bandwidth limit (Mbit/s)", "Zero allows unlimited transfer speed", Kind::Number(0.0,100000.0,1.0)),
+                field("bandwidth_limit_mbps", "Bandwidth limit (Mbit/s)", "Shared by all transfers; zero means unlimited", Kind::Number(0.0,100000.0,1.0)),
                 field("history_days", "Keep history for days", "Zero keeps records until the count limit or manual deletion", Kind::Number(0.0,3650.0,1.0)),
                 Field {
                     key: "max_parallel",
@@ -296,9 +296,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             ],
         ),
         ("bluetooth", "Bluetooth", "Controller and nearby advertising", &[
-            field("adapter", "Bluetooth controller", "BlueZ controller path; leave empty for automatic selection", Kind::Text),
+            field("adapter", "Bluetooth controller", "BlueZ controller name, for example hci0; empty selects automatically", Kind::Text),
         ]),
-        ("network", "Advanced network", "Restrict discovery to the networks you choose", &[
+        ("network", "Advanced network", "Choose LAN interfaces for LocalSend and Quick Share; AirDrop uses its dedicated adapter", &[
             field("allowed_interfaces", "Allowed interfaces", "Comma-separated interface names; empty chooses suitable local interfaces automatically", Kind::Interfaces),
             field("allow_virtual_interfaces", "Allow virtual and VPN interfaces", "Only enable this when you intend to announce to those networks", Kind::Toggle),
         ]),

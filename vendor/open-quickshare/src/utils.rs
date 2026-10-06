@@ -5,7 +5,7 @@ use anyhow::anyhow;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
-use get_if_addrs::{IfAddr, get_if_addrs};
+use get_if_addrs::get_if_addrs;
 use hkdf::Hkdf;
 use num_bigint::{BigUint, ToBigInt};
 use p256::elliptic_curve::rand_core::OsRng;
@@ -211,10 +211,10 @@ pub fn get_download_dir() -> PathBuf {
 /// First non-loopback IPv4 address of this host (used to advertise our Wi-Fi-LAN
 /// endpoint in a bandwidth-upgrade). Prefers private LAN ranges when several exist.
 pub fn local_ipv4() -> Option<[u8; 4]> {
-    let addrs = get_if_addrs().ok()?;
+    let addrs = crate::lan_policy::interfaces(false).ok()?;
     let mut fallback: Option<[u8; 4]> = None;
     for ia in addrs {
-        if let std::net::IpAddr::V4(v4) = ia.ip() {
+        if let std::net::IpAddr::V4(v4) = ia.address {
             if v4.is_loopback() || v4.is_link_local() {
                 continue;
             }
@@ -231,23 +231,12 @@ pub fn local_ipv4() -> Option<[u8; 4]> {
 /// interfaces — i.e. whether a peer at that address is reachable over the
 /// local network (used to pick the bandwidth-upgrade path).
 pub fn same_subnet(remote: [u8; 4]) -> bool {
-    let Ok(addrs) = get_if_addrs() else {
+    let Ok(addrs) = crate::lan_policy::interfaces(false) else {
         return false;
     };
-    let r = u32::from(Ipv4Addr::from(remote));
-    for ia in addrs {
-        if let IfAddr::V4(v4) = &ia.addr {
-            if v4.ip.is_loopback() || v4.ip.is_link_local() {
-                continue;
-            }
-            let ip = u32::from(v4.ip);
-            let mask = u32::from(v4.netmask);
-            if mask != 0 && (ip & mask) == (r & mask) {
-                return true;
-            }
-        }
-    }
-    false
+    addrs.iter().any(|interface| {
+        !interface.address.is_loopback() && interface.contains(Ipv4Addr::from(remote).into())
+    })
 }
 
 pub fn is_not_self_ip(ip_address: &Ipv4Addr) -> bool {

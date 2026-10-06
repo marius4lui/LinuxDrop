@@ -42,6 +42,7 @@ struct Data {
     stop_when_idle: bool,
 }
 struct Shared {
+    bandwidth: Mutex<linuxdrop_network::BandwidthLimiter>,
     data: Mutex<Data>,
     connection: std::sync::OnceLock<zbus::Connection>,
     config_path: PathBuf,
@@ -483,6 +484,13 @@ impl Manager {
     }
     async fn create_download_offer(&self, draft_id: String) -> zbus::fdo::Result<String> {
         let mut d = self.0.data.lock().await;
+        let local = linuxdrop_network::interfaces(&transfer_policy(&d.settings), false)
+            .map_err(failed)?
+            .into_iter()
+            .find(|interface| interface.address.is_ipv4())
+            .ok_or_else(|| {
+                failed("No enabled IPv4 LAN interface for a download link; check network settings")
+            })?;
         let draft = d
             .drafts
             .remove(&draft_id)
@@ -492,7 +500,7 @@ impl Manager {
                 .as_str()
                 .unwrap()
                 .into(),
-            bind: "0.0.0.0:53318".parse().unwrap(),
+            bind: std::net::SocketAddr::new(local.address, 53318),
             expires_after: Duration::from_secs(600),
             max_files: d.settings["receive"]["max_files"].as_u64().unwrap() as usize,
             max_bytes: d.settings["receive"]["max_bytes"].as_u64().unwrap(),
@@ -501,11 +509,12 @@ impl Manager {
         let mut current = self.0.download_offer.lock().await;
         current.take();
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let offer = linuxdrop_localsend::reverse::start_offer(config, draft.paths)
-            .await
-            .map_err(failed)?;
-        let ip = local_address().await.unwrap_or_else(|| "127.0.0.1".into());
-        let result=json!({"url":format!("http://{}:{}",ip,offer.address.port()),"pin":offer.pin,"expires_in":600,"encrypted":false}).to_string();
+        let budget = self.0.bandwidth.lock().await.clone();
+        let offer =
+            linuxdrop_localsend::reverse::start_offer_with_budget(config, draft.paths, budget)
+                .await
+                .map_err(failed)?;
+        let result=json!({"url":format!("http://{}",offer.address),"pin":offer.pin,"expires_in":600,"encrypted":false}).to_string();
         *current = Some(offer);
         Ok(result)
     }
@@ -819,18 +828,6 @@ async fn apply_autostart(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-async fn local_address() -> Option<String> {
-    // Route lookup via UDP connect does not send a datagram.
-    let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
-    socket.connect("192.0.2.1:9").await.ok()?;
-    let address = socket.local_addr().ok()?.ip();
-    if address.is_unspecified() {
-        None
-    } else {
-        Some(address.to_string())
-    }
-}
-
 async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendEvent)>) {
     let generation = shared
         .backend_generation
@@ -866,6 +863,11 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     tokio::time::sleep(Duration::from_millis(500)).await;
     shared.helper.lock().await.take();
     shared.quickshare_helper.lock().await.take();
+    shared.download_offer.lock().await.take();
+    let bandwidth = linuxdrop_network::BandwidthLimiter::new(
+        transfer_policy(&settings).bandwidth_bytes_per_second,
+    );
+    *shared.bandwidth.lock().await = bandwidth.clone();
     let name = settings["general"]["device_name"]
         .as_str()
         .unwrap()
@@ -873,7 +875,7 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     let directory = PathBuf::from(settings["receive"]["directory"].as_str().unwrap());
     let visible = settings["visibility"]["mode"] == "everyone";
     if settings["localsend"]["enabled"] == true {
-        let result = linuxdrop_localsend::start(
+        let result = linuxdrop_localsend::start_with_budget(
             linuxdrop_localsend::Config {
                 name: name.clone(),
                 download_dir: directory.clone(),
@@ -893,6 +895,7 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
                 }),
             },
             events.clone(),
+            bandwidth.clone(),
         )
         .await;
         install_backend(shared, "localsend", result).await;
@@ -920,7 +923,7 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
         } else {
             None
         };
-        let result = linuxdrop_quickshare::start(
+        let result = linuxdrop_quickshare::start_with_budget(
             linuxdrop_quickshare::Config {
                 name: name.clone(),
                 download_dir: directory.clone(),
@@ -939,6 +942,7 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
                 policy: transfer_policy(&settings),
             },
             events.clone(),
+            bandwidth.clone(),
         )
         .await;
         install_backend(shared, "quickshare", result).await;
@@ -1039,7 +1043,8 @@ async fn start_airdrop(
         linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
         _ => anyhow::bail!("Unexpected helper response"),
     };
-    let tx = linuxdrop_airdrop::start(
+    let bandwidth = shared.bandwidth.lock().await.clone();
+    let tx = linuxdrop_airdrop::start_with_budget(
         linuxdrop_airdrop::Config {
             name,
             download_dir: directory,
@@ -1051,6 +1056,7 @@ async fn start_airdrop(
             policy: transfer_policy(settings),
         },
         events,
+        bandwidth,
     )
     .await?;
     *shared.helper.lock().await = Some(client);
@@ -1184,7 +1190,11 @@ async fn main() -> Result<()> {
         .filter(|prefs| prefs.len() <= 1000)
         .unwrap_or_default();
     let (restart, mut restarts) = mpsc::channel(4);
+    let bandwidth = linuxdrop_network::BandwidthLimiter::new(
+        transfer_policy(&settings).bandwidth_bytes_per_second,
+    );
     let shared = Arc::new(Shared {
+        bandwidth: Mutex::new(bandwidth),
         data: Mutex::new(Data {
             epoch: Uuid::new_v4().to_string(),
             revision: 0,

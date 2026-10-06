@@ -154,9 +154,20 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         assert snapshot()["transfers"] == []
         assert json.loads(history.read_text()) == []
         assert (root / "received/integration.txt").read_bytes() == payload
+        # An explicit download link must obey the same network allowlist as
+        # discovery; refusing it must preserve the user's prepared file draft.
+        call("UpdateSettings", "(s)", (json.dumps({"network": {"allowed_interfaces": ["not-present0"]}}),))
+        draft = call("PrepareSend", "(as)", ([str(root / "received/integration.txt")],))
+        for _ in range(2):
+            try:
+                call("CreateDownloadOffer", "(s)", (draft,))
+                raise AssertionError("Download offer escaped the network allowlist")
+            except GLib.Error as error:
+                assert "No enabled IPv4 LAN interface" in str(error), str(error)
+        call("DiscardDraft", "(s)", (draft,))
         call("StopWhenIdle")
         assert daemon.wait(timeout=5) == 0
-        print("PASS actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, idle shutdown")
+        print("PASS actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, idle shutdown")
     finally:
         daemon.terminate()
         try:

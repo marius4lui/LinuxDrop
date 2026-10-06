@@ -168,6 +168,13 @@ type SharedState = Arc<Shared>;
 pub async fn start(config: Config, events: EventSender) -> Result<CommandSender> {
     start_bound(config, events, Ipv4Addr::UNSPECIFIED).await
 }
+pub async fn start_with_budget(
+    config: Config,
+    events: EventSender,
+    budget: linuxdrop_network::BandwidthLimiter,
+) -> Result<CommandSender> {
+    start_bound_with_budget(config, events, Ipv4Addr::UNSPECIFIED, budget).await
+}
 
 /// Explicit listener address for local protocol tools and isolated demos.
 /// Multicast remains governed separately by `Config::multicast`.
@@ -175,6 +182,15 @@ pub async fn start_bound(
     config: Config,
     events: EventSender,
     bind: Ipv4Addr,
+) -> Result<CommandSender> {
+    let budget = linuxdrop_network::BandwidthLimiter::new(config.policy.bandwidth_bytes_per_second);
+    start_bound_with_budget(config, events, bind, budget).await
+}
+async fn start_bound_with_budget(
+    config: Config,
+    events: EventSender,
+    bind: Ipv4Addr,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
 ) -> Result<CommandSender> {
     if config
         .receive_pin
@@ -198,9 +214,7 @@ pub async fn start_bound(
     };
     let shared = Arc::new(Shared {
         interfaces: linuxdrop_network::interfaces(&config.policy, true)?,
-        bandwidth: linuxdrop_network::BandwidthLimiter::new(
-            config.policy.bandwidth_bytes_per_second,
-        ),
+        bandwidth,
         prepare_gate: rate::RequestGate::new(20, Duration::from_secs(60)),
         registration_gate: rate::RequestGate::new(120, Duration::from_secs(60)),
         pin_gate: rate::RequestGate::new(6, Duration::from_secs(60)),

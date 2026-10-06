@@ -1,4 +1,4 @@
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +31,7 @@ pub struct SendInfo {
 
 pub struct TcpServer {
     endpoint_id: [u8; 4],
-    tcp_listener: TcpListener,
+    tcp_listeners: Vec<TcpListener>,
     sender: Sender<ChannelMessage>,
     connect_receiver: Receiver<SendInfo>,
 }
@@ -39,13 +39,13 @@ pub struct TcpServer {
 impl TcpServer {
     pub fn new(
         endpoint_id: [u8; 4],
-        tcp_listener: TcpListener,
+        tcp_listeners: Vec<TcpListener>,
         sender: Sender<ChannelMessage>,
         connect_receiver: Receiver<SendInfo>,
     ) -> Result<Self, anyhow::Error> {
         Ok(Self {
             endpoint_id,
-            tcp_listener,
+            tcp_listeners,
             sender,
             connect_receiver,
         })
@@ -85,9 +85,10 @@ impl TcpServer {
                     }
                     });
                 }
-                r = self.tcp_listener.accept() => {
+                r = crate::lan_policy::accept(&self.tcp_listeners) => {
                     match r {
                         Ok((socket, remote_addr)) => {
+                            if !socket.local_addr().is_ok_and(|local| crate::lan_policy::permits(local.ip(), remote_addr.ip())) { continue; }
                             trace!("{INNER_NAME}: new client: {remote_addr}");
                             let esender = self.sender.clone();
                             let csender = self.sender.clone();
@@ -167,7 +168,7 @@ impl TransferConnector {
         // the OS's full connect timeout (~40s) with the UI stuck on it.
         let socket = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            TcpStream::connect(si.addr.clone()),
+            crate::lan_policy::connect(si.addr.parse()?),
         )
         .await
         .map_err(|_| {
@@ -214,8 +215,7 @@ impl TransferConnector {
         use std::time::Duration;
 
         debug!("{INNER_NAME}: BLE send to {:?}", si.name);
-        let session = bluer::Session::new().await?;
-        let adapter = session.default_adapter().await?;
+        let adapter = crate::bluetooth_adapter().await?;
         if !adapter.is_powered().await? {
             anyhow::bail!("Bluetooth is switched off");
         }

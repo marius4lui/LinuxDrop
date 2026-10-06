@@ -139,6 +139,7 @@ pub struct OutboundRequest<S = TcpStream> {
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
     payload: OutboundPayload,
     /// Mediums advertised to the peer in the ConnectionRequest. Defaults to
     /// Wi-Fi-LAN (the mDNS/TCP send path); a BLE send sets `[Ble, WifiLan]` so
@@ -204,6 +205,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
             },
             sender,
             receiver,
+            bandwidth: crate::payload_budget::current(),
             payload,
             mediums: vec![Medium::WifiLan.into()],
             pending_bwu: None,
@@ -1299,7 +1301,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         info!("BWU(send): phone offered WIFI_LAN at {ip}:{port}; connecting");
         let tcp = match tokio::time::timeout(
             Duration::from_secs(8),
-            tokio::net::TcpStream::connect((ip, port)),
+            crate::lan_policy::connect(std::net::SocketAddr::new(ip.into(), port)),
         )
         .await
         {
@@ -1858,6 +1860,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                             )
                         };
 
+                        if !crate::payload_budget::acquire(
+                            &self.bandwidth,
+                            bytes_read,
+                            &mut self.receiver,
+                            &self.state.id,
+                        )
+                        .await?
+                        {
+                            self.update_state(|state| state.state = TransferState::Cancelled, true)
+                                .await;
+                            self.disconnection().await?;
+                            return Err(anyhow!(crate::errors::AppError::NotAnError));
+                        }
                         let sending_buffer = buffer[..bytes_read].to_vec();
                         info!(
                             "> File ready: {bytes_read} bytes && {} && left to send: {} with current offset: {}",

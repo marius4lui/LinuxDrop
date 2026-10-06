@@ -12,7 +12,6 @@ use hdl::MDnsDiscovery;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use rand::distr::Alphanumeric;
-use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -25,7 +24,9 @@ use crate::manager::TcpServer;
 pub mod channel;
 pub mod errors;
 pub mod hdl;
+pub mod lan_policy;
 pub mod manager;
+pub mod payload_budget;
 pub mod utils;
 
 static BLUETOOTH_ADAPTER: RwLock<Option<String>> = RwLock::new(None);
@@ -175,9 +176,9 @@ impl RQS {
             .take(4)
             .map(u8::from)
             .collect();
-        let tcp_listener =
-            TcpListener::bind(format!("0.0.0.0:{}", self.port_number.unwrap_or(0))).await?;
-        let binded_addr = tcp_listener.local_addr()?;
+        let tcp_listeners =
+            lan_policy::listeners(u16::try_from(self.port_number.unwrap_or(0))?).await?;
+        let binded_addr = tcp_listeners[0].local_addr()?;
         info!("TcpListener on: {}", binded_addr);
 
         // So the random port can be accessed from the user if needed.
@@ -190,7 +191,7 @@ impl RQS {
         // Start TcpServer in own "task"
         let mut server = TcpServer::new(
             endpoint_id[..4].try_into()?,
-            tcp_listener,
+            tcp_listeners,
             self.message_sender.clone(),
             send_channel.1,
         )?;

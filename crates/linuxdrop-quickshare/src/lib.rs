@@ -37,6 +37,14 @@ pub async fn start(
     config: Config,
     events: mpsc::Sender<BackendEvent>,
 ) -> Result<mpsc::Sender<BackendCommand>> {
+    let budget = linuxdrop_network::BandwidthLimiter::new(config.policy.bandwidth_bytes_per_second);
+    start_with_budget(config, events, budget).await
+}
+pub async fn start_with_budget(
+    config: Config,
+    events: mpsc::Sender<BackendEvent>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
+) -> Result<mpsc::Sender<BackendCommand>> {
     std::fs::create_dir_all(&config.download_dir)?;
     let staging = tempfile::Builder::new()
         .prefix(".linuxdrop-quickshare-")
@@ -72,14 +80,25 @@ pub async fn start(
             .filter(|name| !name.is_empty())
             .cloned(),
     );
+    rqs_lib::lan_policy::set(config.policy.clone());
+    let lan_ready = rqs_lib::lan_policy::interfaces(false)?
+        .iter()
+        .any(|interface| interface.address.is_ipv4());
+    let available = lan_ready || engine.ble_enabled;
+    let lan_status = if lan_ready {
+        "Quick Share LAN active"
+    } else {
+        "Quick Share has no enabled IPv4 LAN interface; check network settings"
+    };
     let readiness = match &bluetooth {
-        Ok(name) if config.ble => format!("Quick Share LAN active; Bluetooth discovery on {name}."),
-        Ok(_) => "Quick Share LAN active; Bluetooth discovery disabled in settings.".to_owned(),
+        Ok(name) if config.ble => format!("{lan_status}; Bluetooth discovery on {name}."),
+        Ok(_) => format!("{lan_status}; Bluetooth discovery disabled in settings."),
         Err(error) => format!(
-            "Quick Share LAN active. Bluetooth unavailable: {error}. Enable a BlueZ controller and restart LinuxDrop to use Bluetooth discovery."
+            "{lan_status}. Bluetooth unavailable: {error}. Enable a BlueZ controller and restart LinuxDrop to use Bluetooth discovery."
         ),
     };
     rqs_lib::set_receive_limits(config.max_receive_bytes, config.max_files);
+    rqs_lib::payload_budget::set_budget(bandwidth);
     rqs_lib::hdl::set_upgrade_lease(config.upgrade_lease.map(|lease| {
         linuxdrop_network::nm::Lease {
             interface: lease.interface,
@@ -105,7 +124,7 @@ pub async fn start(
     events
         .send(BackendEvent::StateChanged(BackendState {
             id: "quickshare".into(),
-            state: "ready".into(),
+            state: if available { "ready" } else { "unavailable" }.into(),
             detail: readiness,
         }))
         .await
@@ -174,7 +193,8 @@ pub async fn start(
                 message = messages.recv() => match message {
                     Ok(ChannelMessage {msg:Message::Backend {component,detail},..}) => {
                         let bluetooth=component.starts_with("bluetooth-");
-                        events.send(BackendEvent::StateChanged(BackendState{id:"quickshare".into(),state:if bluetooth {"ready"} else {"error"}.into(),detail:if bluetooth {format!("Quick Share LAN active; {component} unavailable: {detail}. Check BlueZ and restart the backend from Settings.")} else {format!("Quick Share {component} stopped: {detail}. Restart the backend from Settings.")}})).await.ok();
+                        let lan_active=rqs_lib::lan_policy::interfaces(false).is_ok_and(|interfaces|interfaces.iter().any(|interface|interface.address.is_ipv4()));
+                        events.send(BackendEvent::StateChanged(BackendState{id:"quickshare".into(),state:if bluetooth && lan_active {"ready"} else {"error"}.into(),detail:if bluetooth {format!("{}; {component} unavailable: {detail}. Check BlueZ and restart the backend from Settings.",if lan_active {"Quick Share LAN active"} else {"Quick Share has no enabled LAN interface"})} else {format!("Quick Share {component} stopped: {detail}. Restart the backend from Settings.")}})).await.ok();
                         if !bluetooth {break;}
                     }
                     Ok(ChannelMessage {id, msg:Message::Client(message)}) => {
@@ -401,6 +421,9 @@ mod tests {
         let receive = dir.path().join("received");
         std::fs::create_dir(&receive).unwrap();
         let bytes: Vec<u8> = (0..700_123).map(|n| (n % 251) as u8).collect();
+        // Both endpoints share one engine budget in this loopback test. Each
+        // direction must debit its 700123-byte payload (two seconds together).
+        rqs_lib::payload_budget::set(Some(bytes.len() as u64));
         std::fs::write(&source, &bytes).unwrap();
         let empty = dir.path().join("empty");
         std::fs::write(&empty, []).unwrap();
@@ -484,6 +507,7 @@ mod tests {
         let mut codes = HashMap::new();
         let mut destination = None;
         let mut completed = 0;
+        let mut payload_started = None;
         tokio::time::timeout(Duration::from_secs(20), async {
             while completed < 2 {
                 let message = events.recv().await.unwrap();
@@ -493,6 +517,9 @@ mod tests {
                 if event.state == Some(TransferState::WaitingForUserConsent) {
                     let metadata = event.metadata.unwrap();
                     codes.insert(message.id.clone(), metadata.pin_code.unwrap());
+                    if codes.len() == 2 {
+                        payload_started = Some(std::time::Instant::now());
+                    }
                     if event.kind == TransferKind::Inbound {
                         destination = metadata.destination;
                         assert_eq!(
@@ -519,6 +546,8 @@ mod tests {
         .unwrap();
         incoming.await.unwrap();
         outgoing.await.unwrap();
+        assert!(payload_started.unwrap().elapsed() >= Duration::from_millis(1950));
+        rqs_lib::payload_budget::set(None);
         assert_eq!(codes.len(), 2);
         assert_eq!(codes["incoming-test"], codes["outgoing-test"]);
         let destination = destination.unwrap();
@@ -531,6 +560,54 @@ mod tests {
         assert_eq!(
             std::fs::read(Path::new(&destination).join("source")).unwrap(),
             bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_budget_wait_cancels_only_the_requested_transfer() {
+        let budget = linuxdrop_network::BandwidthLimiter::new(Some(1));
+        let (control, mut receiver) = broadcast::channel(16);
+        let waiting_budget = budget.clone();
+        let mut waiting = tokio::spawn(async move {
+            rqs_lib::payload_budget::acquire(&waiting_budget, 1024, &mut receiver, "slow").await
+        });
+        control
+            .send(ChannelMessage {
+                id: "other".into(),
+                msg: Message::Lib {
+                    action: TransferAction::TransferCancel,
+                },
+            })
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        control
+            .send(ChannelMessage {
+                id: "slow".into(),
+                msg: Message::Lib {
+                    action: TransferAction::TransferCancel,
+                },
+            })
+            .unwrap();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        );
+        let mut next = control.subscribe();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                rqs_lib::payload_budget::acquire(&budget, 0, &mut next, "next")
+            )
+            .await
+            .unwrap()
+            .unwrap()
         );
     }
 }

@@ -15,7 +15,7 @@ pub trait P2pConnector: Send + Sync {
     fn disconnect(&self) -> futures_util::future::BoxFuture<'_, Result<()>>;
 }
 use anyhow::{bail, Result};
-use linuxdrop_core::TransferPolicy;
+pub use linuxdrop_core::TransferPolicy;
 use std::{
     ffi::CStr,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -192,8 +192,8 @@ pub fn interfaces(
     Ok(result)
 }
 
-/// One backend shares one limiter across all sessions, bounding aggregate bytes.
-#[derive(Clone)]
+/// Clones share one aggregate payload budget across sessions and backends.
+#[derive(Clone, Debug)]
 pub struct BandwidthLimiter {
     bytes_per_second: Option<u64>,
     next: Arc<tokio::sync::Mutex<Instant>>,
@@ -206,6 +206,12 @@ impl BandwidthLimiter {
         }
     }
     pub async fn acquire(&self, bytes: usize, cancel: &CancellationToken) -> Result<()> {
+        if cancel.is_cancelled() {
+            bail!("Transfer cancelled");
+        }
+        if bytes == 0 {
+            return Ok(());
+        }
         let Some(rate) = self.bytes_per_second else {
             return Ok(());
         };

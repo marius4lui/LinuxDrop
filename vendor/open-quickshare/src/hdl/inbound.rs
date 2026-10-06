@@ -156,6 +156,7 @@ pub struct InboundRequest<S = TcpStream> {
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
     /// Set (BLE sessions) to enable offering a Wi-Fi bandwidth upgrade once the
     /// encrypted connection is established.
     bwu_tcp_port: Option<u16>,
@@ -221,6 +222,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             },
             sender,
             receiver,
+            bandwidth: crate::payload_budget::current(),
             bwu_tcp_port: None,
             bwu_pending: false,
             bwu_attempts: 0,
@@ -1131,6 +1133,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
                             ));
                         }
 
+                        if !crate::payload_budget::acquire(
+                            &self.bandwidth,
+                            chunk_size,
+                            &mut self.receiver,
+                            &self.state.id,
+                        )
+                        .await?
+                        {
+                            self.update_state(|state| state.state = TransferState::Cancelled, true)
+                                .await;
+                            self.disconnection().await?;
+                            return Err(anyhow!(crate::errors::AppError::NotAnError));
+                        }
                         if !chunk.body().is_empty() {
                             file_internal
                                 .file
@@ -2095,7 +2110,9 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             return self.do_bwu_hotspot().await;
         }
 
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+        let local = crate::utils::local_ipv4()
+            .ok_or_else(|| anyhow!("No enabled LAN interface for bandwidth upgrade"))?;
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::from(local), 0)).await?;
         let port = listener.local_addr()?.port();
 
         // Offer WIFI_LAN over the encrypted BLE channel.
@@ -2111,6 +2128,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((s, peer)) => {
+                        if !s.local_addr().is_ok_and(|local| crate::lan_policy::permits(local.ip(), peer.ip())) { continue; }
                         info!("BWU: phone connected over TCP from {peer}");
                         break s;
                     }

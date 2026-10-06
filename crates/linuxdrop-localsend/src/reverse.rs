@@ -67,6 +67,7 @@ struct DownloadSession {
     ip: IpAddr,
 }
 struct OfferState {
+    bandwidth: linuxdrop_network::BandwidthLimiter,
     alias: String,
     fingerprint: String,
     pin: String,
@@ -126,6 +127,18 @@ impl OfferState {
 /// Sources are opened before publishing. FDs prevent subsequent path/symlink
 /// substitution; independent read_at offsets allow concurrent downloads safely.
 pub async fn start_offer(config: OfferConfig, paths: Vec<PathBuf>) -> Result<ReverseOffer> {
+    start_offer_with_budget(
+        config,
+        paths,
+        linuxdrop_network::BandwidthLimiter::new(None),
+    )
+    .await
+}
+pub async fn start_offer_with_budget(
+    config: OfferConfig,
+    paths: Vec<PathBuf>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
+) -> Result<ReverseOffer> {
     if paths.is_empty() || paths.len() > config.max_files || paths.len() > 256 {
         bail!("Invalid download offer file count");
     }
@@ -194,6 +207,7 @@ pub async fn start_offer(config: OfferConfig, paths: Vec<PathBuf>) -> Result<Rev
     );
     let stop = CancellationToken::new();
     let state = Arc::new(OfferState {
+        bandwidth,
         alias: config.alias,
         fingerprint: Uuid::new_v4().to_string(),
         pin: pin.clone(),
@@ -326,8 +340,8 @@ async fn download(
     let size = source.metadata.size;
     let stop = state.stop.clone();
     let stream = futures_util::stream::try_unfold(
-        (file, 0u64, stop, permit),
-        move |(file, offset, stop, permit)| async move {
+        (file, 0u64, stop, permit, state.bandwidth.clone()),
+        move |(file, offset, stop, permit, bandwidth)| async move {
             if stop.is_cancelled() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
@@ -361,8 +375,12 @@ async fn download(
             })
             .await
             .map_err(std::io::Error::other)??;
+            bandwidth
+                .acquire(bytes.len(), &stop)
+                .await
+                .map_err(std::io::Error::other)?;
             let next = offset + bytes.len() as u64;
-            Ok(Some((bytes, (file, next, stop, permit))))
+            Ok(Some((bytes, (file, next, stop, permit, bandwidth))))
         },
     );
     let encoded = source
@@ -435,7 +453,7 @@ mod tests {
         let path = dir.path().join("Grüße file.txt");
         let bytes = vec![42u8; 150_000];
         std::fs::write(&path, &bytes).unwrap();
-        let offer = start_offer(
+        let offer = start_offer_with_budget(
             OfferConfig {
                 alias: "Test".into(),
                 bind: "127.0.0.1:0".parse().unwrap(),
@@ -444,6 +462,7 @@ mod tests {
                 max_bytes: 1_000_000,
             },
             vec![path],
+            linuxdrop_network::BandwidthLimiter::new(Some(bytes.len() as u64)),
         )
         .await
         .unwrap();
@@ -470,10 +489,15 @@ mod tests {
         let session = data["sessionId"].as_str().unwrap();
         let file = data["files"].as_object().unwrap().keys().next().unwrap();
         let url = format!("{base}/api/localsend/v2/download?sessionId={session}&fileId={file}");
+        let started = Instant::now();
         let (first, second) = tokio::join!(client.get(&url).send(), client.get(&url).send());
         let (first, second) = tokio::join!(first.unwrap().bytes(), second.unwrap().bytes());
         assert_eq!(first.unwrap().as_ref(), bytes);
         assert_eq!(second.unwrap().as_ref(), bytes);
+        assert!(
+            started.elapsed() >= Duration::from_millis(1950),
+            "Concurrent downloads must share their supplied payload budget"
+        );
         assert_eq!(
             client
                 .get(format!(

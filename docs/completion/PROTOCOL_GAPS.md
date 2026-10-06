@@ -24,10 +24,11 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] BlueZ BLE advertisements, GATT/L2CAP discovery/session transport and negotiated bandwidth upgrades.
 - [x] SSID/password-based peer group joining and sender-hosted network credentials; dedicated disconnected interface required.
 - [x] Missing BlueZ preserves LAN functionality; task failures and cancellation produce terminal states; mdns lifecycle cleanup.
-- [ ] Stable configurable LAN listener port and interface-filtered advertisement/discovery/listening.
+- [x] Stable configurable IPv4 LAN listener port and interface-filtered advertisement/discovery/listening; exact local-address binds and source-bound outgoing connections.
+- [ ] Live LAN address/interface changes must reconcile listeners and mDNS records without requiring a manual backend restart; IPv6 LAN/address candidates remain separate work.
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
-- [ ] Bandwidth limits.
+- [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
 - [ ] WPS PIN/device-name Wi-Fi Direct authentication path, P2P group discovery and negotiated group connection.
 - [x] Exclusive hardware lease and transfer semaphore for radio-changing upgrades, unique owned NetworkManager profiles and cancellation cleanup; isolated D-Bus lifecycle test passed.
 - [ ] Protocol metadata and upgrade failure regression tests beyond existing TCP handshake simulator.
@@ -42,7 +43,7 @@ Google's wire schema distinguishes password-based joining from device-name disco
 - [x] BLE wake, graceful degradation without Bluetooth, cancellation including disconnect during consent.
 - [ ] Explicit Bluetooth controller and shared advertisement resource coordination.
 - [x] ReceiveOptions destination/selection/collision policy.
-- [ ] Bandwidth limit.
+- [x] Incoming/outgoing archive bandwidth uses the daemon's shared payload budget; outgoing sockets remain bound to the leased AWDL interface.
 - [ ] Reconnect/channel/hardware-loss integration exercised with helper simulations; no false ready state after lease failure.
 
 ## Physical acceptance (software work continues independently)
@@ -88,3 +89,39 @@ default workspace run deliberately skips that environment-dependent test.
 These checks do not emulate driver group formation or prove Android/Windows P2P
 interoperability. New release artifacts have not yet been rebuilt. Remaining
 software items above stay in the active full implementation goal.
+
+## Transfer policy integration, 2026-10-06
+
+The daemon now provides one payload budget to LocalSend, Quick Share, AirDrop and
+reverse-download offers. Both directions and concurrent requests debit that same
+budget; handshake/control traffic is excluded. Backend restart revokes the old
+download offer before installing the changed network/bandwidth policy. Standalone
+backend APIs retain independently scoped budgets for protocol tools and tests.
+
+Quick Share's TCP listeners bind only selected local IPv4 addresses. Discovery
+probes, initial TCP sends and LAN upgrades select and bind an allowed source
+interface and reject peers outside its local subnet. mDNS interface selection is
+paired with explicit service addresses: the pinned mDNS library's `addr_auto`
+registration path imports all host addresses independently of interface selection,
+so it is deliberately disabled. The selected BlueZ controller now also reaches
+the outbound BLE connector. Missing LAN access no longer reports LAN as active.
+
+AirDrop's outbound IPv6 sockets use the interface index supplied by the leased
+AWDL discovery context, bind its source address/device and reject unscoped remote
+addresses. Network settings describe LAN selection separately from this dedicated
+AirDrop adapter. Download-link listeners bind an enabled LAN address; when none
+exists, the request fails before consuming the user's file draft.
+
+Verification: the workspace run passed 37 tests (native-display and private-NM-bus
+tests remain explicit runners). Real TLS/UKEY2 payload tests now exercise actual
+throttling in both directions; parallel reverse downloads share their supplied
+budget. Targeted tests cover matching versus unrelated cancellation, forbidden
+LAN routes, exact listener and mDNS address sets, and unscoped AirDrop addresses.
+The LAN socket test also passed as the unprivileged Ubuntu user. The daemon's
+D-Bus/HTTPS integration passed including repeated refusal of a download link on
+an excluded network while retaining the prepared draft.
+
+Still open: LocalSend multicast interface scoping and HTTP-first discovery replies,
+live network reconfiguration, reverse-download client, protocol metadata/IPv6/P2P
+completion, and the remaining desktop/distribution acceptance. These are software
+tasks in the full goal, not physical-device exceptions.
