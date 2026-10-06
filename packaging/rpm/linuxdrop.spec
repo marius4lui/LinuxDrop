@@ -4,23 +4,40 @@ Release:        1%{?dist}
 Summary:        Nearby file sharing for Linux
 License:        GPL-3.0-only
 URL:            https://github.com/marius4lui/LinuxDrop
-Source0:        LinuxDrop-%{version}.tar.gz
+Source0:        linuxdrop_%{version}_source.tar.gz
+%bcond_with prebuilt
+%if %{with prebuilt}
+Source1:        linuxdrop-binaries.tar.gz
+BuildRequires:  glib2 systemd-rpm-macros
+%else
 BuildRequires:  cargo rust gcc pkgconfig(gtk4) pkgconfig(libadwaita-1) pkgconfig(openssl) pkgconfig(dbus-1) pkgconfig(libudev) pkgconfig(libnl-3.0) pkgconfig(libnl-genl-3.0) libpcap-devel libev-devel protobuf-compiler glib2-devel
-Requires:       gtk4 libadwaita openssl-libs systemd dbus polkit iw iproute
+BuildRequires:  systemd-rpm-macros
+%endif
+Requires:       gtk4 libadwaita openssl-libs systemd dbus polkit iw iproute ethtool python3
 %{?systemd_requires}
 
 %description
 Native desktop nearby file sharing. Experimental AirDrop requires a dedicated wireless adapter.
 
 %prep
-%autosetup -n LinuxDrop-%{version}
+%setup -q -c -n LinuxDrop-%{version}
+%if %{with prebuilt}
+mkdir -p target/release
+tar -xf %{SOURCE1} -C target/release
+%endif
 
 %build
+%if !%{with prebuilt}
 cargo build --release --locked --workspace
 cargo build --release --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs
+%endif
 
 %install
+%if %{with prebuilt}
+LINUXDROP_FILIN="$PWD/target/release/filin" DESTDIR=%{buildroot} sh packaging/install.sh
+%else
 DESTDIR=%{buildroot} sh packaging/install.sh
+%endif
 install -Dm644 packaging/linuxdrop.sysusers %{buildroot}%{_sysusersdir}/linuxdrop.conf
 
 %pre
@@ -38,6 +55,7 @@ install -Dm644 packaging/linuxdrop.sysusers %{buildroot}%{_sysusersdir}/linuxdro
 %files
 %{_bindir}/linuxdrop
 %{_bindir}/linuxdropd
+%{_bindir}/linuxdrop-thunar-install
 %{_libexecdir}/linuxdrop/
 /usr/lib/systemd/user/linuxdropd.service
 /usr/lib/systemd/system/linuxdrop-netd.service
@@ -46,6 +64,7 @@ install -Dm644 packaging/linuxdrop.sysusers %{buildroot}%{_sysusersdir}/linuxdro
 %{_datadir}/metainfo/io.github.marius4lui.LinuxDrop.metainfo.xml
 %{_datadir}/dbus-1/services/io.github.marius4lui.LinuxDrop.service
 %{_datadir}/polkit-1/actions/io.github.marius4lui.LinuxDrop.policy
+%{_datadir}/polkit-1/rules.d/50-linuxdrop-netd.rules
 %{_datadir}/nautilus-python/extensions/linuxdrop.py
 %{_datadir}/kio/servicemenus/linuxdrop.desktop
 %{_datadir}/gnome-shell/extensions/linuxdrop@marius4lui.github.io/

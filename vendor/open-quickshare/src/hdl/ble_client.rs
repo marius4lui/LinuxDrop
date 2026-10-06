@@ -315,12 +315,7 @@ const DISCOVERY_PAUSE: Duration = Duration::from_secs(4);
 /// list is cleared when the dialog reopens, so no removal flicker from a scan
 /// window that happens to miss a phone.
 pub async fn ble_discovery(sender: Sender<EndpointInfo>, ctk: CancellationToken) {
-    let adapter = match async {
-        let session = bluer::Session::new().await?;
-        session.default_adapter().await
-    }
-    .await
-    {
+    let adapter = match async { crate::bluetooth_adapter().await }.await {
         Ok(a) => a,
         Err(e) => {
             warn!("{INNER_NAME}: discovery couldn't open the adapter: {e}");

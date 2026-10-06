@@ -13,13 +13,33 @@ struct Field {
 }
 enum Kind {
     Text,
+    Secret,
+    Interfaces,
     Folder,
     Toggle,
     Number(f64, f64, f64),
     Choice(&'static [(&'static str, &'static str)]),
 }
 
+const fn field(key: &'static str, title: &'static str, detail: &'static str, kind: Kind) -> Field {
+    Field {
+        key,
+        title,
+        detail,
+        kind,
+    }
+}
+
 pub fn render(ui: &Rc<Ui>, config: &Value) {
+    let mut focused = gtk::prelude::GtkWindowExt::focus(&ui.window);
+    let mut focus_name = None;
+    while let Some(widget) = focused {
+        if widget.widget_name().starts_with("setting:") {
+            focus_name = Some(widget.widget_name().to_string());
+            break;
+        }
+        focused = widget.parent();
+    }
     clear(&ui.settings_body);
     ui.settings_body.append(&label("Settings", "hero-title"));
     ui.settings_body.append(&label(
@@ -29,13 +49,19 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
     let search = gtk::SearchEntry::builder()
         .placeholder_text(tr("Search settings"))
         .build();
+    search.set_text(&ui.settings_query.borrow());
     ui.settings_body.append(&search);
+    let category = gtk::DropDown::from_strings(&[&tr("All categories")]);
+    category.update_property(&[gtk::accessible::Property::Label(&tr("Settings category"))]);
+    ui.settings_body.append(&category);
     let sections: &[(&str, &str, &str, &[Field])] = &[
         (
             "general",
             "General",
             "Your identity and the way LinuxDrop feels",
             &[
+                field("language", "Language", "Applies when the app next opens", Kind::Choice(&[("system","System"),("de","Deutsch"),("en","English")])),
+                field("close_behavior", "When closing the window", "Background keeps sharing available; quit when idle never interrupts active transfers", Kind::Choice(&[("background","Keep running in background"),("quit_when_idle","Quit when no transfers are active")])),
                 Field {
                     key: "device_name",
                     title: "Device name",
@@ -65,6 +91,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "Receiving",
             "Files are saved only after you accept a request",
             &[
+                field("ask_directory", "Choose a folder for each request", "Review the destination before accepting incoming files", Kind::Toggle),
+                field("collision_policy", "Existing filenames", "Never overwrite an existing file", Kind::Choice(&[("rename","Save with a new name"),("reject","Reject conflicting files")])),
+                field("subfolders", "Organize received files", "Use separate folders for the sender or receiving date", Kind::Choice(&[("none","No subfolders"),("sender","By sender"),("date","By date"),("sender_date","By sender and date")])),
                 Field {
                     key: "directory",
                     title: "Save files to",
@@ -127,6 +156,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "LocalSend",
             "Share with the LocalSend app on any platform",
             &[
+                field("require_pin", "Require a receiving PIN", "LocalSend senders must enter your PIN before transferring", Kind::Toggle),
+                field("pin", "Receiving PIN", "Keep this PIN private; diagnostics never include it", Kind::Secret),
                 Field {
                     key: "enabled",
                     title: "Enable LocalSend",
@@ -158,6 +189,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "Quick Share",
             "Nearby Share is now called Quick Share",
             &[
+                field("port", "Quick Share listening port", "A fixed local TCP port for nearby connections", Kind::Number(1024.0,65535.0,1.0)),
                 Field {
                     key: "enabled",
                     title: "Enable Quick Share",
@@ -177,6 +209,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "AirDrop · Experimental",
             "Availability depends on supported wireless hardware",
             &[
+                field("send", "Allow AirDrop sending", "Send files through the selected AWDL adapter", Kind::Toggle),
+                field("receive", "Allow AirDrop receiving", "Receive only after confirming each request", Kind::Toggle),
                 Field {
                     key: "enabled",
                     title: "Enable experimental AirDrop",
@@ -196,6 +230,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "Hardware",
             "Keep existing connections safe",
             &[
+                field("auto_use_usb", "Use suitable USB adapters automatically", "Select available hardware after passive detection; never run an active injection test automatically", Kind::Toggle),
+                field("open_on_adapter", "Open Hardware when an adapter arrives", "Show new wireless hardware without changing an active transfer", Kind::Toggle),
                 Field {
                     key: "preferred_adapter",
                     title: "Preferred adapter",
@@ -221,6 +257,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "Notifications",
             "Stay informed without unnecessary interruptions",
             &[
+                field("incoming", "Incoming requests", "Show system notifications for requests and verification codes", Kind::Toggle),
+                field("sound", "Notification sounds", "Use your desktop notification sound preference", Kind::Toggle),
+                field("private_content", "Keep notification contents private", "Hide sender names and filenames in system notifications", Kind::Toggle),
                 Field {
                     key: "completed",
                     title: "Completed transfers",
@@ -240,6 +279,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             "Transfers and history",
             "Limits apply to new requests",
             &[
+                field("bandwidth_limit_mbps", "Bandwidth limit (Mbit/s)", "Zero allows unlimited transfer speed", Kind::Number(0.0,100000.0,1.0)),
+                field("history_days", "Keep history for days", "Zero keeps records until the count limit or manual deletion", Kind::Number(0.0,3650.0,1.0)),
                 Field {
                     key: "max_parallel",
                     title: "Simultaneous transfers",
@@ -254,6 +295,16 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                 },
             ],
         ),
+        ("bluetooth", "Bluetooth", "Controller and nearby advertising", &[
+            field("adapter", "Bluetooth controller", "BlueZ controller path; leave empty for automatic selection", Kind::Text),
+        ]),
+        ("network", "Advanced network", "Restrict discovery to the networks you choose", &[
+            field("allowed_interfaces", "Allowed interfaces", "Comma-separated interface names; empty chooses suitable local interfaces automatically", Kind::Interfaces),
+            field("allow_virtual_interfaces", "Allow virtual and VPN interfaces", "Only enable this when you intend to announce to those networks", Kind::Toggle),
+        ]),
+        ("diagnostics", "Advanced diagnostics", "Operational details without file contents or private keys", &[
+            field("log_level", "Logging detail", "Detailed logs can contain operational context; review before sharing", Kind::Choice(&[("warn","Warnings and errors"),("info","Normal"),("debug","Detailed")])),
+        ]),
     ];
     let mut search_groups: Vec<(adw::PreferencesGroup, Vec<(gtk::Widget, String)>)> = Vec::new();
     for (section, title, description, fields) in sections {
@@ -266,6 +317,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             let Some(value) = config.get(section).and_then(|s| s.get(field.key)) else {
                 continue;
             };
+            let draft_key = format!("{section}.{}", field.key);
             if field.key == "protect_active_connection" {
                 let row = adw::ActionRow::builder()
                     .title(tr(field.title))
@@ -326,20 +378,39 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     } else {
                         1.0
                     };
-                    let adjustment = gtk::Adjustment::new(
-                        value.as_f64().unwrap_or(*min) / scale,
-                        *min,
-                        *max,
-                        *step,
-                        *step * 10.0,
-                        0.0,
-                    );
+                    let persisted = value.as_f64().unwrap_or(*min) / scale;
+                    if ui
+                        .settings_drafts
+                        .borrow()
+                        .get(&draft_key)
+                        .and_then(|text| text.parse::<f64>().ok())
+                        == Some(persisted)
+                    {
+                        ui.settings_drafts.borrow_mut().remove(&draft_key);
+                    }
+                    let initial = ui
+                        .settings_drafts
+                        .borrow()
+                        .get(&draft_key)
+                        .and_then(|text| text.parse::<f64>().ok())
+                        .unwrap_or(persisted);
+                    let adjustment =
+                        gtk::Adjustment::new(initial, *min, *max, *step, *step * 10.0, 0.0);
                     let row = adw::SpinRow::builder()
                         .title(tr(field.title))
                         .subtitle(tr(field.detail))
                         .adjustment(&adjustment)
                         .digits(0)
                         .build();
+                    let weak = Rc::downgrade(ui);
+                    let draft_key = draft_key.clone();
+                    row.connect_value_notify(move |row| {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.settings_drafts
+                                .borrow_mut()
+                                .insert(draft_key.clone(), row.value().to_string());
+                        }
+                    });
                     let weak = Rc::downgrade(ui);
                     let section = section.to_string();
                     let key = field.key.to_owned();
@@ -359,13 +430,92 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     row.add_controller(controller);
                     row.upcast()
                 }
-                Kind::Text => {
+                Kind::Text | Kind::Interfaces => {
+                    let interfaces = matches!(field.kind, Kind::Interfaces);
+                    let current = if interfaces {
+                        value
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        value.as_str().unwrap_or("").to_owned()
+                    };
+                    if ui.settings_drafts.borrow().get(&draft_key) == Some(&current) {
+                        ui.settings_drafts.borrow_mut().remove(&draft_key);
+                    }
+                    let initial = ui
+                        .settings_drafts
+                        .borrow()
+                        .get(&draft_key)
+                        .cloned()
+                        .unwrap_or(current);
                     let row = adw::EntryRow::builder()
                         .title(tr(field.title))
-                        .text(value.as_str().unwrap_or(""))
+                        .text(initial)
                         .show_apply_button(true)
                         .build();
                     row.set_tooltip_text(Some(&tr(field.detail)));
+                    let weak = Rc::downgrade(ui);
+                    let draft_key = draft_key.clone();
+                    row.connect_changed(move |row| {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.settings_drafts
+                                .borrow_mut()
+                                .insert(draft_key.clone(), row.text().to_string());
+                        }
+                    });
+                    let weak = Rc::downgrade(ui);
+                    let section = section.to_string();
+                    let key = field.key.to_owned();
+                    row.connect_apply(move |row| {
+                        if let Some(ui) = weak.upgrade() {
+                            let value = if interfaces {
+                                json!(row
+                                    .text()
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|name| !name.is_empty())
+                                    .collect::<Vec<_>>())
+                            } else {
+                                json!(row.text().as_str())
+                            };
+                            update(&ui, &section, &key, value);
+                        }
+                    });
+                    row.upcast()
+                }
+                Kind::Secret => {
+                    let current = value.as_str().unwrap_or("").to_owned();
+                    if ui.settings_drafts.borrow().get(&draft_key) == Some(&current) {
+                        ui.settings_drafts.borrow_mut().remove(&draft_key);
+                    }
+                    let initial = ui
+                        .settings_drafts
+                        .borrow()
+                        .get(&draft_key)
+                        .cloned()
+                        .unwrap_or(current);
+                    let row = adw::PasswordEntryRow::builder()
+                        .title(tr(field.title))
+                        .text(initial)
+                        .show_apply_button(true)
+                        .build();
+                    row.set_tooltip_text(Some(&tr(field.detail)));
+                    let weak = Rc::downgrade(ui);
+                    let draft_key = draft_key.clone();
+                    row.connect_changed(move |row| {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.settings_drafts
+                                .borrow_mut()
+                                .insert(draft_key.clone(), row.text().to_string());
+                        }
+                    });
                     let weak = Rc::downgrade(ui);
                     let section = section.to_string();
                     let key = field.key.to_owned();
@@ -420,6 +570,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     row.upcast()
                 }
             };
+            widget.set_widget_name(&format!("setting:{draft_key}"));
             group.add(&widget);
             rows.push((
                 widget,
@@ -433,13 +584,20 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     .subtitle(tr("Received files remain in their folder"))
                     .build();
                 let button = gtk::Button::from_icon_name("user-trash-symbolic");
+                button.set_tooltip_text(Some(&tr("Clear transfer history")));
                 button.set_valign(gtk::Align::Center);
                 row.add_suffix(&button);
                 row.set_activatable_widget(Some(&button));
                 let weak = Rc::downgrade(ui);
                 button.connect_clicked(move |_| {
                     if let Some(ui) = weak.upgrade() {
-                        ui.mutate("ClearHistory", ().to_variant());
+                        let dialog = adw::AlertDialog::builder().heading(tr("Clear transfer history?")).body(tr("This removes completed transfer records. Active transfers and received files are kept.")).build();
+                        dialog.add_responses(&[("cancel", &tr("Cancel")), ("clear", &tr("Clear history"))]);
+                        dialog.set_close_response("cancel");
+                        dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+                        let weak = Rc::downgrade(&ui);
+                        dialog.connect_response(None, move |_, response| { if response == "clear" { if let Some(ui) = weak.upgrade() { let Some(proxy)=ui.proxy.borrow().clone() else{return;}; glib::MainContext::default().spawn_local(async move {match crate::ipc::call(&proxy,"ClearHistory",None).await {Ok(_)=>{ui.toast("Transfer history cleared");ui.refresh();},Err(error)=>ui.toast(&error)}}); } } });
+                        dialog.present(Some(&ui.window));
                     }
                 });
                 group.add(&row);
@@ -449,18 +607,6 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             search_groups.push((group, rows));
         }
     }
-    search.connect_search_changed(move |entry| {
-        let query = entry.text().to_lowercase();
-        for (group, rows) in &search_groups {
-            let mut visible = false;
-            for (row, text) in rows {
-                let matches = text.contains(&query);
-                row.set_visible(matches);
-                visible |= matches;
-            }
-            group.set_visible(visible);
-        }
-    });
     let desktop = adw::PreferencesGroup::builder()
         .title(tr("Desktop notch"))
         .description(tr(
@@ -472,6 +618,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         .subtitle(tr("Requires the LinuxDrop GNOME Shell extension"))
         .build();
     let button = gtk::Button::from_icon_name("preferences-system-symbolic");
+    button.set_tooltip_text(Some(&tr("Notch preferences")));
     button.set_valign(gtk::Align::Center);
     open.add_suffix(&button);
     open.set_activatable_widget(Some(&button));
@@ -493,6 +640,19 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
     });
     desktop.add(&open);
     ui.settings_body.append(&desktop);
+    search_groups.push((
+        desktop,
+        vec![(
+            open.upcast(),
+            format!(
+                "{} {} {}",
+                tr("Desktop notch"),
+                tr("Notch preferences"),
+                tr("Position, monitor, and appearance live in the GNOME extension preferences.")
+            )
+            .to_lowercase(),
+        )],
+    ));
     let diagnostics = adw::PreferencesGroup::builder()
         .title(tr("About and diagnostics"))
         .build();
@@ -511,6 +671,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         ))
         .build();
     let button = gtk::Button::from_icon_name("edit-copy-symbolic");
+    button.set_tooltip_text(Some(&tr("Copy diagnostic report")));
     button.set_valign(gtk::Align::Center);
     row.add_suffix(&button);
     row.set_activatable_widget(Some(&button));
@@ -534,7 +695,66 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         }
     });
     diagnostics.add(&row);
+    let mut diagnostic_rows = crate::diagnostics::add_actions(ui, &diagnostics);
     ui.settings_body.append(&diagnostics);
+    diagnostic_rows.extend([
+        (about.upcast(), tr("About and diagnostics").to_lowercase()),
+        (
+            row.upcast(),
+            format!(
+                "{} {}",
+                tr("Copy diagnostic report"),
+                tr("Service status and capability information; review before sharing")
+            )
+            .to_lowercase(),
+        ),
+    ]);
+    search_groups.push((diagnostics, diagnostic_rows));
+    let names: Vec<String> = std::iter::once(tr("All categories"))
+        .chain(
+            search_groups
+                .iter()
+                .map(|(group, _)| group.title().to_string()),
+        )
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    category.set_model(Some(&gtk::StringList::new(&names)));
+    category.set_selected(ui.settings_category.get().min(search_groups.len() as u32));
+    let groups = Rc::new(search_groups);
+    let filter: Rc<dyn Fn()> = {
+        let groups = groups.clone();
+        let search = search.downgrade();
+        let category = category.downgrade();
+        let weak = Rc::downgrade(ui);
+        Rc::new(move || {
+            let (Some(search), Some(category)) = (search.upgrade(), category.upgrade()) else {
+                return;
+            };
+            let query = search.text().to_lowercase();
+            let selected = category.selected();
+            if let Some(ui) = weak.upgrade() {
+                *ui.settings_query.borrow_mut() = search.text().to_string();
+                ui.settings_category.set(selected);
+            }
+            for (index, (group, rows)) in groups.iter().enumerate() {
+                let mut visible = false;
+                for (row, text) in rows {
+                    let matches =
+                        text.contains(&query) && (selected == 0 || selected == index as u32 + 1);
+                    row.set_visible(matches);
+                    visible |= matches;
+                }
+                group.set_visible(visible);
+            }
+        })
+    };
+    filter();
+    let filter_copy = filter.clone();
+    search.connect_search_changed(move |_| filter_copy());
+    category.connect_selected_notify(move |_| filter());
+    if let Some(name) = focus_name {
+        crate::ui::restore_focus(&ui.settings_body, &name);
+    }
 }
 
 fn update(ui: &Rc<Ui>, section: &str, key: &str, value: Value) {

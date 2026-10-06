@@ -324,9 +324,8 @@ async fn send_inner(
     Ok(())
 }
 
-pub async fn ble_wake() -> Result<bluer::adv::AdvertisementHandle> {
-    let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
+pub async fn ble_wake(name: Option<&str>) -> Result<bluer::adv::AdvertisementHandle> {
+    let adapter = linuxdrop_network::bluetooth_adapter(name).await?;
     if !adapter.is_powered().await? {
         bail!("Bluetooth is switched off");
     }
@@ -340,7 +339,7 @@ pub async fn ble_wake() -> Result<bluer::adv::AdvertisementHandle> {
         )]),
         ..Default::default()
     };
-    Ok(adapter.advertise(advertisement).await?)
+    linuxdrop_network::advertise(&adapter, advertisement).await
 }
 
 #[cfg(test)]

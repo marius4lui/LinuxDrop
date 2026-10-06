@@ -1,0 +1,38 @@
+[package]
+name = "linuxdrop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+linuxdrop-hardware = { path = "../crates/linuxdrop-hardware" }
+linuxdrop-localsend = { path = "../crates/linuxdrop-localsend", features = ["fuzzing"] }
+linuxdrop-airdrop = { path = "../crates/linuxdrop-airdrop", features = ["fuzzing"] }
+
+[[bin]]
+name = "localsend_offer"
+path = "fuzz_targets/localsend_offer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "airdrop_archive"
+path = "fuzz_targets/airdrop_archive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hardware_report"
+path = "fuzz_targets/hardware_report.rs"
+test = false
+doc = false
+bench = false

@@ -1,4 +1,5 @@
 import Clutter from 'gi://Clutter';
+import Atk from 'gi://Atk';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -44,9 +45,12 @@ const SharingIndicator = GObject.registerClass(class SharingIndicator extends Qu
 });
 
 function textLabel(text, style = 'linuxdrop-notch-subtitle') {
-    const label = new St.Label({text: t(text), style_class: style});
+    const value = t(String(text ?? ''));
+    const label = new St.Label({text: value.length > 240 ? `${value.slice(0, 237)}…` : value, style_class: style});
     label.clutter_text.line_wrap = true;
+    label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
     label.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+    if (style === 'linuxdrop-notch-code') label.clutter_text.line_alignment = Pango.Alignment.CENTER;
     return label;
 }
 
@@ -57,6 +61,8 @@ export default class LinuxDropExtension extends Extension {
         this._dropRequested = false;
         this._dropLaunchPending = false;
         this._activeCount = 0;
+        this._selectedTransfer = null;
+        this._interactionMonitor = null;
         this._snapshot = null;
         this._revision = '';
         this._signals = [];
@@ -75,7 +81,7 @@ export default class LinuxDropExtension extends Extension {
             return Clutter.EVENT_PROPAGATE;
         });
         Main.panel.addToStatusArea('linuxdrop', this._panelButton, 0, 'right');
-        this._notch = new St.BoxLayout({vertical: true, style_class: 'linuxdrop-notch', reactive: true, can_focus: true, track_hover: true, visible: false});
+        this._notch = new St.BoxLayout({vertical: true, request_mode: Clutter.RequestMode.HEIGHT_FOR_WIDTH, style_class: 'linuxdrop-notch', reactive: true, can_focus: true, track_hover: true, visible: false});
         this._header = new St.Button({style_class: 'linuxdrop-notch-header', can_focus: true, accessible_name: t('Close LinuxDrop'), x_expand: true});
         const row = new St.BoxLayout({style_class: 'linuxdrop-notch-actions', x_expand: true});
         row.add_child(new St.Icon({icon_name: 'document-send-symbolic', style_class: 'linuxdrop-notch-icon'}));
@@ -83,7 +89,7 @@ export default class LinuxDropExtension extends Extension {
         row.add_child(this._title);
         this._detail = new St.Label({text: '', style_class: 'linuxdrop-notch-detail', y_align: Clutter.ActorAlign.CENTER}); row.add_child(this._detail);
         this._header.set_child(row); this._notch.add_child(this._header);
-        this._body = new St.BoxLayout({vertical: true, style_class: 'linuxdrop-notch-expanded', visible: false}); this._notch.add_child(this._body);
+        this._body = new St.BoxLayout({vertical: true, request_mode: Clutter.RequestMode.HEIGHT_FOR_WIDTH, style_class: 'linuxdrop-notch-expanded', visible: false}); this._notch.add_child(this._body);
         this._header.connect('clicked', () => this._setExpanded(!this._expanded));
         this._notch.connect('key-press-event', (_, event) => {
             if (event.get_key_symbol() === Clutter.KEY_Escape) { this._setExpanded(false); return Clutter.EVENT_STOP; }
@@ -165,57 +171,98 @@ export default class LinuxDropExtension extends Extension {
         const transfers = snapshot.transfers ?? [];
         const active = transfers.filter(t => !TERMINAL.has(t.state));
         const pending = active.find(t => t.state === 'verification' || (t.state === 'waiting' && ['incoming', 'receive'].includes(t.direction)));
-        const current = pending ?? active[0];
-        const finished = this._activeCount > 0 && active.length === 0;
+        const selected = transfers.find(transfer => transfer.id === this._selectedTransfer);
+        const current = selected && (!TERMINAL.has(selected.state) || this._expanded) ? selected : pending ?? active[0];
+        if (current) this._selectedTransfer = current.id;
         this._activeCount = active.length;
         this._panelIcon.icon_name = pending ? 'mail-unread-symbolic' : 'document-send-symbolic';
         this._panelButton.accessible_name = `LinuxDrop · ${pending ? t('Request') : active.length ? t('Transfer in progress') : t('Open LinuxDrop')}`;
         if (active.length) this._panelIcon.add_style_class_name('linuxdrop-panel-active');
         else this._panelIcon.remove_style_class_name('linuxdrop-panel-active');
         this._title.text = current ? `${['incoming', 'receive'].includes(current.direction) ? '↓' : '↑'} ${current.peer_name}` : 'LinuxDrop';
-        this._detail.text = current ? (current.state === 'transferring' && current.total_bytes > 0 ? `${Math.floor(100 * current.transferred_bytes / current.total_bytes)}%` : t(current.state === 'verification' ? 'Compare code' : pending ? 'Request' : 'Waiting')) : nearby((snapshot.peers ?? []).length);
+        this._detail.text = current ? (TERMINAL.has(current.state) ? t(current.state) : current.state === 'transferring' && current.total_bytes > 0 ? `${Math.floor(100 * current.transferred_bytes / current.total_bytes)}%` : t(current.state === 'verification' ? 'Compare code' : current.state === 'waiting' && ['incoming', 'receive'].includes(current.direction) ? 'Request' : 'Waiting')) : nearby((snapshot.peers ?? []).length);
         const visible = snapshot.settings?.visibility?.mode === 'everyone';
         this._indicator.toggle.checked = visible;
         this._indicator.toggle.subtitle = t(visible ? 'Visible to everyone' : 'Hidden');
         this._indicator.toggle.devices.removeAll();
         for (const peer of (snapshot.peers ?? []).slice(0, 6)) this._indicator.toggle.devices.addAction(peer.name, () => this.openApp());
         if (!(snapshot.peers ?? []).length) this._indicator.toggle.devices.addMenuItem(new PopupMenu.PopupMenuItem(t('No devices nearby'), {reactive: false}));
-        // Completion returns to the quiet panel icon. The daemon owns completion notifications.
-        if (finished && this._expanded && !this._dropWindow) { this._setExpanded(false); return; }
         // Rebuild only expanded contents. Compact progress has a stable actor/focus tree.
-        if (this._expanded) this._renderBody(current, active.length);
+        if (this._expanded) this._renderBody(current, active);
         this._position();
     }
 
-    _renderBody(current, activeCount) {
+    _renderBody(current, active) {
         // Preserve keyboard focus by keeping action rows unless the transfer/state changes.
-        const signature = current ? `${current.id}:${current.state}` : 'idle';
+        const signature = `${current ? `${current.id}:${current.state}` : 'idle'}:${active.map(transfer => transfer.id).join(',')}`;
         if (this._bodySignature === signature) {
-            if (this._progress && current) this._progress.width = Math.max(0, Math.min(280, 280 * (current.transferred_bytes ?? 0) / Math.max(1, current.total_bytes ?? 1)));
+            if (this._progress && current) {
+                const fraction = Math.max(0, Math.min(1, (current.transferred_bytes ?? 0) / Math.max(1, current.total_bytes ?? 1)));
+                this._progress.width = 280 * fraction;
+                this._progress.get_parent().accessible_name = `${current.peer_name}: ${Math.floor(100 * fraction)}%`;
+            }
             return;
         }
         this._bodySignature = signature;
         this._body.destroy_all_children(); this._progress = null;
+        if (active.length > 1 || (active.length && current && TERMINAL.has(current.state))) {
+            const chooser = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
+            const index = active.findIndex(transfer => transfer.id === current?.id);
+            const select = offset => {
+                const next = (Math.max(0, index) + offset + active.length) % active.length;
+                this._selectedTransfer = active[next].id;
+                this._render();
+            };
+            this._button(chooser, 'Previous', () => select(-1));
+            this._button(chooser, 'Next', () => select(1));
+            this._body.add_child(chooser);
+            this._body.add_child(textLabel(`${Math.max(0, index + 1)} / ${active.length} · ${t('Active transfers')}`));
+        }
         if (current) {
             this._body.add_child(textLabel(current.peer_name, 'linuxdrop-notch-heading'));
             const files = current.files ?? [];
-            this._body.add_child(textLabel(files.length === 1 ? files[0].name : filesStatus(files.length, activeCount)));
+            this._body.add_child(textLabel(files.length === 1 ? files[0].name : filesStatus(files.length, active.length)));
+            if (TERMINAL.has(current.state)) {
+                this._body.add_child(textLabel(current.error || t(current.state), current.state === 'failed' ? 'linuxdrop-notch-error' : 'linuxdrop-notch-subtitle'));
+                const actions = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
+                const saved = current.saved_paths?.[0];
+                if (current.state === 'completed' && saved) {
+                    this._button(actions, 'Open folder', () => {
+                        try {
+                            const parent = Gio.File.new_for_path(saved).get_parent();
+                            if (parent) Gio.AppInfo.launch_default_for_uri(parent.get_uri(), global.create_app_launch_context(0, -1));
+                            this._setExpanded(false);
+                        } catch (error) { this._error(error.message); }
+                    });
+                }
+                this._button(actions, 'Details', () => this.openApp('--transfers'));
+                this._body.add_child(actions);
+                const done = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
+                this._button(done, 'Done', () => this._setExpanded(false), true);
+                this._body.add_child(done);
+                this._scheduleCollapse();
+                return;
+            }
             if (current.state === 'verification') {
                 this._body.add_child(textLabel('Compare this code on both devices'));
                 this._body.add_child(textLabel(current.verification_code ?? '', 'linuxdrop-notch-code'));
             }
             if (current.state === 'transferring') {
-                const track = new St.Widget({style_class: 'linuxdrop-notch-track', width: 280});
+                const track = new St.Widget({style_class: 'linuxdrop-notch-track', width: 280, accessible_role: Atk.Role.PROGRESS_BAR, accessible_name: `${current.peer_name}: ${Math.floor(100 * (current.transferred_bytes ?? 0) / Math.max(1, current.total_bytes ?? 1))}%`});
                 this._progress = new St.Widget({style_class: 'linuxdrop-notch-fill', width: Math.max(0, Math.min(280, 280 * (current.transferred_bytes ?? 0) / Math.max(1, current.total_bytes ?? 1)))});
                 track.add_child(this._progress); this._body.add_child(track);
             }
             const actions = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
             const id = new GLib.Variant('(s)', [current.id]);
             if (current.state === 'verification' || (current.state === 'waiting' && ['incoming', 'receive'].includes(current.direction))) {
+                const primary = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
+                const needsDestination = ['incoming', 'receive'].includes(current.direction) && this._snapshot?.settings?.receive?.ask_directory;
+                if (current.state === 'verification' && !needsDestination) this._button(primary, 'Codes match', () => this.call('AcceptTransfer', id), true);
+                else this._button(primary, 'Review files', () => this.openApp('--transfers'), true);
+                this._body.add_child(primary);
                 this._button(actions, 'Decline', () => this.call('RejectTransfer', id));
-                this._button(actions, current.state === 'verification' ? 'Codes match' : 'Accept', () => this.call('AcceptTransfer', id), true);
             } else this._button(actions, 'Cancel', () => this.call('CancelTransfer', id));
-            this._button(actions, 'Details', () => this.openApp('--transfers'));
+            this._button(actions, current.state === 'pin_required' ? 'Enter PIN' : 'Details', () => this.openApp('--transfers'));
             this._body.add_child(actions);
         } else {
             this._body.add_child(textLabel('Send files', 'linuxdrop-notch-heading'));
@@ -238,7 +285,11 @@ export default class LinuxDropExtension extends Extension {
             this._dropRequested = false;
             this._cancelDragHover();
             this._closeDropSurface();
-        } else Main.panel.statusArea.quickSettings.menu.close();
+        } else {
+            if (!this._expanded) this._interactionMonitor = this._monitor()?.index ?? null;
+            Main.panel.statusArea.quickSettings.menu.close();
+        }
+        if (!expanded) { this._interactionMonitor = null; this._selectedTransfer = null; }
         this._expanded = expanded; this._body.visible = expanded;
         if (expanded) this._panelButton.add_style_pseudo_class('active');
         else this._panelButton.remove_style_pseudo_class('active');
@@ -264,8 +315,8 @@ export default class LinuxDropExtension extends Extension {
 
     _position() {
         if (!this._alive) return;
-        const index = this._settings.get_int('monitor');
-        const monitor = Main.layoutManager.monitors[index] ?? Main.layoutManager.primaryMonitor;
+        if (this._interactionMonitor !== null && !Main.layoutManager.monitors[this._interactionMonitor]) this._setExpanded(false);
+        const monitor = this._monitor();
         if (!monitor) return;
         const width = Math.min(350, monitor.width - 32);
         this._detail.visible = width >= 210;
@@ -275,8 +326,7 @@ export default class LinuxDropExtension extends Extension {
 
     _visibility() {
         if (!this._alive) return;
-        const index = this._settings.get_int('monitor');
-        const monitor = Main.layoutManager.monitors[index] ?? Main.layoutManager.primaryMonitor;
+        const monitor = this._monitor();
         const locked = Main.sessionMode.isLocked || Main.sessionMode.isGreeter;
         const fullscreen = monitor && global.display.get_monitor_in_fullscreen(monitor.index);
         const enabled = this._settings.get_boolean('show-notch');
@@ -284,6 +334,12 @@ export default class LinuxDropExtension extends Extension {
         this._panelButton.visible = enabled && !locked;
         this._notch.visible = this._expanded && !this._dropWindow && enabled && !blocked;
         if ((!enabled || blocked) && this._expanded) this._setExpanded(false);
+    }
+
+    _monitor() {
+        const mode = this._settings.get_string('monitor-mode');
+        const index = this._interactionMonitor ?? (mode === 'pointer' ? global.display.get_current_monitor() : mode === 'fixed' ? this._settings.get_int('monitor') : -1);
+        return Main.layoutManager.monitors[index] ?? Main.layoutManager.primaryMonitor;
     }
 
     _closeDropSurface() {
@@ -327,7 +383,7 @@ export default class LinuxDropExtension extends Extension {
         const [width, height] = this._notch.get_transformed_size();
         if (x < left - 12 || x > left + width + 12 || y < top - 8 || y > top + height + 12) { this._cancelDragHover(); return; }
         if (this._dragHover) return;
-        this._dragHover = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+        this._dragHover = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._settings.get_int('drag-hover-delay'), () => {
             this._dragHover = 0;
             if (this._expanded && this._notch.visible) this.openApp('--notch-drop');
             return GLib.SOURCE_REMOVE;
@@ -343,7 +399,7 @@ export default class LinuxDropExtension extends Extension {
             if (!this._expanded || !this._dropRequested) { window.delete(global.get_current_time()); return; }
             this._dropRequested = false;
             this._dropWindow = window;
-            const monitor = Main.layoutManager.monitors[this._settings.get_int('monitor')] ?? Main.layoutManager.primaryMonitor;
+            const monitor = this._monitor();
             if (!monitor) return;
             window.make_above();
             window.move_resize_frame(false, Math.round(monitor.x + (monitor.width - 350) / 2), monitor.y + Main.panel.height + this._settings.get_int('top-offset'), 350, 180);

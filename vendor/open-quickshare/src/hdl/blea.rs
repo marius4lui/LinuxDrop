@@ -44,8 +44,7 @@ pub struct BleAdvertiser {
 
 impl BleAdvertiser {
     pub async fn new() -> Result<Self, anyhow::Error> {
-        let session = bluer::Session::new().await?;
-        let adapter = session.default_adapter().await?;
+        let adapter = crate::bluetooth_adapter().await?;
         if !adapter.is_powered().await? {
             anyhow::bail!("Bluetooth is switched off");
         }
@@ -68,10 +67,11 @@ impl BleAdvertiser {
         let _suppressor = BleScanSuppressor::new();
 
         let service_uuid = Uuid::from_u16(0xFE2C);
-        let handle = self
-            .adapter
-            .advertise(self.get_advertisement(service_uuid, SERVICE_DATA))
-            .await?;
+        let handle = linuxdrop_network::advertise(
+            &self.adapter,
+            self.get_advertisement(service_uuid, SERVICE_DATA),
+        )
+        .await?;
         ctk.cancelled().await;
         info!("{INNER_NAME}: tracker cancelled, returning");
         drop(handle);
@@ -440,8 +440,7 @@ impl ReceiverAdvertiser {
         device_name: &str,
         l2cap_psm: Option<u16>,
     ) -> Result<Self, anyhow::Error> {
-        let session = bluer::Session::new().await?;
-        let adapter = session.default_adapter().await?;
+        let adapter = crate::bluetooth_adapter().await?;
         if !adapter.is_powered().await? {
             anyhow::bail!("Bluetooth is switched off");
         }
@@ -450,7 +449,9 @@ impl ReceiverAdvertiser {
         // `PACKET_BLE_ADVERT` picks the layout: `dual` (default), `header`
         // (15-byte header only, everything via GATT fetch), or `full` (the
         // whole advertisement as one extended instance, the original layout).
-        let mode_var = std::env::var("PACKET_BLE_ADVERT").unwrap_or_default();
+        // One compatible legacy header leaves room for another protocol's
+        // advertisement; full payload is still available through GATT slot 0.
+        let mode_var = std::env::var("PACKET_BLE_ADVERT").unwrap_or_else(|_| "header".into());
         let (mode, payloads): (&'static str, Vec<(&'static str, Vec<u8>)>) =
             if mode_var.eq_ignore_ascii_case("full") {
                 ("full", vec![("full", full_advert.clone())])
@@ -547,10 +548,15 @@ impl ReceiverAdvertiser {
             // Register, retrying failures (some controllers refuse a new
             // connectable set while a previous LE connection is still winding
             // down).
+            let mut failures = 0;
             let handles = loop {
                 match self.register_all().await {
                     Ok(handles) => break handles,
                     Err(e) => {
+                        failures += 1;
+                        if failures >= 3 {
+                            return Err(e);
+                        }
                         warn!("{RX_INNER_NAME}: advertise failed ({e}); retrying");
                         tokio::select! {
                             _ = ctk.cancelled() => {
@@ -682,7 +688,12 @@ impl ReceiverAdvertiser {
         &self,
         adv: Advertisement,
     ) -> Result<bluer::adv::AdvertisementHandle, anyhow::Error> {
-        match tokio::time::timeout(Self::REGISTER_TIMEOUT, self.adapter.advertise(adv)).await {
+        match tokio::time::timeout(
+            Self::REGISTER_TIMEOUT,
+            linuxdrop_network::advertise(&self.adapter, adv),
+        )
+        .await
+        {
             Ok(result) => Ok(result?),
             Err(_) => Err(anyhow::anyhow!(
                 "RegisterAdvertisement didn't answer within {:?}",

@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 [dependencies]
 anyhow = "1"
 linuxdrop-core = { path = "../linuxdrop-core" }
+linuxdrop-network = { path = "../linuxdrop-network" }
 linuxdrop-storage = { path = "../linuxdrop-storage" }
 rqs_lib = { path = "../../vendor/open-quickshare" }
 tokio = { version = "1", features = ["full"] }

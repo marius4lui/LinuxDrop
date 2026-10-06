@@ -1,15 +1,19 @@
+mod history;
 mod notifications;
+mod preferences;
+mod receive;
 mod settings;
 use anyhow::{Context, Result};
 use linuxdrop_core::*;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, Mutex};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
 const SERVICE: &str = "io.github.marius4lui.LinuxDrop";
@@ -25,13 +29,17 @@ struct Data {
     revision: u64,
     settings: Value,
     peers: HashMap<String, Peer>,
+    peer_preferences: HashMap<String, preferences::PeerPreferences>,
     transfers: HashMap<String, Transfer>,
     transfer_order: Vec<String>,
+    completed_at: HashMap<String, u64>,
     backends: HashMap<String, BackendState>,
     hardware: Value,
     drafts: HashMap<String, Draft>,
     commands: HashMap<String, CommandSender>,
     visibility_since: Option<Instant>,
+    decisions: HashSet<String>,
+    stop_when_idle: bool,
 }
 struct Shared {
     data: Mutex<Data>,
@@ -40,9 +48,15 @@ struct Shared {
     data_dir: PathBuf,
     restart: mpsc::Sender<()>,
     helper: Mutex<Option<linuxdrop_netd::Client>>,
+    quickshare_helper: Mutex<Option<linuxdrop_netd::Client>>,
+    backend_generation: std::sync::atomic::AtomicU64,
     locked: std::sync::atomic::AtomicBool,
     download_offer: Mutex<Option<linuxdrop_localsend::reverse::ReverseOffer>>,
     history_io: Mutex<()>,
+    log_filter: tracing_subscriber::reload::Handle<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::Registry,
+    >,
 }
 impl Shared {
     async fn persist_history(&self) -> Result<()> {
@@ -53,6 +67,14 @@ impl Shared {
             .iter()
             .filter_map(|id| d.transfers.get(id))
             .filter(|t| t.is_terminal())
+            .map(|t| history::Entry {
+                transfer: t.clone(),
+                completed_at: d
+                    .completed_at
+                    .get(&t.id)
+                    .copied()
+                    .unwrap_or_else(history::now)
+            })
             .collect::<Vec<_>>());
         drop(d);
         save_config(&self.data_dir.join("history.json"), &history).await
@@ -73,19 +95,43 @@ impl Shared {
         let d = self.data.lock().await;
         let mut peers: Vec<_> = d.peers.values().collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
+        let peers:Vec<_>=peers.into_iter().map(|peer| {
+            let mut value=serde_json::to_value(peer).unwrap_or_default();
+            if let Some(prefs)=d.peer_preferences.get(&peer.id) {
+                for (key,field) in serde_json::to_value(prefs).unwrap().as_object().unwrap() {value[key]=field.clone();}
+                if prefs.blocked {value["available"]=json!(false);}
+            }
+            value["identity_scope"]=json!("Preferences apply to this protocol identifier; they do not authenticate a person. Discovery identifiers can change.");
+            value
+        }).collect();
+        let known_peers:Vec<_>=d.peer_preferences.iter().map(|(id,prefs)|json!({"id":id,"favorite":prefs.favorite,"display_name":prefs.display_name,"blocked":prefs.blocked,"preferred_protocol":prefs.preferred_protocol,"available":d.peers.contains_key(id)})).collect();
         let transfers: Vec<_> = d
             .transfer_order
             .iter()
             .rev()
             .filter_map(|id| d.transfers.get(id))
+            .map(|transfer| {
+                let mut value = serde_json::to_value(transfer).unwrap_or_default();
+                if transfer.direction == "incoming" && !transfer.is_terminal() {
+                    if let Ok(options) = receive::options(&d.settings, transfer, None) {
+                        value["receive_directory"] = json!(options.directory);
+                    }
+                    value["selection_mode"] = json!(if transfer.protocol == "localsend" {
+                        "native"
+                    } else {
+                        "publish_selected"
+                    });
+                }
+                value
+            })
             .collect();
-        json!({"epoch":d.epoch,"revision":d.revision,"peers":peers,"transfers":transfers,"backends":d.backends.values().collect::<Vec<_>>(),"hardware":d.hardware,"settings":d.settings}).to_string()
+        json!({"epoch":d.epoch,"revision":d.revision,"peers":peers,"known_peers":known_peers,"transfers":transfers,"backends":d.backends.values().collect::<Vec<_>>(),"hardware":d.hardware,"settings":d.settings}).to_string()
     }
     async fn action(&self, id: &str, action: &str) -> zbus::fdo::Result<()> {
-        if action == "accept" && self.locked.load(std::sync::atomic::Ordering::Relaxed) {
-            return Err(failed("Unlock the session to accept files"));
+        if action == "accept" {
+            return self.accept(id, None).await;
         }
-        let data = self.data.lock().await;
+        let mut data = self.data.lock().await;
         let transfer = data
             .transfers
             .get(id)
@@ -98,13 +144,12 @@ impl Shared {
             .get(&transfer.protocol)
             .cloned()
             .ok_or_else(|| failed("Backend unavailable"))?;
-        if action == "accept" && !matches!(transfer.state.as_str(), "waiting" | "verification") {
-            return Err(failed("Transfer is not awaiting a decision"));
+        if action == "reject" && data.decisions.contains(id) {
+            return Err(failed(
+                "A decision has already been submitted; cancel the transfer instead",
+            ));
         }
         let command = match action {
-            "accept" => BackendCommand::Accept {
-                transfer_id: id.into(),
-            },
             "reject" => BackendCommand::Reject {
                 transfer_id: id.into(),
             },
@@ -112,16 +157,155 @@ impl Shared {
                 transfer_id: id.into(),
             },
         };
-        drop(data);
-        tx.send(command)
+        tx.try_send(command).map_err(failed)?;
+        data.decisions.insert(id.into());
+        Ok(())
+    }
+
+    async fn accept(&self, id: &str, patch: Option<Value>) -> zbus::fdo::Result<()> {
+        if self.locked.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(failed("Unlock the session to accept files"));
+        }
+        let mut d = self.data.lock().await;
+        let transfer = d
+            .transfers
+            .get(id)
+            .ok_or_else(|| failed("Unknown transfer"))?;
+        if transfer.is_terminal() {
+            return Err(failed("Transfer has already ended"));
+        }
+        if d.decisions.contains(id) {
+            return Err(failed("A decision has already been submitted"));
+        }
+        if !matches!(transfer.state.as_str(), "waiting" | "verification") {
+            return Err(failed("Transfer is not awaiting a decision"));
+        }
+        if d.peer_preferences
+            .get(&transfer.peer_id)
+            .is_some_and(|p| p.blocked)
+        {
+            return Err(failed("This device is blocked"));
+        }
+        let tx = d
+            .commands
+            .get(&transfer.protocol)
+            .cloned()
+            .ok_or_else(|| failed("Backend unavailable"))?;
+        let command = if transfer.direction == "incoming" {
+            if d.settings["receive"]["ask_directory"] == true
+                && !patch.as_ref().is_some_and(|p| p["directory"].is_string())
+            {
+                return Err(failed("Choose a destination in LinuxDrop before accepting"));
+            }
+            let options = receive::options(&d.settings, transfer, patch).map_err(failed)?;
+            let directory = options.directory.clone().unwrap();
+            let bytes = if transfer.protocol == "localsend" {
+                options
+                    .selected_indices
+                    .as_ref()
+                    .map(|indices| indices.iter().map(|i| transfer.files[*i].size).sum())
+                    .unwrap_or(transfer.total_bytes)
+            } else {
+                transfer.total_bytes
+            };
+            tokio::task::spawn_blocking(move || {
+                linuxdrop_storage::ReceiveStore::open(directory)?.ensure_space(bytes)
+            })
             .await
-            .map_err(|_| failed("Backend stopped"))
+            .map_err(failed)?
+            .map_err(failed)?;
+            BackendCommand::AcceptWithOptions {
+                transfer_id: id.into(),
+                options,
+            }
+        } else {
+            BackendCommand::Accept {
+                transfer_id: id.into(),
+            }
+        };
+        if self.locked.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(failed("Unlock the session to accept files"));
+        }
+        tx.try_send(command).map_err(failed)?;
+        d.decisions.insert(id.into());
+        Ok(())
     }
 }
 fn failed(message: impl ToString) -> zbus::fdo::Error {
     zbus::fdo::Error::Failed(message.to_string())
 }
 struct Manager(Arc<Shared>);
+struct HelperP2p {
+    shared: std::sync::Weak<Shared>,
+    lease_id: String,
+}
+impl HelperP2p {
+    async fn request(&self, request: linuxdrop_netd::Request) -> Result<linuxdrop_netd::Response> {
+        let shared = self
+            .shared
+            .upgrade()
+            .context("LinuxDrop is shutting down")?;
+        let mut slot = shared.quickshare_helper.lock().await;
+        let client = slot
+            .as_mut()
+            .context("Direct Wi-Fi helper lease is unavailable")?;
+        match tokio::time::timeout(Duration::from_secs(110), client.request(&request)).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => {
+                slot.take();
+                Err(error.into())
+            }
+            Err(error) => {
+                slot.take();
+                Err(error.into())
+            }
+        }
+    }
+}
+impl linuxdrop_network::P2pConnector for HelperP2p {
+    fn connect(
+        &self,
+        peer_name: String,
+        pin: String,
+        frequency: u32,
+    ) -> futures_util::future::BoxFuture<'_, Result<linuxdrop_network::P2pConnection>> {
+        Box::pin(async move {
+            match self
+                .request(linuxdrop_netd::Request::JoinP2p {
+                    lease_id: self.lease_id.clone(),
+                    peer_name,
+                    pin,
+                    frequency,
+                })
+                .await?
+            {
+                linuxdrop_netd::Response::P2pJoined {
+                    interface,
+                    ipv4_address,
+                } => Ok(linuxdrop_network::P2pConnection {
+                    interface,
+                    ipv4_address: ipv4_address.parse()?,
+                }),
+                linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
+                _ => anyhow::bail!("Unexpected P2P helper response"),
+            }
+        })
+    }
+    fn disconnect(&self) -> futures_util::future::BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            match self
+                .request(linuxdrop_netd::Request::LeaveP2p {
+                    lease_id: self.lease_id.clone(),
+                })
+                .await?
+            {
+                linuxdrop_netd::Response::Ok => Ok(()),
+                linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
+                _ => anyhow::bail!("Unexpected P2P cleanup response"),
+            }
+        })
+    }
+}
 #[zbus::interface(name = "io.github.marius4lui.LinuxDrop.Manager1")]
 impl Manager {
     async fn get_snapshot(&self) -> String {
@@ -130,12 +314,100 @@ impl Manager {
     async fn get_settings(&self) -> String {
         self.0.data.lock().await.settings.to_string()
     }
+    async fn get_defaults(&self) -> String {
+        settings::defaults().to_string()
+    }
+
+    async fn update_peer_preferences(
+        &self,
+        peer_id: String,
+        patch: String,
+    ) -> zbus::fdo::Result<()> {
+        if peer_id.len() > 512 || patch.len() > 4096 {
+            return Err(failed("Peer preferences exceed limits"));
+        }
+        let mut d = self.0.data.lock().await;
+        if !d.peers.contains_key(&peer_id) && !d.peer_preferences.contains_key(&peer_id) {
+            return Err(failed("Unknown peer"));
+        }
+        if d.peer_preferences.len() >= 1000 && !d.peer_preferences.contains_key(&peer_id) {
+            return Err(failed("Saved device limit reached"));
+        }
+        let next = d
+            .peer_preferences
+            .get(&peer_id)
+            .cloned()
+            .unwrap_or_default()
+            .patch(serde_json::from_str(&patch).map_err(failed)?)
+            .map_err(failed)?;
+        let mut prefs = d.peer_preferences.clone();
+        prefs.insert(peer_id, next);
+        save_config(&self.0.data_dir.join("peers.json"), &json!(prefs))
+            .await
+            .map_err(failed)?;
+        d.peer_preferences = prefs;
+        drop(d);
+        self.0.changed().await;
+        Ok(())
+    }
+    async fn forget_peer(&self, peer_id: String) -> zbus::fdo::Result<()> {
+        let mut d = self.0.data.lock().await;
+        let mut prefs = d.peer_preferences.clone();
+        prefs.remove(&peer_id);
+        save_config(&self.0.data_dir.join("peers.json"), &json!(prefs))
+            .await
+            .map_err(failed)?;
+        d.peer_preferences = prefs;
+        drop(d);
+        self.0.changed().await;
+        Ok(())
+    }
+    async fn export_diagnostics(&self) -> String {
+        let d = self.0.data.lock().await;
+        let backends: Vec<_> = d
+            .backends
+            .values()
+            .map(|b| json!({"id":b.id,"state":b.state}))
+            .collect();
+        let radios:Vec<_>=d.hardware["radios"].as_array().into_iter().flatten().map(|r|json!({"driver":r["driver"],"firmware":r["firmware"],"bands":r["bands"],"rfkill":r["rfkill"],"protected":r["protected"],"monitor":r["monitor"]})).collect();
+        json!({"version":env!("CARGO_PKG_VERSION"),"platform":"linux","backends":backends,"radios":radios,"active_transfers":d.transfers.values().filter(|t|!t.is_terminal()).count(),"redacted":true,"omitted":["names","addresses","serials","paths","keys","PINs","file names","error details"]}).to_string()
+    }
+    async fn restart_backends(&self) -> zbus::fdo::Result<()> {
+        if self
+            .0
+            .data
+            .lock()
+            .await
+            .transfers
+            .values()
+            .any(|t| !t.is_terminal())
+        {
+            return Err(failed(
+                "Finish or cancel active transfers before restarting",
+            ));
+        }
+        self.0.restart.send(()).await.map_err(failed)
+    }
+    async fn stop_when_idle(&self) -> zbus::fdo::Result<()> {
+        self.set_visibility("hidden".into()).await?;
+        self.0.download_offer.lock().await.take();
+        self.0.data.lock().await.stop_when_idle = true;
+        Ok(())
+    }
+    async fn reset_settings(&self) -> zbus::fdo::Result<()> {
+        self.update_settings(settings::defaults().to_string()).await
+    }
     async fn get_diagnostics(&self) -> String {
         let d = self.0.data.lock().await;
         json!({"version":env!("CARGO_PKG_VERSION"),"epoch":d.epoch,"backends":d.backends,"hardware":d.hardware,"active_transfers":d.transfers.values().filter(|t|!t.is_terminal()).count()}).to_string()
     }
     async fn prepare_send(&self, paths: Vec<String>) -> zbus::fdo::Result<String> {
         let mut d = self.0.data.lock().await;
+        if d.stop_when_idle {
+            return Err(failed(
+                "LinuxDrop is finishing active transfers before closing",
+            ));
+        }
         d.drafts
             .retain(|_, draft| draft.created.elapsed() < Duration::from_secs(1800));
         if d.drafts.len() >= 64
@@ -223,6 +495,12 @@ impl Manager {
             .peers
             .get(&peer_id)
             .ok_or_else(|| failed("Device is no longer available"))?;
+        if d.peer_preferences.get(&peer_id).is_some_and(|p| p.blocked) {
+            return Err(failed("This device is blocked"));
+        }
+        if protocol == "airdrop" && d.settings["airdrop"]["send"] != true {
+            return Err(failed("AirDrop sending is disabled"));
+        }
         if !peer.protocols.contains(&protocol) || !peer.available {
             return Err(failed("Protocol unavailable for this device"));
         }
@@ -289,6 +567,79 @@ impl Manager {
     async fn accept_transfer(&self, id: String) -> zbus::fdo::Result<()> {
         self.0.action(&id, "accept").await
     }
+    async fn accept_transfer_with_options(
+        &self,
+        id: String,
+        options: String,
+    ) -> zbus::fdo::Result<()> {
+        if options.len() > 131072 {
+            return Err(failed("Receive options too large"));
+        }
+        self.0
+            .accept(&id, Some(serde_json::from_str(&options).map_err(failed)?))
+            .await
+    }
+    async fn provide_transfer_pin(&self, id: String, pin: String) -> zbus::fdo::Result<()> {
+        if !(4..=12).contains(&pin.len()) || !pin.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(failed("PIN must contain 4 to 12 digits"));
+        }
+        let d = self.0.data.lock().await;
+        let t = d
+            .transfers
+            .get(&id)
+            .ok_or_else(|| failed("Unknown transfer"))?;
+        if t.state != "pin_required" || t.direction != "outgoing" || t.protocol != "localsend" {
+            return Err(failed("Transfer is not awaiting a PIN"));
+        }
+        d.commands
+            .get(&t.protocol)
+            .ok_or_else(|| failed("Backend unavailable"))?
+            .try_send(BackendCommand::ProvidePin {
+                transfer_id: id,
+                pin,
+            })
+            .map_err(failed)
+    }
+    async fn run_hardware_diagnostic(
+        &self,
+        radio_id: String,
+        channel: u16,
+    ) -> zbus::fdo::Result<String> {
+        if self
+            .0
+            .data
+            .lock()
+            .await
+            .transfers
+            .values()
+            .any(|t| !t.is_terminal())
+        {
+            return Err(failed("Finish transfers before testing an adapter"));
+        }
+        let mut client = linuxdrop_netd::Client::connect().await.map_err(failed)?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(90),
+            client.request(&linuxdrop_netd::Request::Diagnose { radio_id, channel }),
+        )
+        .await
+        .map_err(failed)?
+        .map_err(failed)?;
+        match response {
+            linuxdrop_netd::Response::Diagnostic { report } => {
+                serde_json::to_string(&report).map_err(failed)
+            }
+            linuxdrop_netd::Response::Error { message } => Err(failed(message)),
+            _ => Err(failed("Unexpected diagnostic response")),
+        }
+    }
+    async fn get_recovery_status(&self) -> zbus::fdo::Result<String> {
+        let mut client = linuxdrop_netd::Client::connect().await.map_err(failed)?;
+        let response = client
+            .request(&linuxdrop_netd::Request::RecoveryStatus)
+            .await
+            .map_err(failed)?;
+        serde_json::to_string(&response).map_err(failed)
+    }
     async fn reject_transfer(&self, id: String) -> zbus::fdo::Result<()> {
         self.0.action(&id, "reject").await
     }
@@ -298,6 +649,7 @@ impl Manager {
     async fn clear_history(&self) -> zbus::fdo::Result<()> {
         let mut d = self.0.data.lock().await;
         d.transfers.retain(|_, t| !t.is_terminal());
+        d.completed_at.clear();
         let active: Vec<_> = d
             .transfer_order
             .iter()
@@ -324,14 +676,20 @@ impl Manager {
         } else {
             None
         };
-        let commands: Vec<_> = d.commands.values().cloned().collect();
+        let commands: Vec<_> = d
+            .commands
+            .iter()
+            .map(|(id, tx)| {
+                (
+                    tx.clone(),
+                    mode == "everyone"
+                        && (id != "airdrop" || d.settings["airdrop"]["receive"] == true),
+                )
+            })
+            .collect();
         drop(d);
-        for tx in commands {
-            let _ = tx
-                .send(BackendCommand::SetVisibility {
-                    visible: mode == "everyone",
-                })
-                .await;
+        for (tx, visible) in commands {
+            let _ = tx.send(BackendCommand::SetVisibility { visible }).await;
         }
         self.0.changed().await;
         Ok(())
@@ -342,14 +700,15 @@ impl Manager {
         }
         let patch: Value = serde_json::from_str(&patch).map_err(failed)?;
         let mut d = self.0.data.lock().await;
-        if d.transfers.values().any(|t| !t.is_terminal()) {
-            return Err(failed(
-                "Finish or cancel active transfers before changing settings",
-            ));
-        }
         let mut next = d.settings.clone();
         settings::merge(&mut next, &patch).map_err(failed)?;
         settings::validate(&next).map_err(failed)?;
+        let restart = settings::needs_backend_restart(&d.settings, &next);
+        if restart && d.transfers.values().any(|t| !t.is_terminal()) {
+            return Err(failed(
+                "Finish or cancel active transfers before changing network settings",
+            ));
+        }
         if next["visibility"]["mode"] == "everyone"
             && self.0.locked.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -361,14 +720,29 @@ impl Manager {
         apply_autostart(next["general"]["autostart"].as_bool().unwrap())
             .await
             .map_err(failed)?;
-        d.visibility_since = if next["visibility"]["mode"] == "everyone" {
-            Some(Instant::now())
-        } else {
-            None
-        };
+        self.0
+            .log_filter
+            .reload(tracing_subscriber::EnvFilter::new(format!(
+                "warn,linuxdrop={}",
+                next["diagnostics"]["log_level"].as_str().unwrap_or("info")
+            )))
+            .map_err(failed)?;
+        let visibility_changed = d.settings["visibility"]["mode"] != next["visibility"]["mode"];
+        if visibility_changed {
+            d.visibility_since = if next["visibility"]["mode"] == "everyone" {
+                Some(Instant::now())
+            } else {
+                None
+            };
+        }
+        let mode = next["visibility"]["mode"].as_str().unwrap().to_owned();
         d.settings = next;
         drop(d);
-        self.0.restart.send(()).await.map_err(failed)?;
+        if restart {
+            self.0.restart.send(()).await.map_err(failed)?;
+        } else if visibility_changed {
+            self.set_visibility(mode).await?;
+        }
         self.0.changed().await;
         Ok(())
     }
@@ -424,17 +798,41 @@ async fn local_address() -> Option<String> {
     }
 }
 
-async fn boot_backends(shared: &Arc<Shared>, events: EventSender) {
+async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendEvent)>) {
+    let generation = shared
+        .backend_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        + 1;
+    let (events, mut receiver) = mpsc::channel(256);
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            if output.send((generation, event)).await.is_err() {
+                break;
+            }
+        }
+    });
     let (settings, previous) = {
         let mut d = shared.data.lock().await;
         d.peers.clear();
+        for id in ["localsend", "quickshare", "airdrop"] {
+            d.backends.insert(
+                id.into(),
+                BackendState {
+                    id: id.into(),
+                    state: "starting".into(),
+                    detail: "Applying sharing settings".into(),
+                },
+            );
+        }
         (d.settings.clone(), std::mem::take(&mut d.commands))
     };
+    shared.changed().await;
     for (_, tx) in previous {
         let _ = tx.send(BackendCommand::Shutdown).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     shared.helper.lock().await.take();
+    shared.quickshare_helper.lock().await.take();
     let name = settings["general"]["device_name"]
         .as_str()
         .unwrap()
@@ -453,6 +851,13 @@ async fn boot_backends(shared: &Arc<Shared>, events: EventSender) {
                 multicast: settings["localsend"]["multicast"] == true,
                 max_files: settings["receive"]["max_files"].as_u64().unwrap() as usize,
                 max_bytes: settings["receive"]["max_bytes"].as_u64().unwrap(),
+                policy: transfer_policy(&settings),
+                receive_pin: (settings["localsend"]["require_pin"] == true).then(|| {
+                    settings["localsend"]["pin"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .into()
+                }),
             },
             events.clone(),
         )
@@ -466,22 +871,39 @@ async fn boot_backends(shared: &Arc<Shared>, events: EventSender) {
             .as_str()
             .unwrap_or("");
         let inventory = linuxdrop_hardware::inventory().await;
-        let upgrade_interface = inventory
+        let upgrade_radio = inventory
             .radios
             .iter()
             .find(|r| r.id == preferred && !r.protected && !r.rfkill)
-            .and_then(|r| r.interfaces.first())
-            .cloned();
+            .map(|r| r.id.clone());
+        let upgrade_lease = if let Some(radio_id) = upgrade_radio {
+            match reserve_direct_wifi(shared, radio_id).await {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    tracing::warn!(%error,"Quick Share direct Wi-Fi unavailable; continuing on LAN");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let result = linuxdrop_quickshare::start(
             linuxdrop_quickshare::Config {
                 name: name.clone(),
                 download_dir: directory.clone(),
                 visible,
-                port: None,
+                port: Some(settings["quickshare"]["port"].as_u64().unwrap() as u16),
                 ble: settings["quickshare"]["ble"] == true,
                 max_receive_bytes: settings["receive"]["max_bytes"].as_u64().unwrap(),
                 max_files: settings["receive"]["max_files"].as_u64().unwrap() as usize,
-                upgrade_interface,
+                p2p_connector: upgrade_lease.as_ref().map(|lease| {
+                    Arc::new(HelperP2p {
+                        shared: Arc::downgrade(shared),
+                        lease_id: lease.lease_id.clone(),
+                    }) as Arc<dyn linuxdrop_network::P2pConnector>
+                }),
+                upgrade_lease,
+                policy: transfer_policy(&settings),
             },
             events.clone(),
         )
@@ -537,6 +959,16 @@ async fn start_airdrop(
     events: EventSender,
 ) -> Result<CommandSender> {
     let inventory = linuxdrop_hardware::inventory().await;
+    let leased = if let Some(client) = shared.quickshare_helper.lock().await.as_mut() {
+        match client.request(&linuxdrop_netd::Request::Status).await {
+            Ok(linuxdrop_netd::Response::State { leases, .. }) => {
+                leases.into_iter().map(|lease| lease.phy).collect()
+            }
+            _ => vec![],
+        }
+    } else {
+        vec![]
+    };
     let preferred = settings["hardware"]["preferred_adapter"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -549,7 +981,7 @@ async fn start_airdrop(
                 preferred: preferred.clone(),
                 channel: Some(channel),
                 require_tested_awdl: false,
-                leased: vec![],
+                leased: leased.clone(),
                 prefer_usb: settings["hardware"]["prefer_usb"] == true,
             },
         );
@@ -579,10 +1011,11 @@ async fn start_airdrop(
             name,
             download_dir: directory,
             interface,
-            visible,
+            visible: visible && settings["airdrop"]["receive"] == true,
             ble_wake: settings["airdrop"]["ble_wakeup"] == true,
             max_receive_bytes: settings["receive"]["max_bytes"].as_u64().unwrap(),
             max_files: settings["receive"]["max_files"].as_u64().unwrap() as usize,
+            policy: transfer_policy(settings),
         },
         events,
     )
@@ -591,17 +1024,65 @@ async fn start_airdrop(
     Ok(tx)
 }
 
+async fn reserve_direct_wifi(
+    shared: &Arc<Shared>,
+    radio_id: String,
+) -> Result<linuxdrop_quickshare::DirectWifiLease> {
+    let mut client = linuxdrop_netd::Client::connect().await?;
+    let response = tokio::time::timeout(
+        Duration::from_secs(90),
+        client.request(&linuxdrop_netd::Request::Reserve { radio_id }),
+    )
+    .await??;
+    let lease = match response {
+        linuxdrop_netd::Response::Acquired { lease } => lease,
+        linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
+        _ => anyhow::bail!("Unexpected direct Wi-Fi helper response"),
+    };
+    let result = linuxdrop_quickshare::DirectWifiLease {
+        interface: lease.interface,
+        lease_id: lease.id,
+        connection_uuid: lease
+            .connection_uuid
+            .context("Direct Wi-Fi lease missing its connection ownership marker")?,
+    };
+    *shared.quickshare_helper.lock().await = Some(client);
+    Ok(result)
+}
+
+fn transfer_policy(settings: &Value) -> TransferPolicy {
+    let limit = settings["transfers"]["bandwidth_limit_mbps"]
+        .as_u64()
+        .unwrap_or(0);
+    TransferPolicy {
+        allowed_interfaces: settings["network"]["allowed_interfaces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        allow_virtual_interfaces: settings["network"]["allow_virtual_interfaces"] == true,
+        bandwidth_bytes_per_second: (limit > 0).then_some(limit * 125_000),
+        bluetooth_adapter: settings["bluetooth"]["adapter"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if std::env::args().any(|a| a == "--version") {
         println!("linuxdropd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "linuxdrop=info".into()),
-        )
+    let (filter, log_filter) = tracing_subscriber::reload::Layer::new(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "warn,linuxdrop=info".into()),
+    );
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
         .init();
     let home = PathBuf::from(std::env::var("HOME")?);
     let config_dir = std::env::var("XDG_CONFIG_HOME")
@@ -620,21 +1101,55 @@ async fn main() -> Result<()> {
         settings::validate(&settings)?;
     }
     // Public visibility never survives a daemon restart unnoticed.
+    if std::env::var_os("RUST_LOG").is_none() {
+        log_filter.reload(tracing_subscriber::EnvFilter::new(format!(
+            "warn,linuxdrop={}",
+            settings["diagnostics"]["log_level"]
+                .as_str()
+                .unwrap_or("info")
+        )))?;
+    }
     settings["visibility"]["mode"] = json!("hidden");
     let history_path = data_dir.join("history.json");
-    let history: Vec<Transfer> = if let Ok(bytes) = tokio::fs::read(&history_path).await {
+    let history: Vec<history::Entry> = if let Ok(bytes) = tokio::fs::read(&history_path).await {
         serde_json::from_slice(&bytes).unwrap_or_default()
     } else {
         vec![]
     };
     let history: Vec<_> = history
         .into_iter()
-        .filter(Transfer::is_terminal)
+        .filter(|entry| {
+            entry.transfer.is_terminal()
+                && history::retained(
+                    entry.completed_at,
+                    settings["transfers"]["history_days"].as_u64().unwrap_or(30),
+                    history::now(),
+                )
+        })
         .rev()
         .take(settings["transfers"]["history_limit"].as_u64().unwrap() as usize)
         .collect();
-    let transfer_order: Vec<_> = history.iter().rev().map(|t| t.id.clone()).collect();
-    let transfers = history.into_iter().map(|t| (t.id.clone(), t)).collect();
+    let transfer_order: Vec<_> = history
+        .iter()
+        .rev()
+        .map(|t| t.transfer.id.clone())
+        .collect();
+    let completed_at = history
+        .iter()
+        .map(|entry| (entry.transfer.id.clone(), entry.completed_at))
+        .collect();
+    let transfers = history
+        .into_iter()
+        .map(|entry| (entry.transfer.id.clone(), entry.transfer))
+        .collect();
+    let peer_preferences = tokio::fs::read(data_dir.join("peers.json"))
+        .await
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<HashMap<String, preferences::PeerPreferences>>(&bytes).ok()
+        })
+        .filter(|prefs| prefs.len() <= 1000)
+        .unwrap_or_default();
     let (restart, mut restarts) = mpsc::channel(4);
     let shared = Arc::new(Shared {
         data: Mutex::new(Data {
@@ -642,22 +1157,29 @@ async fn main() -> Result<()> {
             revision: 0,
             settings,
             peers: HashMap::new(),
+            peer_preferences,
             transfers,
             transfer_order,
+            completed_at,
             backends: HashMap::new(),
             hardware: json!({"radios":[],"interfaces":[],"bluetooth":[],"warnings":[]}),
             drafts: HashMap::new(),
             commands: HashMap::new(),
             visibility_since: None,
+            decisions: HashSet::new(),
+            stop_when_idle: false,
         }),
         connection: std::sync::OnceLock::new(),
         config_path,
         data_dir,
         restart,
         helper: Mutex::new(None),
+        quickshare_helper: Mutex::new(None),
+        backend_generation: std::sync::atomic::AtomicU64::new(0),
         locked: std::sync::atomic::AtomicBool::new(false),
         download_offer: Mutex::new(None),
         history_io: Mutex::new(()),
+        log_filter,
     });
     let connection = zbus::connection::Builder::session()?
         .name(SERVICE)?
@@ -670,26 +1192,32 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            let mut connection = helper.helper.lock().await;
-            if let Some(client) = connection.as_mut() {
-                if !matches!(tokio::time::timeout(Duration::from_secs(5),client.request(&linuxdrop_netd::Request::Status)).await,Ok(Ok(linuxdrop_netd::Response::State{leases,..})) if !leases.is_empty())
-                {
-                    connection.take();
-                    drop(connection);
-                    let mut d = helper.data.lock().await;
-                    if let Some(tx) = d.commands.remove("airdrop") {
-                        let _ = tx.send(BackendCommand::Shutdown).await;
+            for (backend, socket) in [
+                ("airdrop", &helper.helper),
+                ("quickshare", &helper.quickshare_helper),
+            ] {
+                let mut connection = socket.lock().await;
+                if let Some(client) = connection.as_mut() {
+                    if !matches!(tokio::time::timeout(Duration::from_secs(5),client.request(&linuxdrop_netd::Request::Status)).await,Ok(Ok(linuxdrop_netd::Response::State{leases,..})) if !leases.is_empty())
+                    {
+                        connection.take();
+                        drop(connection);
+                        let mut d = helper.data.lock().await;
+                        if let Some(tx) = d.commands.remove(backend) {
+                            let _ = tx.send(BackendCommand::Shutdown).await;
+                        }
+                        d.backends.insert(
+                            backend.into(),
+                            BackendState {
+                                id: backend.into(),
+                                state: "error".into(),
+                                detail: "Network helper connection lost; radio lease released"
+                                    .into(),
+                            },
+                        );
+                        drop(d);
+                        helper.changed().await;
                     }
-                    d.backends.insert(
-                        "airdrop".into(),
-                        BackendState {
-                            id: "airdrop".into(),
-                            state: "error".into(),
-                            detail: "AWDL helper connection lost; radio lease released".into(),
-                        },
-                    );
-                    drop(d);
-                    helper.changed().await;
                 }
             }
         }
@@ -706,25 +1234,48 @@ async fn main() -> Result<()> {
     let hardware = shared.clone();
     tokio::spawn(async move {
         let mut inventories = linuxdrop_hardware::watch_inventory();
+        let mut initialized = false;
         while inventories.changed().await.is_ok() {
             let value =
                 serde_json::to_value(inventories.borrow_and_update().clone()).unwrap_or_default();
             let mut d = hardware.data.lock().await;
             let changed = d.hardware != value;
             let radios_changed = d.hardware["radios"] != value["radios"];
+            let show_adapter = initialized
+                && d.settings["hardware"]["open_on_adapter"] == true
+                && !hardware.locked.load(std::sync::atomic::Ordering::Relaxed)
+                && value["radios"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|radio| {
+                        radio["bus"] == "usb"
+                            && !d.hardware["radios"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .any(|old| old["id"] == radio["id"])
+                    });
             let retry = radios_changed
                 && d.settings["airdrop"]["enabled"] == true
+                && d.settings["hardware"]["auto_use_usb"] == true
                 && d.backends
                     .get("airdrop")
                     .is_some_and(|b| b.state == "error")
                 && !d.transfers.values().any(|t| !t.is_terminal());
             d.hardware = value;
+            initialized = true;
             drop(d);
             if retry {
                 let _ = hardware.restart.try_send(());
             }
             if changed {
                 hardware.changed().await;
+            }
+            if show_adapter {
+                let _ = tokio::process::Command::new("linuxdrop")
+                    .arg("--hardware")
+                    .spawn();
             }
         }
     });
@@ -747,10 +1298,16 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let mut shutdown_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>break,
-            Some(event)=event_rx.recv()=>{
+            _=shutdown_tick.tick()=>{
+                let d=shared.data.lock().await;
+                if d.stop_when_idle && !d.transfers.values().any(|t|!t.is_terminal()) {break;}
+            },
+            Some((generation,event))=event_rx.recv()=>{
+                if generation != shared.backend_generation.load(std::sync::atomic::Ordering::Acquire) {continue;}
                 let mut d=shared.data.lock().await;
                 let mut notification=None;
                 if let BackendEvent::Incoming(t)|BackendEvent::TransferUpdated(t)=&event {
@@ -762,13 +1319,16 @@ async fn main() -> Result<()> {
                     BackendEvent::Incoming(transfer)=>{
                         if !d.transfers.get(&transfer.id).is_some_and(Transfer::is_terminal) {
                             let full=!d.transfers.contains_key(&transfer.id) && d.transfers.values().filter(|t|!t.is_terminal()).count() >= d.settings["transfers"]["max_parallel"].as_u64().unwrap() as usize;
-                            if full || shared.locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            let blocked=d.peer_preferences.get(&transfer.peer_id).is_some_and(|p|p.blocked);
+                            let receive_disabled=transfer.protocol=="airdrop" && d.settings["airdrop"]["receive"]!=true;
+                            if full || blocked || receive_disabled || d.stop_when_idle || shared.locked.load(std::sync::atomic::Ordering::Relaxed) {
                                 if let Some(tx)=d.commands.get(&transfer.protocol) {let _=tx.try_send(BackendCommand::Reject{transfer_id:transfer.id.clone()});}
                             } else {notification=Some(transfer.clone());}
                             d.transfers.insert(transfer.id.clone(),transfer);
                         }
                     },
                     BackendEvent::TransferUpdated(transfer)=>{
+                        if transfer.is_terminal(){d.decisions.remove(&transfer.id);d.completed_at.entry(transfer.id.clone()).or_insert_with(history::now);}
                         if d.transfers.get(&transfer.id).is_none_or(|old|old.accepts_update(&transfer)){
                             if transfer.is_terminal(){notification=Some(transfer.clone());}
                             d.transfers.insert(transfer.id.clone(),transfer);
@@ -781,6 +1341,8 @@ async fn main() -> Result<()> {
                     let keep=d.settings["transfers"]["history_limit"].as_u64().unwrap_or(100) as usize;
                     let finished:Vec<_>=d.transfer_order.iter().filter(|id|d.transfers.get(*id).is_some_and(Transfer::is_terminal)).cloned().collect();
                     for id in finished.iter().take(finished.len().saturating_sub(keep)){d.transfers.remove(id);}
+                    let expired:Vec<_>=d.completed_at.iter().filter(|(_,timestamp)|!history::retained(**timestamp,d.settings["transfers"]["history_days"].as_u64().unwrap_or(30),history::now())).map(|(id,_)|id.clone()).collect();
+                    for id in expired {d.transfers.remove(&id);d.completed_at.remove(&id);}
                     let order:Vec<_>=d.transfer_order.iter().filter(|id|d.transfers.contains_key(*id)).cloned().collect();d.transfer_order=order;
                     Some(json!(d.transfer_order.iter().filter_map(|id|d.transfers.get(id)).filter(|t|t.is_terminal()).collect::<Vec<_>>()))
                 }else{None};

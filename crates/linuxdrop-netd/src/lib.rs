@@ -4,10 +4,39 @@ pub const SOCKET_PATH: &str = "/run/linuxdrop/netd.sock";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    Acquire { radio_id: String, channel: u16 },
-    AcquireAwdl { radio_id: String, channel: u16 },
-    SetChannel { lease_id: String, channel: u16 },
-    Release { lease_id: String },
+    JoinP2p {
+        lease_id: String,
+        peer_name: String,
+        pin: String,
+        frequency: u32,
+    },
+    LeaveP2p {
+        lease_id: String,
+    },
+    Reserve {
+        radio_id: String,
+    },
+    Diagnose {
+        radio_id: String,
+        channel: u16,
+    },
+    RecoveryStatus,
+    RetryRecovery,
+    Acquire {
+        radio_id: String,
+        channel: u16,
+    },
+    AcquireAwdl {
+        radio_id: String,
+        channel: u16,
+    },
+    SetChannel {
+        lease_id: String,
+        channel: u16,
+    },
+    Release {
+        lease_id: String,
+    },
     Status,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -21,12 +50,56 @@ pub struct Lease {
     pub awdl_interface: Option<String>,
     #[serde(default)]
     pub allowed_frequencies: Vec<u32>,
+    #[serde(default)]
+    pub kind: LeaseKind,
+    #[serde(default)]
+    pub connection_uuid: Option<String>,
+    #[serde(default)]
+    pub p2p_group: Option<linuxdrop_network::p2p::GroupIdentity>,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseKind {
+    #[default]
+    Monitor,
+    DirectWifi,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiagnosticStep {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiagnosticReport {
+    pub radio_id: String,
+    pub steps: Vec<DiagnosticStep>,
+    pub restored: bool,
+    pub transmitted_frames: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecoveryIssue {
+    pub lease_id: String,
+    pub interface: String,
+    pub ownership_verified: bool,
+    pub detail: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
+    P2pJoined {
+        interface: String,
+        ipv4_address: String,
+    },
+    Diagnostic {
+        report: DiagnosticReport,
+    },
+    Recovery {
+        issues: Vec<RecoveryIssue>,
+        recent_errors: Vec<String>,
+    },
     Acquired {
-        lease: Lease,
+        lease: Box<Lease>,
     },
     Ok,
     State {

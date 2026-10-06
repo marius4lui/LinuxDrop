@@ -1,5 +1,14 @@
+mod rate;
 pub mod reverse;
 mod tls;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    pub fn validate_prepare_json(bytes: &[u8]) -> bool {
+        bytes.len() <= 65536
+            && serde_json::from_slice::<super::Prepare>(bytes)
+                .is_ok_and(|request| super::validate_offer(&request, 100, 64 * 1024 * 1024).is_ok())
+    }
+}
 
 use anyhow::{bail, Context, Result};
 use axum::{
@@ -42,6 +51,8 @@ pub struct Config {
     pub multicast: bool,
     pub max_files: usize,
     pub max_bytes: u64,
+    pub policy: TransferPolicy,
+    pub receive_pin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +76,7 @@ struct DeviceInfo {
     announce: bool,
 }
 fn version() -> String {
-    "2.1".into()
+    "2.2".into()
 }
 fn port() -> u16 {
     53317
@@ -107,6 +118,10 @@ struct UploadQuery {
 struct CancelQuery {
     session_id: String,
 }
+#[derive(Default, Deserialize)]
+struct PrepareQuery {
+    pin: Option<String>,
+}
 
 struct IncomingFile {
     index: usize,
@@ -119,7 +134,9 @@ struct Session {
     ip: IpAddr,
     files: HashMap<String, IncomingFile>,
     transfer: Transfer,
-    consent: Option<oneshot::Sender<bool>>,
+    consent: Option<oneshot::Sender<Option<ReceiveOptions>>>,
+    store: ReceiveStore,
+    collision_policy: CollisionPolicy,
     accepted: bool,
     cancel: CancellationToken,
     created: Instant,
@@ -139,6 +156,12 @@ struct Shared {
     outgoing: Mutex<HashMap<String, CancellationToken>>,
     stop: CancellationToken,
     store: ReceiveStore,
+    prepare_gate: rate::RequestGate,
+    registration_gate: rate::RequestGate,
+    pin_gate: rate::RequestGate,
+    pin_requests: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    interfaces: Vec<linuxdrop_network::InterfaceAddress>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
 }
 type SharedState = Arc<Shared>;
 
@@ -153,6 +176,13 @@ pub async fn start_bound(
     events: EventSender,
     bind: Ipv4Addr,
 ) -> Result<CommandSender> {
+    if config
+        .receive_pin
+        .as_deref()
+        .is_some_and(|pin| !valid_pin(pin))
+    {
+        bail!("Receive PIN must contain 4–12 digits");
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (cert, key, fingerprint) = tls::identity(&config.identity_dir)?;
     let info = DeviceInfo {
@@ -167,6 +197,14 @@ pub async fn start_bound(
         announce: false,
     };
     let shared = Arc::new(Shared {
+        interfaces: linuxdrop_network::interfaces(&config.policy, true)?,
+        bandwidth: linuxdrop_network::BandwidthLimiter::new(
+            config.policy.bandwidth_bytes_per_second,
+        ),
+        prepare_gate: rate::RequestGate::new(20, Duration::from_secs(60)),
+        registration_gate: rate::RequestGate::new(120, Duration::from_secs(60)),
+        pin_gate: rate::RequestGate::new(6, Duration::from_secs(60)),
+        pin_requests: Mutex::new(HashMap::new()),
         store: ReceiveStore::open(&config.download_dir)?,
         visible: AtomicBool::new(config.visible),
         config: config.clone(),
@@ -188,8 +226,27 @@ pub async fn start_bound(
         .route("/api/localsend/v2/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(shared.clone());
-    let listener = std::net::TcpListener::bind((bind, config.port))?;
-    listener.set_nonblocking(true)?;
+    let addresses: Vec<_> = if bind.is_unspecified() {
+        shared
+            .interfaces
+            .iter()
+            .filter_map(|interface| match interface.address {
+                IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            })
+            .collect()
+    } else {
+        vec![bind]
+    };
+    if addresses.is_empty() {
+        bail!("No permitted IPv4 network interfaces are available");
+    }
+    let mut listeners = Vec::new();
+    for address in addresses {
+        let listener = std::net::TcpListener::bind((address, config.port))?;
+        listener.set_nonblocking(true)?;
+        listeners.push(listener);
+    }
     let handle = axum_server::Handle::new();
     let stop_handle = handle.clone();
     let stopper = shared.stop.clone();
@@ -197,28 +254,37 @@ pub async fn start_bound(
         stopper.cancelled().await;
         stop_handle.graceful_shutdown(Some(Duration::from_secs(2)));
     });
-    let state = shared.clone();
-    if config.https {
-        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(cert, key).await?;
-        tokio::spawn(async move {
-            if let Err(error) = axum_server::from_tcp_rustls(listener, tls)
-                .handle(handle)
-                .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-            {
-                state.error(format!("LocalSend server: {error}")).await;
-            }
-        });
+    let tls = if config.https {
+        Some(axum_server::tls_rustls::RustlsConfig::from_pem(cert, key).await?)
     } else {
-        tokio::spawn(async move {
-            if let Err(error) = axum_server::from_tcp(listener)
-                .handle(handle)
-                .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
-                .await
-            {
-                state.error(format!("LocalSend server: {error}")).await;
-            }
-        });
+        None
+    };
+    for listener in listeners {
+        let state = shared.clone();
+        let handle = handle.clone();
+        let routes = routes.clone();
+        if config.https {
+            let tls = tls.clone().unwrap();
+            tokio::spawn(async move {
+                if let Err(error) = axum_server::from_tcp_rustls(listener, tls)
+                    .handle(handle)
+                    .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                {
+                    state.error(format!("LocalSend server: {error}")).await;
+                }
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(error) = axum_server::from_tcp(listener)
+                    .handle(handle)
+                    .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+                {
+                    state.error(format!("LocalSend server: {error}")).await;
+                }
+            });
+        }
     }
     if config.multicast {
         let s = shared.clone();
@@ -243,8 +309,22 @@ pub async fn start_bound(
                         send(s, transfer_id, peer_id, files).await;
                     });
                 }
-                BackendCommand::Accept { transfer_id } => s.decide(&transfer_id, true).await,
-                BackendCommand::Reject { transfer_id } => s.decide(&transfer_id, false).await,
+                BackendCommand::Accept { transfer_id } => {
+                    s.decide(&transfer_id, Some(ReceiveOptions::default()))
+                        .await
+                }
+                BackendCommand::AcceptWithOptions {
+                    transfer_id,
+                    options,
+                } => s.decide(&transfer_id, Some(options)).await,
+                BackendCommand::ProvidePin { transfer_id, pin } => {
+                    if valid_pin(&pin) {
+                        if let Some(reply) = s.pin_requests.lock().await.remove(&transfer_id) {
+                            let _ = reply.send(pin);
+                        }
+                    }
+                }
+                BackendCommand::Reject { transfer_id } => s.decide(&transfer_id, None).await,
                 BackendCommand::Cancel { transfer_id } => s.cancel_transfer(&transfer_id).await,
                 BackendCommand::SetVisibility { visible } => {
                     s.visible.store(visible, Ordering::Relaxed);
@@ -302,10 +382,10 @@ impl Shared {
             }))
             .await;
     }
-    async fn decide(&self, id: &str, accept: bool) {
+    async fn decide(&self, id: &str, options: Option<ReceiveOptions>) {
         if let Some(session) = self.sessions.lock().await.get_mut(id) {
             if let Some(consent) = session.consent.take() {
-                let _ = consent.send(accept);
+                let _ = consent.send(options);
             }
         }
     }
@@ -317,7 +397,7 @@ impl Shared {
             }
             session.cancel.cancel();
             if let Some(consent) = session.consent.take() {
-                let _ = consent.send(false);
+                let _ = consent.send(None);
             }
             session.transfer.state = "cancelled".into();
             let _ = self
@@ -380,6 +460,9 @@ async fn register(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(info): Json<DeviceInfo>,
 ) -> Result<Json<DeviceInfo>, StatusCode> {
+    if !s.registration_gate.allow(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     s.remember(info, addr.ip())
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -391,30 +474,25 @@ async fn register(
 async fn prepare(
     State(s): State<SharedState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<PrepareQuery>,
     Json(request): Json<Prepare>,
 ) -> Result<Json<Prepared>, StatusCode> {
+    if !s.prepare_gate.allow(addr.ip()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     if !s.visible.load(Ordering::Relaxed) {
         return Err(StatusCode::FORBIDDEN);
     }
-    if request.files.is_empty() || request.files.len() > s.config.max_files {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let mut total = 0u64;
-    for (id, f) in &request.files {
-        if id != &f.id || id.len() > 256 || validate_name(&f.file_name).is_err() {
-            return Err(StatusCode::BAD_REQUEST);
-        }
-        total = total.checked_add(f.size).ok_or(StatusCode::BAD_REQUEST)?;
-        if total > s.config.max_bytes {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        if f.sha256
-            .as_ref()
-            .is_some_and(|h| h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()))
-        {
-            return Err(StatusCode::BAD_REQUEST);
+    if let Some(expected) = s.config.receive_pin.as_deref() {
+        if !pin_matches(query.pin.as_deref().unwrap_or_default(), expected) {
+            return Err(if s.pin_gate.allow(addr.ip()) {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            });
         }
     }
+    let total = validate_offer(&request, s.config.max_files, s.config.max_bytes)?;
     s.remember(request.info.clone(), addr.ip())
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -484,6 +562,8 @@ async fn prepare(
             files: entries,
             transfer: transfer.clone(),
             consent: Some(tx),
+            store: s.store.clone(),
+            collision_policy: CollisionPolicy::Rename,
             accepted: false,
             cancel: cancellation.clone(),
             created: Instant::now(),
@@ -491,10 +571,10 @@ async fn prepare(
     );
     drop(sessions);
     let _ = s.events.send(BackendEvent::Incoming(transfer)).await;
-    let accepted = tokio::select! { _ = cancellation.cancelled() => false, decision = tokio::time::timeout(Duration::from_secs(120),rx) => matches!(decision,Ok(Ok(true))) };
+    let options = tokio::select! { _ = cancellation.cancelled() => None, decision = tokio::time::timeout(Duration::from_secs(120),rx) => decision.ok().and_then(Result::ok).flatten() };
     let mut sessions = s.sessions.lock().await;
     let session = sessions.get_mut(&id).ok_or(StatusCode::FORBIDDEN)?;
-    if !accepted || session.cancel.is_cancelled() || !s.visible.load(Ordering::Relaxed) {
+    if options.is_none() || session.cancel.is_cancelled() || !s.visible.load(Ordering::Relaxed) {
         if !session.transfer.is_terminal() {
             session.transfer.state = "rejected".into();
         }
@@ -503,6 +583,69 @@ async fn prepare(
             .send(BackendEvent::TransferUpdated(session.transfer.clone()))
             .await;
         return Err(StatusCode::FORBIDDEN);
+    }
+    let options = options.unwrap();
+    let selection = options
+        .selected_indices
+        .clone()
+        .unwrap_or_else(|| (0..session.transfer.files.len()).collect());
+    let selected: std::collections::HashSet<_> = selection.iter().copied().collect();
+    if selected.is_empty()
+        || selected.len() != selection.len()
+        || selected
+            .iter()
+            .any(|index| *index >= session.transfer.files.len())
+    {
+        session.transfer.state = "rejected".into();
+        session.transfer.error = Some("Invalid or empty receive selection".into());
+        s.events
+            .send(BackendEvent::TransferUpdated(session.transfer.clone()))
+            .await
+            .ok();
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(directory) = options.directory {
+        match ReceiveStore::open(directory) {
+            Ok(store) => session.store = store,
+            Err(error) => {
+                session.transfer.state = "failed".into();
+                session.transfer.error = Some(error.to_string());
+                s.events
+                    .send(BackendEvent::TransferUpdated(session.transfer.clone()))
+                    .await
+                    .ok();
+                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+    }
+    session.collision_policy = options.collision_policy;
+    session
+        .files
+        .retain(|_, file| selected.contains(&file.index));
+    let retained: Vec<_> = session
+        .transfer
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| selected.contains(index))
+        .map(|(index, file)| (index, file.clone()))
+        .collect();
+    for file in session.files.values_mut() {
+        file.index = retained
+            .iter()
+            .position(|(index, _)| *index == file.index)
+            .unwrap();
+    }
+    session.transfer.files = retained.into_iter().map(|(_, file)| file).collect();
+    session.transfer.total_bytes = session.transfer.files.iter().map(|file| file.size).sum();
+    if let Err(error) = session.store.ensure_space(session.transfer.total_bytes) {
+        session.transfer.state = "failed".into();
+        session.transfer.error = Some(error.to_string());
+        s.events
+            .send(BackendEvent::TransferUpdated(session.transfer.clone()))
+            .await
+            .ok();
+        return Err(StatusCode::INSUFFICIENT_STORAGE);
     }
     session.accepted = true;
     session.transfer.state = "transferring".into();
@@ -518,6 +661,34 @@ async fn prepare(
             .map(|(id, f)| (id.clone(), f.token.clone()))
             .collect(),
     }))
+}
+
+fn validate_offer(
+    request: &Prepare,
+    max_files: usize,
+    max_bytes: u64,
+) -> std::result::Result<u64, StatusCode> {
+    if request.files.is_empty() || request.files.len() > max_files {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let mut total = 0u64;
+    for (id, file) in &request.files {
+        if id != &file.id || id.len() > 256 || validate_name(&file.file_name).is_err() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        total = total
+            .checked_add(file.size)
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        if total > max_bytes {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        if file.sha256.as_ref().is_some_and(|hash| {
+            hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+    Ok(total)
 }
 
 async fn upload(
@@ -598,7 +769,12 @@ async fn receive_body(
     cancel: CancellationToken,
     body: Body,
 ) -> Result<PathBuf> {
-    let mut pending = s.store.create(&meta.file_name)?;
+    let (store, policy) = {
+        let sessions = s.sessions.lock().await;
+        let session = sessions.get(&q.session_id).context("Session expired")?;
+        (session.store.clone(), session.collision_policy)
+    };
+    let mut pending = store.create(&meta.file_name)?;
     let mut stream = body.into_data_stream();
     let mut bytes = 0u64;
     let mut hasher = Sha256::new();
@@ -613,6 +789,7 @@ async fn receive_body(
         if bytes > meta.size {
             bail!("File exceeds declared size");
         }
+        s.bandwidth.acquire(chunk.len(), &cancel).await?;
         pending.file.write_all(&chunk).await?;
         hasher.update(&chunk);
         if last.elapsed() >= Duration::from_millis(100) || bytes == meta.size {
@@ -643,7 +820,21 @@ async fn receive_body(
     if cancel.is_cancelled() {
         bail!("Transfer cancelled");
     }
-    pending.commit().await
+    pending.commit_with_policy(policy).await
+}
+
+fn valid_pin(pin: &str) -> bool {
+    (4..=12).contains(&pin.len()) && pin.bytes().all(|byte| byte.is_ascii_digit())
+}
+fn pin_matches(actual: &str, expected: &str) -> bool {
+    let mut difference = actual.len() ^ expected.len();
+    for index in 0..12 {
+        difference |= usize::from(
+            actual.as_bytes().get(index).copied().unwrap_or(0)
+                ^ expected.as_bytes().get(index).copied().unwrap_or(0),
+        );
+    }
+    difference == 0 && valid_pin(actual)
 }
 
 async fn cancel(
@@ -748,7 +939,17 @@ async fn send_files(
     cancel: CancellationToken,
 ) -> Result<()> {
     let (info, address) = peer.context("Device is no longer available")?;
-    let client = tls::client(&info.protocol, &info.fingerprint)?;
+    let interface = s
+        .interfaces
+        .iter()
+        .find(|interface| interface.contains(address.ip()))
+        .or_else(|| {
+            s.interfaces
+                .iter()
+                .find(|interface| !interface.address.is_loopback())
+        })
+        .context("No permitted interface can reach this peer")?;
+    let client = tls::client_on(&info.protocol, &info.fingerprint, Some(&interface.name))?;
     let base = format!("{}://{address}/api/localsend/v2", info.protocol);
     let mut files = HashMap::new();
     let mut opened = Vec::new();
@@ -794,11 +995,51 @@ async fn send_files(
         .events
         .send(BackendEvent::TransferUpdated(transfer.clone()))
         .await;
-    let response = tokio::select! { _=cancel.cancelled()=>bail!("Transfer cancelled"),r=client.post(format!("{base}/prepare-upload")).json(&Prepare{info:s.info.clone(),files}).timeout(Duration::from_secs(130)).send()=>r? };
+    let offer = Prepare {
+        info: s.info.clone(),
+        files,
+    };
+    let mut pin: Option<String> = None;
+    let mut attempts = 0;
+    let response = loop {
+        let mut request = client
+            .post(format!("{base}/prepare-upload"))
+            .json(&offer)
+            .timeout(Duration::from_secs(130));
+        if let Some(pin) = &pin {
+            request = request.query(&[("pin", pin)]);
+        }
+        let response = tokio::select! { _=cancel.cancelled()=>bail!("Transfer cancelled"),r=request.send()=>r? };
+        if response.status() != StatusCode::UNAUTHORIZED {
+            break response;
+        }
+        attempts += 1;
+        if attempts > 5 {
+            bail!("Recipient rejected the PIN too many times");
+        }
+        let (reply, receiver) = oneshot::channel();
+        s.pin_requests
+            .lock()
+            .await
+            .insert(transfer.id.clone(), reply);
+        transfer.state = "pin_required".into();
+        transfer.error = Some("Enter the receiving device's LocalSend PIN.".into());
+        s.events
+            .send(BackendEvent::TransferUpdated(transfer.clone()))
+            .await
+            .ok();
+        let supplied = tokio::select! { _=cancel.cancelled()=>None,result=tokio::time::timeout(Duration::from_secs(120),receiver)=>result.ok().and_then(|value|value.ok()) };
+        s.pin_requests.lock().await.remove(&transfer.id);
+        pin = Some(supplied.context("PIN entry cancelled or expired")?);
+        transfer.error = None;
+        transfer.state = "waiting".into();
+    };
     let response = response
         .error_for_status()
         .context("Recipient did not accept the transfer")?;
     if response.status() == StatusCode::NO_CONTENT {
+        transfer.files.clear();
+        transfer.total_bytes = 0;
         return Ok(());
     }
     let mut response = response;
@@ -821,6 +1062,18 @@ async fn send_files(
     {
         bail!("Recipient returned invalid upload tokens");
     }
+    if prepared.files.is_empty() {
+        bail!("Recipient did not select any files");
+    }
+    transfer.files = transfer
+        .files
+        .iter()
+        .zip(&opened)
+        .filter(|(_, (id, _, _))| prepared.files.contains_key(id))
+        .map(|(file, _)| file.clone())
+        .collect();
+    transfer.total_bytes = transfer.files.iter().map(|file| file.size).sum();
+    opened.retain(|(id, _, _)| prepared.files.contains_key(id));
     let result = async {
         for (index, (id, file, size)) in opened.into_iter().enumerate() {
             let Some(file_token) = prepared.files.get(&id) else {
@@ -831,17 +1084,32 @@ async fn send_files(
             let report = shared_transfer.clone();
             let events = s.events.clone();
             let mut last = Instant::now();
-            let stream = tokio_util::io::ReaderStream::new(file.take(size)).inspect(move |chunk| {
-                if let Ok(bytes) = chunk {
-                    let mut t = report.lock().unwrap();
-                    t.files[index].transferred += bytes.len() as u64;
-                    t.transferred_bytes = t.files.iter().map(|f| f.transferred).sum();
-                    if last.elapsed() >= Duration::from_millis(100) {
-                        let _ = events.try_send(BackendEvent::TransferUpdated(t.clone()));
-                        last = Instant::now();
+            let bandwidth = s.bandwidth.clone();
+            let stream_cancel = cancel.clone();
+            let stream = tokio_util::io::ReaderStream::new(file.take(size))
+                .then(move |chunk| {
+                    let bandwidth = bandwidth.clone();
+                    let cancel = stream_cancel.clone();
+                    async move {
+                        let bytes = chunk?;
+                        bandwidth
+                            .acquire(bytes.len(), &cancel)
+                            .await
+                            .map_err(std::io::Error::other)?;
+                        Ok::<_, std::io::Error>(bytes)
                     }
-                }
-            });
+                })
+                .inspect(move |chunk| {
+                    if let Ok(bytes) = chunk {
+                        let mut t = report.lock().unwrap();
+                        t.files[index].transferred += bytes.len() as u64;
+                        t.transferred_bytes = t.files.iter().map(|f| f.transferred).sum();
+                        if last.elapsed() >= Duration::from_millis(100) {
+                            let _ = events.try_send(BackendEvent::TransferUpdated(t.clone()));
+                            last = Instant::now();
+                        }
+                    }
+                });
             let request = client
                 .post(format!("{base}/upload"))
                 .query(&[
@@ -901,6 +1169,8 @@ mod tests {
             multicast: false,
             max_files: 10,
             max_bytes: 8 * 1024 * 1024,
+            policy: TransferPolicy::default(),
+            receive_pin: None,
         }
     }
     async fn next_transfer(rx: &mut mpsc::Receiver<BackendEvent>, state: &str) -> Transfer {
@@ -918,6 +1188,92 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+    #[tokio::test]
+    async fn pin_retry_partial_consent_and_chosen_destination() {
+        let sender = tempfile::tempdir().unwrap();
+        let receiver = tempfile::tempdir().unwrap();
+        let sc = config(sender.path(), "Sender");
+        let mut rc = config(receiver.path(), "Receiver");
+        rc.receive_pin = Some("424242".into());
+        let (se, mut sr) = mpsc::channel(128);
+        let st = start(sc.clone(), se).await.unwrap();
+        let (re, mut rr) = mpsc::channel(128);
+        let rt = start(rc.clone(), re).await.unwrap();
+        let (_, _, sf) = tls::identity(&sc.identity_dir).unwrap();
+        let (_, _, rf) = tls::identity(&rc.identity_dir).unwrap();
+        tls::client("https", &sf)
+            .unwrap()
+            .post(format!(
+                "https://127.0.0.1:{}/api/localsend/v2/register",
+                sc.port
+            ))
+            .json(&DeviceInfo {
+                alias: "Receiver".into(),
+                version: version(),
+                device_model: None,
+                device_type: None,
+                fingerprint: rf.clone(),
+                port: rc.port,
+                protocol: "https".into(),
+                download: false,
+                announce: false,
+            })
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let keep = sender.path().join("selected.txt");
+        let skip = sender.path().join("declined.txt");
+        std::fs::write(&keep, b"selected bytes").unwrap();
+        std::fs::write(&skip, b"do not receive").unwrap();
+        st.send(BackendCommand::Send {
+            transfer_id: "pin-and-partial".into(),
+            peer_id: format!("localsend:{rf}"),
+            files: vec![keep, skip],
+        })
+        .await
+        .unwrap();
+        for pin in ["0000", "424242"] {
+            let challenge = next_transfer(&mut sr, "pin_required").await;
+            st.send(BackendCommand::ProvidePin {
+                transfer_id: challenge.id,
+                pin: pin.into(),
+            })
+            .await
+            .unwrap();
+        }
+        let incoming = next_transfer(&mut rr, "waiting").await;
+        let selected = incoming
+            .files
+            .iter()
+            .position(|file| file.name == "selected.txt")
+            .unwrap();
+        let destination = receiver.path().join("chosen");
+        rt.send(BackendCommand::AcceptWithOptions {
+            transfer_id: incoming.id,
+            options: ReceiveOptions {
+                directory: Some(destination.clone()),
+                selected_indices: Some(vec![selected]),
+                collision_policy: CollisionPolicy::Reject,
+            },
+        })
+        .await
+        .unwrap();
+        let received = next_transfer(&mut rr, "completed").await;
+        let sent = next_transfer(&mut sr, "completed").await;
+        assert_eq!(received.files.len(), 1);
+        assert_eq!(sent.files.len(), 1);
+        assert_eq!(sent.transferred_bytes, 14);
+        assert_eq!(
+            std::fs::read(destination.join("selected.txt")).unwrap(),
+            b"selected bytes"
+        );
+        assert!(!destination.join("declined.txt").exists());
+        assert_eq!(std::fs::read_dir(&rc.download_dir).unwrap().count(), 0);
+        st.send(BackendCommand::Shutdown).await.unwrap();
+        rt.send(BackendCommand::Shutdown).await.unwrap();
     }
     #[tokio::test]
     async fn tls_send_receive_consent_zero_bytes_collision_and_rejection() {

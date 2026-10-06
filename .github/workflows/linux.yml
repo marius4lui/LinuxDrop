@@ -30,6 +30,7 @@ jobs:
           appstreamcli validate --no-net packaging/io.github.marius4lui.LinuxDrop.metainfo.xml
           glib-compile-schemas --strict --dry-run extensions/gnome-shell/schemas
           python3 -m py_compile integrations/nautilus/linuxdrop.py
+          python3 integrations/thunar/test_install_action.py
           node --check extensions/gnome-shell/extension.js
           sh -n packaging/install.sh packaging/build-deb.sh
       - name: Build installable package
@@ -52,4 +53,37 @@ jobs:
           path: |
             dist/*.deb
             dist/*_source.tar.gz
+            dist/SHA256SUMS
           if-no-files-found: error
+  dependency-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verified audit tools
+        run: sh packaging/ci/install-audit-tools.sh "$RUNNER_TEMP/linuxdrop-tools"
+      - name: Vulnerabilities, licenses and dependency sources
+        run: |
+          "$RUNNER_TEMP/linuxdrop-tools/cargo-audit" audit
+          "$RUNNER_TEMP/linuxdrop-tools/cargo-audit" audit --file vendor/opendrop-rs/Cargo.lock
+          "$RUNNER_TEMP/linuxdrop-tools/cargo-deny" check licenses sources advisories
+  parser-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Bounded fuzz dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev clang
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Production parser fuzz smoke
+        env:
+          CARGO_BUILD_JOBS: 3
+        run: sh packaging/ci/fuzz-smoke.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: parser-fuzz-failures
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

@@ -1,12 +1,16 @@
 window.linuxdrop { background: @window_bg_color; }
+/* White normal-size action text: 4.77:1 against this blue (WCAG AA). */
+button.suggested-action:not(:disabled) { background: #1c71d8; color: #ffffff; }
+button.suggested-action:not(:disabled):hover { background: #1a65c2; color: #ffffff; }
+button.suggested-action:not(:disabled):active { background: #15539e; color: #ffffff; }
 .brand-mark { color: @accent_color; }
 .hero-title { font-size: 28px; font-weight: 800; letter-spacing: -0.7px; }
 .hero-subtitle { font-size: 14px; color: @window_fg_color; opacity: 0.62; }
-.drop-zone { border: 2px dashed alpha(@accent_color, 0.28); border-radius: 24px; background: alpha(@accent_color, 0.045); padding: 30px 22px; transition: background 180ms, border-color 180ms; }
+.drop-zone { border: 2px dashed alpha(@accent_color, 0.28); border-radius: 18px; background: alpha(@accent_color, 0.045); padding: 16px 12px; transition: background 180ms, border-color 180ms; }
 .drop-zone.drag-active { border-color: @accent_color; background: alpha(@accent_color, 0.14); }
 .drop-zone.has-files { padding: 10px; border-radius: 16px; }
-.drop-icon { color: @accent_color; padding: 12px; border-radius: 20px; background: alpha(@accent_color, 0.10); }
-.drop-title { font-size: 18px; font-weight: 700; }
+.drop-icon { color: @accent_color; padding: 7px; border-radius: 14px; background: alpha(@accent_color, 0.10); }
+.drop-title { font-size: 16px; font-weight: 700; }
 .section-heading { font-size: 16px; font-weight: 700; }
 .eyebrow { font-size: 10px; font-weight: 700; letter-spacing: 1.3px; opacity: 0.5; }
 .peer-card { padding: 6px; border-radius: 16px; background: @card_bg_color; border: 1px solid alpha(@window_fg_color, 0.08); box-shadow: 0 2px 5px alpha(black, 0.025); }
@@ -29,3 +33,4 @@ progressbar progress { min-height: 5px; border-radius: 99px; }
 .notch-surface > box { background: #18191f; border-radius: 22px; border: 1px solid alpha(white,0.12); margin: 0; padding: 18px 20px; }
 .notch-surface button { border-radius: 12px; }
 .notch-surface .brand-mark { color: #8ab4f8; }
+.transfer-state { font-size: 13px; font-weight: 600; }

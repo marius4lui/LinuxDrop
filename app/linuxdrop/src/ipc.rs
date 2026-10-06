@@ -30,7 +30,11 @@ pub async fn call(
             method,
             parameters.as_ref(),
             gio::DBusCallFlags::NONE,
-            30_000,
+            if method == "RunHardwareDiagnostic" {
+                120_000
+            } else {
+                30_000
+            },
         )
         .await
         .map_err(|e| e.to_string())

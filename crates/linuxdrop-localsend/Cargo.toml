@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 linuxdrop-core = { path = "../linuxdrop-core" }
+linuxdrop-network = { path = "../linuxdrop-network" }
 linuxdrop-storage = { path = "../linuxdrop-storage" }
 anyhow.workspace = true
 serde.workspace = true
@@ -28,3 +29,6 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+fuzzing = []

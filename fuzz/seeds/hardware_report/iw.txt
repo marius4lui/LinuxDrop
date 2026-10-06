@@ -1,0 +1,9 @@
+Supported interface modes:
+ * managed
+ * monitor
+valid interface combinations:
+ * #{ managed, P2P-client } <= 2,
+   total <= 2, #channels <= 1
+Band 1:
+ * 2412 MHz [1] (20.0 dBm)
+ * 5260 MHz [52] (no IR, radar detection)

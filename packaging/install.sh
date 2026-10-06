@@ -11,15 +11,19 @@ install -Dm755 "$target/linuxdropd" "$dest$prefix/bin/linuxdropd"
 install -Dm755 "$target/linuxdrop-netd" "$dest$prefix/libexec/linuxdrop/linuxdrop-netd"
 filin=${LINUXDROP_FILIN:-"${CARGO_TARGET_DIR:-$root/vendor/opendrop-rs/target}/release/filin"}
 install -Dm755 "$filin" "$dest$prefix/libexec/linuxdrop/filin"
+install -Dm755 "$root/packaging/helpers/p2p-dhcp.py" "$dest$prefix/libexec/linuxdrop/p2p-dhcp"
+install -Dm644 "$root/packaging/dbus/io.github.marius4lui.LinuxDrop.Netd.conf" "$dest$prefix/share/dbus-1/system.d/io.github.marius4lui.LinuxDrop.Netd.conf"
 install -Dm644 "$root/packaging/systemd/linuxdropd.service" "$dest$prefix/lib/systemd/user/linuxdropd.service"
 install -Dm644 "$root/packaging/systemd/linuxdrop-netd.service" "$dest$prefix/lib/systemd/system/linuxdrop-netd.service"
 install -Dm644 "$root/packaging/dbus/io.github.marius4lui.LinuxDrop.service" "$dest$prefix/share/dbus-1/services/io.github.marius4lui.LinuxDrop.service"
 install -Dm644 "$root/packaging/polkit/io.github.marius4lui.LinuxDrop.policy" "$dest$prefix/share/polkit-1/actions/io.github.marius4lui.LinuxDrop.policy"
+install -Dm644 "$root/packaging/polkit/50-linuxdrop-netd.rules" "$dest$prefix/share/polkit-1/rules.d/50-linuxdrop-netd.rules"
 install -Dm644 "$root/packaging/io.github.marius4lui.LinuxDrop.desktop" "$dest$prefix/share/applications/io.github.marius4lui.LinuxDrop.desktop"
 install -Dm644 "$root/packaging/io.github.marius4lui.LinuxDrop.metainfo.xml" "$dest$prefix/share/metainfo/io.github.marius4lui.LinuxDrop.metainfo.xml"
 install -Dm644 "$root/integrations/nautilus/linuxdrop.py" "$dest$prefix/share/nautilus-python/extensions/linuxdrop.py"
 install -Dm644 "$root/integrations/dolphin/linuxdrop.desktop" "$dest$prefix/share/kio/servicemenus/linuxdrop.desktop"
 install -Dm644 "$root/integrations/thunar/uca.xml.example" "$dest$prefix/share/doc/linuxdrop/thunar-uca.xml.example"
+install -Dm755 "$root/integrations/thunar/install-action.py" "$dest$prefix/bin/linuxdrop-thunar-install"
 install -Dm644 "$root/LICENSE" "$dest$prefix/share/doc/linuxdrop/copyright"
 install -Dm644 "$root/vendor/open-quickshare/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/open-quickshare-LICENSE"
 install -Dm644 "$root/vendor/opendrop-rs/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/opendrop-rs-LICENSE"
@@ -32,6 +36,8 @@ if [ -d "$root/extensions/gnome-shell" ]; then
     extension="$dest$prefix/share/gnome-shell/extensions/linuxdrop@marius4lui.github.io"
     install -d "$extension"
     cp -R "$root/extensions/gnome-shell/." "$extension/"
+    find "$extension" -type f -exec chmod 644 '{}' \;
+    find "$extension" -type d -exec chmod 755 '{}' \;
     if [ -d "$extension/schemas" ]; then glib-compile-schemas "$extension/schemas"; fi
 fi
 icon=$(find "$root/app/linuxdrop" -name 'io.github.marius4lui.LinuxDrop.svg' -print -quit)

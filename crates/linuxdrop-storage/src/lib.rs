@@ -32,6 +32,20 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 impl ReceiveStore {
+    pub fn ensure_space(&self, bytes: u64) -> Result<()> {
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: descriptor is held by this store; successful fstatvfs initializes stats.
+        if unsafe { libc::fstatvfs(self.directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let stats = unsafe { stats.assume_init() };
+        let available = (stats.f_bavail as u128) * (stats.f_frsize as u128);
+        if u128::from(bytes) > available {
+            bail!("Not enough free space in the receive directory");
+        }
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path).context("Create receive directory")?;
@@ -83,7 +97,15 @@ pub struct PendingFile {
 }
 
 impl PendingFile {
-    pub async fn commit(mut self) -> Result<PathBuf> {
+    pub async fn commit(self) -> Result<PathBuf> {
+        self.commit_with_policy(linuxdrop_core::CollisionPolicy::Rename)
+            .await
+    }
+
+    pub async fn commit_with_policy(
+        mut self,
+        policy: linuxdrop_core::CollisionPolicy,
+    ) -> Result<PathBuf> {
         self.file.sync_all().await?;
         for index in 0..10_000 {
             let name = if index == 0 {
@@ -119,6 +141,9 @@ impl PendingFile {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::EEXIST) {
                 return Err(error.into());
+            }
+            if policy == linuxdrop_core::CollisionPolicy::Reject {
+                bail!("A file already exists with this name");
             }
         }
         bail!("Too many name collisions")
@@ -164,5 +189,24 @@ mod tests {
         }
         drop(store.create("valid.txt").unwrap());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reject_collision_preserves_original_and_cleans_partial() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("photo.jpg"), b"original").unwrap();
+        let store = ReceiveStore::open(temp.path()).unwrap();
+        let pending = store.create("photo.jpg").unwrap();
+        assert!(pending
+            .commit_with_policy(linuxdrop_core::CollisionPolicy::Reject)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read(temp.path().join("photo.jpg")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert!(store.ensure_space(0).is_ok());
+        assert!(store.ensure_space(u64::MAX).is_err());
     }
 }

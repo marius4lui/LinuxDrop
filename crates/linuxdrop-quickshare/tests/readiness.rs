@@ -14,7 +14,9 @@ async fn lan_starts_without_bluetooth_and_port_conflicts_fail() {
         ble: true,
         max_receive_bytes: 1024,
         max_files: 1,
-        upgrade_interface: None,
+        upgrade_lease: None,
+        p2p_connector: None,
+        policy: Default::default(),
     };
     let (events, mut receiver) = mpsc::channel(128);
     let commands = start(configuration(None), events).await.unwrap();

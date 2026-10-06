@@ -19,7 +19,15 @@ pub struct Config {
     pub ble: bool,
     pub max_receive_bytes: u64,
     pub max_files: usize,
-    pub upgrade_interface: Option<String>,
+    pub upgrade_lease: Option<DirectWifiLease>,
+    pub p2p_connector: Option<std::sync::Arc<dyn linuxdrop_network::P2pConnector>>,
+    pub policy: linuxdrop_core::TransferPolicy,
+}
+
+pub struct DirectWifiLease {
+    pub interface: String,
+    pub lease_id: String,
+    pub connection_uuid: String,
 }
 
 /// Starts LAN discovery, UKEY2 encrypted send/receive and BlueZ discovery.
@@ -44,23 +52,40 @@ pub async fn start(
         Some(config.name),
     );
     let bluetooth = if config.ble {
-        match tokio::time::timeout(Duration::from_secs(5), bluetooth_ready()).await {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            bluetooth_ready(config.policy.bluetooth_adapter.as_deref()),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("Bluetooth service timed out")),
         }
     } else {
-        Ok(())
+        Ok(String::new())
     };
     engine.ble_enabled = config.ble && bluetooth.is_ok();
+    rqs_lib::set_bluetooth_adapter(
+        bluetooth
+            .as_ref()
+            .ok()
+            .filter(|name| !name.is_empty())
+            .cloned(),
+    );
     let readiness = match &bluetooth {
-        Ok(()) if config.ble => "Quick Share LAN active; Bluetooth discovery enabled.".to_owned(),
-        Ok(()) => "Quick Share LAN active; Bluetooth discovery disabled in settings.".to_owned(),
+        Ok(name) if config.ble => format!("Quick Share LAN active; Bluetooth discovery on {name}."),
+        Ok(_) => "Quick Share LAN active; Bluetooth discovery disabled in settings.".to_owned(),
         Err(error) => format!(
             "Quick Share LAN active. Bluetooth unavailable: {error}. Enable a BlueZ controller and restart LinuxDrop to use Bluetooth discovery."
         ),
     };
     rqs_lib::set_receive_limits(config.max_receive_bytes, config.max_files);
-    rqs_lib::hdl::set_upgrade_interface(config.upgrade_interface);
+    rqs_lib::hdl::set_upgrade_interface(
+        config
+            .upgrade_lease
+            .as_ref()
+            .map(|lease| lease.interface.clone()),
+    );
     let mut messages = engine.message_sender.subscribe();
     let (send, _) = match engine.run().await {
         Ok(channels) => channels,
@@ -88,6 +113,7 @@ pub async fn start(
         let mut transfers = HashMap::<String, Transfer>::new();
         let mut destinations = HashMap::<String, PathBuf>::new();
         let mut pending = HashMap::<String, std::time::Instant>::new();
+        let mut receive_options = HashMap::<String, linuxdrop_core::ReceiveOptions>::new();
         let mut expiry = tokio::time::interval(Duration::from_secs(5));
         let mut visible = config.visible;
         loop {
@@ -113,6 +139,17 @@ pub async fn start(
                     Some(BackendCommand::Accept {transfer_id}) => {
                         // Consent is valid once, while the authenticated-session SAS is displayed.
                         if pending.remove(&transfer_id).is_some() { action(&engine, &transfer_id, TransferAction::ConsentAccept); }
+                    }
+                    Some(BackendCommand::AcceptWithOptions {transfer_id,options}) => {
+                        if pending.contains_key(&transfer_id) {
+                            let valid=transfers.get(&transfer_id).is_some_and(|transfer|transfer.direction=="incoming" && valid_selection(&options,transfer.files.len()));
+                            if valid {receive_options.insert(transfer_id.clone(),options);pending.remove(&transfer_id);action(&engine,&transfer_id,TransferAction::ConsentAccept);}
+                            else {pending.remove(&transfer_id);action(&engine,&transfer_id,TransferAction::ConsentDecline);}
+                        }
+                    }
+                    Some(BackendCommand::ProvidePin {transfer_id,..}) => {
+                        // A Quick Share SAS must be compared, never entered as a receiver PIN.
+                        pending.remove(&transfer_id);action(&engine,&transfer_id,TransferAction::ConsentDecline);
                     }
                     Some(BackendCommand::Reject {transfer_id}) => {
                         if pending.remove(&transfer_id).is_some() { action(&engine, &transfer_id, TransferAction::ConsentDecline); }
@@ -167,7 +204,7 @@ pub async fn start(
                                 TransferState::Cancelled => transfer.state = "cancelled".into(),
                                 TransferState::Disconnected => {transfer.state = "failed".into(); transfer.error = Some("The Quick Share connection ended before completion.".into());},
                                 TransferState::Finished => {
-                                    let result = if incoming { match destinations.get(&id) {Some(dir)=>publish_received(dir, staging.path(), &config.download_dir).await,None=>Err(anyhow::anyhow!("Missing receive staging directory"))} } else {Ok(Vec::new())};
+                                    let result = if incoming { match destinations.get(&id) {Some(dir)=>publish_received(dir, staging.path(), &config.download_dir,&transfer.files,&receive_options.remove(&id).unwrap_or_default()).await,None=>Err(anyhow::anyhow!("Missing receive staging directory"))} } else {Ok(Vec::new())};
                                     match result {Ok(paths) => {transfer.saved_paths=paths; transfer.state="completed".into(); transfer.transferred_bytes=transfer.total_bytes;}, Err(error) => {transfer.state="failed".into(); transfer.error=Some(error.to_string());}}
                                 }
                                 _ => {},
@@ -175,6 +212,7 @@ pub async fn start(
                         }
                         if matches!(transfer.state.as_str(), "completed"|"failed"|"rejected"|"cancelled") {
                             pending.remove(&id);
+                            receive_options.remove(&id);
                             if let Some(dir)=destinations.remove(&id) && dir.starts_with(staging.path()) && dir != staging.path() {let _=std::fs::remove_dir_all(dir);}
                         }
                         events.send(if is_request {BackendEvent::Incoming(transfer.clone())} else {BackendEvent::TransferUpdated(transfer.clone())}).await.ok();
@@ -204,13 +242,11 @@ pub async fn start(
     Ok(commands)
 }
 
-async fn bluetooth_ready() -> Result<()> {
-    let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
-    if !adapter.is_powered().await? {
-        bail!("Bluetooth is switched off");
-    }
-    Ok(())
+async fn bluetooth_ready(name: Option<&str>) -> Result<String> {
+    Ok(linuxdrop_network::bluetooth_adapter(name)
+        .await?
+        .name()
+        .to_owned())
 }
 
 fn action(engine: &RQS, id: &str, action: TransferAction) {
@@ -293,12 +329,40 @@ fn prepare_send(
         transfer,
     ))
 }
-async fn publish_received(dir: &Path, root: &Path, destination: &Path) -> Result<Vec<String>> {
+fn valid_selection(options: &linuxdrop_core::ReceiveOptions, count: usize) -> bool {
+    options.selected_indices.as_ref().is_none_or(|indices| {
+        !indices.is_empty()
+            && indices.iter().all(|index| *index < count)
+            && indices
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                == indices.len()
+    })
+}
+async fn publish_received(
+    dir: &Path,
+    root: &Path,
+    destination: &Path,
+    files: &[TransferFile],
+    options: &linuxdrop_core::ReceiveOptions,
+) -> Result<Vec<String>> {
     if !dir.starts_with(root) || dir == root {
         bail!("Invalid staging directory");
     }
     let mut paths = vec![];
-    let store = linuxdrop_storage::ReceiveStore::open(destination)?;
+    if !valid_selection(options, files.len()) {
+        bail!("Invalid receive selection");
+    }
+    let selected: std::collections::HashSet<_> = options
+        .selected_indices
+        .clone()
+        .unwrap_or_else(|| (0..files.len()).collect())
+        .into_iter()
+        .map(|index| files[index].name.as_str())
+        .collect();
+    let store =
+        linuxdrop_storage::ReceiveStore::open(options.directory.as_deref().unwrap_or(destination))?;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -306,10 +370,19 @@ async fn publish_received(dir: &Path, root: &Path, destination: &Path) -> Result
         }
         let filename = entry.file_name();
         let base = filename.to_str().context("Invalid filename")?;
+        if !selected.contains(base) {
+            continue;
+        }
         let mut pending = store.create(base)?;
         let mut source = tokio::fs::File::open(entry.path()).await?;
         tokio::io::copy(&mut source, &mut pending.file).await?;
-        paths.push(pending.commit().await?.to_string_lossy().into());
+        paths.push(
+            pending
+                .commit_with_policy(options.collision_policy)
+                .await?
+                .to_string_lossy()
+                .into(),
+        );
     }
     Ok(paths)
 }

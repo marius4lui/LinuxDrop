@@ -1,8 +1,56 @@
 //! Small embedded English/German catalog. No locale files or external services
 //! are needed during early native package installation.
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
+static LANGUAGE: AtomicU8 = AtomicU8::new(0);
+
+pub fn initialize() {
+    static INITIALIZED: OnceLock<()> = OnceLock::new();
+    INITIALIZED.get_or_init(|| {
+        use gio::prelude::*;
+        use gtk::gio;
+        let Ok(proxy) = gio::DBusProxy::for_bus_sync(
+            gio::BusType::Session,
+            gio::DBusProxyFlags::NONE,
+            None,
+            crate::ipc::BUS,
+            crate::ipc::PATH,
+            crate::ipc::INTERFACE,
+            gio::Cancellable::NONE,
+        ) else {
+            return;
+        };
+        let Ok(result) = proxy.call_sync(
+            "GetSettings",
+            None,
+            gio::DBusCallFlags::NONE,
+            1500,
+            gio::Cancellable::NONE,
+        ) else {
+            return;
+        };
+        let Some((text,)) = result.get::<(String,)>() else {
+            return;
+        };
+        if let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) {
+            LANGUAGE.store(
+                match settings["general"]["language"].as_str() {
+                    Some("de") => 1,
+                    Some("en") => 2,
+                    _ => 0,
+                },
+                Ordering::Relaxed,
+            );
+        }
+    });
+}
 
 pub fn german() -> bool {
+    match LANGUAGE.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
     static GERMAN: OnceLock<bool> = OnceLock::new();
     *GERMAN.get_or_init(|| {
         ["LC_ALL", "LC_MESSAGES", "LANG"]
@@ -17,6 +65,124 @@ pub fn tr(message: &str) -> String {
         return message.to_owned();
     }
     match message {
+        "Language" => "Sprache",
+        "Applies when the app next opens" => "Gilt beim nächsten Öffnen der App",
+        "When closing the window" => "Beim Schließen des Fensters",
+        "Background keeps sharing available; quit when idle never interrupts active transfers" => "Im Hintergrund bleiben Freigaben verfügbar; Beenden wartet auf laufende Übertragungen",
+        "Keep running in background" => "Im Hintergrund weiterlaufen",
+        "Quit when no transfers are active" => "Nach laufenden Übertragungen beenden",
+        "Choose a folder for each request" => "Ordner für jede Anfrage wählen",
+        "Review the destination before accepting incoming files" => "Speicherort vor der Annahme eingehender Dateien prüfen",
+        "Existing filenames" => "Vorhandene Dateinamen",
+        "Never overwrite an existing file" => "Vorhandene Dateien niemals überschreiben",
+        "Save with a new name" => "Mit neuem Namen speichern",
+        "Reject conflicting files" => "Dateien mit gleichem Namen ablehnen",
+        "Organize received files" => "Empfangene Dateien ordnen",
+        "Use separate folders for the sender or receiving date" => "Separate Ordner nach Absender oder Empfangsdatum verwenden",
+        "No subfolders" => "Keine Unterordner",
+        "By sender" => "Nach Absender",
+        "By date" => "Nach Datum",
+        "By sender and date" => "Nach Absender und Datum",
+        "Require a receiving PIN" => "Empfangs-PIN verlangen",
+        "LocalSend senders must enter your PIN before transferring" => "LocalSend-Absender müssen vor dem Übertragen deine PIN eingeben",
+        "Receiving PIN" => "Empfangs-PIN",
+        "Keep this PIN private; diagnostics never include it" => "Diese PIN geheim halten; Diagnoseberichte enthalten sie niemals",
+        "Quick Share listening port" => "Quick-Share-Port",
+        "A fixed local TCP port for nearby connections" => "Fester lokaler TCP-Port für Verbindungen zu Geräten in der Nähe",
+        "Allow AirDrop sending" => "Senden mit AirDrop erlauben",
+        "Send files through the selected AWDL adapter" => "Dateien über den ausgewählten AWDL-Adapter senden",
+        "Allow AirDrop receiving" => "Empfang mit AirDrop erlauben",
+        "Receive only after confirming each request" => "Erst nach Bestätigung jeder Anfrage empfangen",
+        "Use suitable USB adapters automatically" => "Geeignete USB-Adapter automatisch verwenden",
+        "Select available hardware after passive detection; never run an active injection test automatically" => "Verfügbare Hardware nach passiver Erkennung auswählen; aktive Injection-Tests niemals automatisch starten",
+        "Open Hardware when an adapter arrives" => "Hardware beim Anschließen eines Adapters öffnen",
+        "Show new wireless hardware without changing an active transfer" => "Neue Funkhardware anzeigen, ohne laufende Übertragungen zu verändern",
+        "Incoming requests" => "Eingehende Anfragen",
+        "Show system notifications for requests and verification codes" => "Systembenachrichtigungen für Anfragen und Bestätigungscodes anzeigen",
+        "Notification sounds" => "Benachrichtigungstöne",
+        "Use your desktop notification sound preference" => "Die Toneinstellung des Desktops verwenden",
+        "Keep notification contents private" => "Benachrichtigungsinhalte verbergen",
+        "Hide sender names and filenames in system notifications" => "Absender und Dateinamen in Systembenachrichtigungen verbergen",
+        "Bandwidth limit (Mbit/s)" => "Bandbreitenlimit (Mbit/s)",
+        "Zero allows unlimited transfer speed" => "Null erlaubt unbegrenzte Übertragungsgeschwindigkeit",
+        "Keep history for days" => "Verlauf aufbewahren (Tage)",
+        "Zero keeps records until the count limit or manual deletion" => "Null behält Einträge bis zum Anzahl-Limit oder manuellen Löschen",
+        "Controller and nearby advertising" => "Controller und Erkennung in der Nähe",
+        "Bluetooth controller" => "Bluetooth-Controller",
+        "BlueZ controller path; leave empty for automatic selection" => "BlueZ-Controllerpfad; leer lassen für automatische Auswahl",
+        "Advanced network" => "Erweiterte Netzwerkeinstellungen",
+        "Restrict discovery to the networks you choose" => "Geräteerkennung auf ausgewählte Netzwerke begrenzen",
+        "Allowed interfaces" => "Erlaubte Netzwerkschnittstellen",
+        "Comma-separated interface names; empty chooses suitable local interfaces automatically" => "Schnittstellennamen mit Komma trennen; leer wählt geeignete lokale Schnittstellen automatisch",
+        "Allow virtual and VPN interfaces" => "Virtuelle und VPN-Schnittstellen erlauben",
+        "Only enable this when you intend to announce to those networks" => "Nur aktivieren, wenn dein Gerät in diesen Netzwerken sichtbar sein soll",
+        "Advanced diagnostics" => "Erweiterte Diagnose",
+        "Operational details without file contents or private keys" => "Betriebsdetails ohne Dateiinhalte oder private Schlüssel",
+        "Logging detail" => "Protokollierungsumfang",
+        "Detailed logs can contain operational context; review before sharing" => "Detaillierte Protokolle können Betriebsinformationen enthalten; vor dem Teilen prüfen",
+        "Warnings and errors" => "Warnungen und Fehler",
+        "Normal" => "Normal",
+        "Detailed" => "Detailliert",
+        "Manage devices" => "Geräte verwalten",
+        "Favorites and labels are local preferences, not verified identities. A blocked device may return under a changed protocol identity; always review incoming requests." => "Favoriten und Namen sind lokale Einstellungen, keine geprüften Identitäten. Ein blockiertes Gerät kann mit geänderter Protokollidentität wieder erscheinen. Prüfe eingehende Anfragen immer.",
+        "No known devices yet" => "Noch keine bekannten Geräte",
+        "Discovered devices will appear here, including your saved preferences." => "Entdeckte Geräte erscheinen hier mit deinen gespeicherten Einstellungen.",
+        "Nearby now" => "Jetzt in der Nähe",
+        "Not currently nearby" => "Derzeit nicht in der Nähe",
+        "Favorite" => "Favorit",
+        "Show this device first" => "Dieses Gerät zuerst anzeigen",
+        "Local display name" => "Lokaler Anzeigename",
+        "Preferred protocol" => "Bevorzugtes Protokoll",
+        "Used when that protocol is available on this device" => "Wird verwendet, wenn das Protokoll auf diesem Gerät verfügbar ist",
+        "Block this protocol identity" => "Diese Protokollidentität blockieren",
+        "This is a local filter, not a guarantee against impersonation" => "Lokaler Filter ohne Schutzgarantie gegen gefälschte Identitäten",
+        "Forget device preferences" => "Geräteeinstellungen vergessen",
+        "The device can be discovered again" => "Das Gerät kann erneut entdeckt werden",
+        "Forget device preferences?" => "Geräteeinstellungen vergessen?",
+        "This removes the local label, favorite and block preference. It does not delete transferred files." => "Entfernt lokalen Namen, Favorit und Blockierung. Übertragene Dateien bleiben erhalten.",
+        "Forget" => "Vergessen",
+        "Review incoming files" => "Eingehende Dateien prüfen",
+        "Accept selected files" => "Ausgewählte Dateien annehmen",
+        "Codes match — accept" => "Codes gleich — annehmen",
+        "Review and accept" => "Prüfen und annehmen",
+        "This protocol accepts the complete request" => "Dieses Protokoll nimmt die gesamte Anfrage an",
+        "The complete request is transferred; only selected files are saved" => "Die gesamte Anfrage wird übertragen; nur ausgewählte Dateien werden gespeichert",
+        "Nothing is saved until you accept. Existing files are never overwritten." => "Vor deiner Annahme wird nichts gespeichert. Vorhandene Dateien werden niemals überschrieben.",
+        "Enter PIN" => "PIN eingeben",
+        "Enter the PIN shown in the receiving device's LocalSend settings. This is separate from Quick Share code verification." => "Gib die PIN aus den LocalSend-Einstellungen des empfangenden Geräts ein. Sie ist unabhängig vom Quick-Share-Codevergleich.",
+        "Continue" => "Weiter",
+        "Review your files and choose a device." => "Prüfe deine Dateien und wähle ein Gerät.",
+        "Keep this window open while sharing. Closing it or pressing Escape immediately disables the link, including copied links." => "Lass dieses Fenster während der Freigabe offen. Schließen oder Escape deaktiviert den Link sofort, auch bereits kopierte Links.",
+        "Clear transfer history?" => "Übertragungsverlauf löschen?",
+        "This removes completed transfer records. Active transfers and received files are kept." => "Entfernt abgeschlossene Verlaufseinträge. Laufende Übertragungen und empfangene Dateien bleiben erhalten.",
+        "Clear history" => "Verlauf löschen",
+        "Transfer history cleared" => "Übertragungsverlauf gelöscht",
+        "Save diagnostic report" => "Diagnosebericht speichern",
+        "Export a redacted JSON file; review it before sharing" => "Bereinigte JSON-Datei exportieren; vor dem Teilen prüfen",
+        "Show default settings" => "Standardeinstellungen anzeigen",
+        "Inspect the defaults before resetting" => "Standardwerte vor dem Zurücksetzen prüfen",
+        "Restart sharing backends" => "Freigabedienste neu starten",
+        "Unavailable during active transfers; the app stays open" => "Während laufender Übertragungen nicht verfügbar; die App bleibt offen",
+        "Restore default settings" => "Standardeinstellungen wiederherstellen",
+        "Reset preferences without deleting received files" => "Einstellungen zurücksetzen, ohne empfangene Dateien zu löschen",
+        "Recovery status" => "Wiederherstellungsstatus",
+        "Inspect adapter leases and pending cleanup" => "Adapterreservierungen und ausstehende Freigaben prüfen",
+        "Default settings" => "Standardeinstellungen",
+        "Discovery is briefly interrupted. Active transfers must finish or be cancelled first." => "Die Geräteerkennung wird kurz unterbrochen. Laufende Übertragungen müssen vorher abgeschlossen oder abgebrochen werden.",
+        "Your preferences will return to their defaults. Received files and device history are not deleted. Active transfers must finish first." => "Deine Einstellungen werden zurückgesetzt. Empfangene Dateien und der Geräteverlauf bleiben erhalten. Laufende Übertragungen müssen vorher abgeschlossen werden.",
+        "Diagnostic report saved" => "Diagnosebericht gespeichert",
+        "This active test may briefly create a monitor interface and change its channel. It never runs automatically. The daemon refuses tests on protected or busy adapters." => "Dieser aktive Test kann kurz eine Monitor-Schnittstelle erstellen und ihren Kanal ändern. Er läuft niemals automatisch. Geschützte oder belegte Adapter werden abgewiesen.",
+        "Test channel" => "Testkanal",
+        "Run active hardware test" => "Aktiven Hardwaretest starten",
+        "Run test" => "Test starten",
+        "Hardware diagnostic" => "Hardwarediagnose",
+        "Transfer progress" => "Übertragungsfortschritt",
+        "All categories" => "Alle Kategorien",
+        "Settings category" => "Einstellungskategorie",
+        "Checking file…" => "Datei wird geprüft …",
+        "Check the marked files before sending" => "Prüfe die markierten Dateien vor dem Senden",
+        "Select regular files; folders need to be imported first" => "Wähle reguläre Dateien; Ordner müssen zuerst importiert werden",
+        "You do not have permission to read this file" => "Du hast keine Leseberechtigung für diese Datei",
         "Send" => "Senden",
         "Send files" => "Dateien senden",
         "Share with nearby devices." => "Mit Geräten in deiner Nähe teilen.",

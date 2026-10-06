@@ -1,4 +1,7 @@
+mod devices;
+mod diagnostics;
 mod i18n;
+mod incoming;
 mod ipc;
 mod settings;
 mod ui;
@@ -27,6 +30,7 @@ fn main() -> glib::ExitCode {
         );
     }
     app.connect_startup(|app| {
+        i18n::initialize();
         gtk::Window::set_default_icon_name("io.github.marius4lui.LinuxDrop");
         let provider = gtk::CssProvider::new();
         provider.load_from_string(include_str!("../resources/style.css"));
@@ -41,7 +45,9 @@ fn main() -> glib::ExitCode {
         let weak = app.downgrade();
         quit.connect_activate(move |_, _| {
             if let Some(app) = weak.upgrade() {
-                app.quit();
+                for window in app.windows() {
+                    window.close();
+                }
             }
         });
         app.add_action(&quit);

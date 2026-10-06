@@ -90,11 +90,23 @@ impl ServerCertVerifier for CertificatePin {
     }
 }
 
+#[cfg(test)]
 pub fn client(protocol: &str, fingerprint: &str) -> Result<reqwest::Client> {
-    let builder = reqwest::Client::builder()
+    client_on(protocol, fingerprint, None)
+}
+
+pub fn client_on(
+    protocol: &str,
+    fingerprint: &str,
+    interface: Option<&str>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
+    if let Some(interface) = interface {
+        builder = builder.interface(interface);
+    }
     if protocol == "http" {
         return Ok(builder.build()?);
     }

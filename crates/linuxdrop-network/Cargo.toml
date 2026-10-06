@@ -1,0 +1,16 @@
+[package]
+name = "linuxdrop-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+linuxdrop-core = { path = "../linuxdrop-core" }
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+libc = "0.2"
+bluer = { version = "0.17", features = ["bluetoothd"] }
+zbus.workspace = true
+futures-util = "0.3"
+serde.workspace = true

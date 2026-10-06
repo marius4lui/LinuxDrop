@@ -1,5 +1,8 @@
 use linuxdrop_hardware::{inventory, select_radio, SelectionRequest};
-use linuxdrop_netd::{Lease, Request, Response, SOCKET_PATH};
+use linuxdrop_netd::{
+    DiagnosticReport, DiagnosticStep, Lease, LeaseKind, RecoveryIssue, Request, Response,
+    SOCKET_PATH,
+};
 use std::{
     collections::HashMap,
     io,
@@ -22,6 +25,7 @@ struct State {
     leases: HashMap<String, Lease>,
     children: HashMap<String, tokio::process::Child>,
     recovery_errors: Vec<String>,
+    attached: std::collections::HashSet<String>,
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -81,7 +85,7 @@ pub async fn run() -> io::Result<()> {
                         })
                     });
                 let unsafe_use = inventory.interfaces.iter().any(|i| {
-                    i.phy.as_deref() == Some(&lease.phy) && i.name != lease.interface && i.in_use()
+                    i.phy.as_deref() == Some(&lease.phy) && i.in_use() && if lease.kind == LeaseKind::DirectWifi { i.active_connection_uuid.as_ref() != lease.connection_uuid.as_ref() } else { i.name != lease.interface }
                 });
                 if dead || radio_gone || unsafe_use || regulatory_change {
                     stop_child(&mut state, &lease.id).await;
@@ -170,7 +174,8 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
                     message: "invalid request".into(),
                 },
                 Ok(request) => {
-                    if !authorized {
+                    if !authorized && !matches!(&request, Request::Status | Request::RecoveryStatus)
+                    {
                         match authorize(pid, uid, start).await {
                             Ok(()) => authorized = true,
                             Err(e) => {
@@ -196,6 +201,7 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
     .await;
     let mut state = state.lock().await;
     for id in owned {
+        state.attached.remove(&id);
         stop_child(&mut state, &id).await;
         if let Some(lease) = state.leases.get(&id).cloned() {
             match restore(&lease).await {
@@ -301,9 +307,269 @@ async fn apply(
     owned: &mut Vec<String>,
     shared: &Shared,
 ) -> Result<Response, String> {
+    if let Request::Diagnose { radio_id, channel } = request {
+        let acquired = Box::pin(apply(
+            Request::Acquire {
+                radio_id: radio_id.clone(),
+                channel,
+            },
+            uid,
+            owned,
+            shared,
+        ))
+        .await;
+        let mut report = DiagnosticReport {
+            radio_id,
+            steps: Vec::new(),
+            restored: true,
+            transmitted_frames: 0,
+        };
+        match acquired {
+            Ok(Response::Acquired { lease }) => {
+                report.steps.push(DiagnosticStep { name: "monitor_interface_and_channel".into(), passed: true, detail: "Dedicated temporary monitor created on an allowed channel; original interfaces unchanged".into() });
+                let raw = probe_raw_socket(&lease.interface);
+                report.steps.push(DiagnosticStep { name: "raw_socket".into(), passed: raw.is_ok(), detail: raw.err().unwrap_or_else(|| "AF_PACKET socket opened and bound; no frame transmitted, injection and AWDL remain unverified".into()) });
+                let released = Box::pin(apply(
+                    Request::Release { lease_id: lease.id },
+                    uid,
+                    owned,
+                    shared,
+                ))
+                .await;
+                report.restored = released.is_ok();
+                report.steps.push(DiagnosticStep {
+                    name: "restore".into(),
+                    passed: report.restored,
+                    detail: released.err().unwrap_or_else(|| {
+                        "Temporary interface removed and lease journal cleared".into()
+                    }),
+                });
+            }
+            Err(error) => {
+                report.restored = !shared
+                    .lock()
+                    .await
+                    .leases
+                    .values()
+                    .any(|l| l.uid == uid && !owned.contains(&l.id));
+                report.steps.push(DiagnosticStep {
+                    name: "prepare".into(),
+                    passed: false,
+                    detail: error,
+                });
+            }
+            _ => return Err("unexpected diagnostic lease response".into()),
+        }
+        return Ok(Response::Diagnostic { report });
+    }
     let mut state = shared.lock().await;
     let awdl = matches!(request, Request::AcquireAwdl { .. });
     match request {
+        Request::Diagnose { .. } => unreachable!(),
+        Request::JoinP2p {
+            lease_id,
+            peer_name,
+            pin,
+            frequency,
+        } => {
+            if !owned.contains(&lease_id) {
+                return Err("lease does not belong to this connection".into());
+            }
+            let mut lease = state
+                .leases
+                .get(&lease_id)
+                .ok_or("lease not found")?
+                .clone();
+            if lease.kind != LeaseKind::DirectWifi || lease.p2p_group.is_some() {
+                return Err("a free direct Wi-Fi lease is required".into());
+            }
+            let inv = inventory().await;
+            let radio = inv
+                .radios
+                .iter()
+                .find(|radio| radio.phy == lease.phy)
+                .ok_or("radio disappeared")?;
+            if radio.protected || radio.rfkill {
+                return Err("radio became active or blocked".into());
+            }
+            if frequency != 0
+                && !radio.channels.iter().any(|channel| {
+                    channel.frequency_mhz == frequency
+                        && !channel.disabled
+                        && !channel.no_ir
+                        && !channel.radar
+                })
+            {
+                return Err("P2P frequency is not permitted by the radio regulatory policy".into());
+            }
+            let group = linuxdrop_network::p2p::connect_wps(
+                &lease.interface,
+                &peer_name,
+                &pin,
+                frequency,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let interface = group.identity.interface.clone();
+            run_command(
+                "/usr/sbin/ip",
+                &[
+                    "link",
+                    "set",
+                    "dev",
+                    &interface,
+                    "alias",
+                    &format!("linuxdrop:p2p:{}", lease.id),
+                ],
+                5,
+            )
+            .await?;
+            lease.p2p_group = Some(group.identity.clone());
+            state.leases.insert(lease_id.clone(), lease.clone());
+            persist(&state).map_err(|e| e.to_string())?;
+            group.into_journaled();
+            match start_p2p_dhcp(&lease).await {
+                Ok((child, address)) => {
+                    state.children.insert(lease_id, child);
+                    Ok(Response::P2pJoined {
+                        interface,
+                        ipv4_address: address,
+                    })
+                }
+                Err(error) => {
+                    if restore_p2p(&lease).await.is_ok() {
+                        lease.p2p_group = None;
+                        state.leases.insert(lease_id, lease);
+                        persist(&state).map_err(|e| e.to_string())?;
+                    }
+                    Err(error)
+                }
+            }
+        }
+        Request::LeaveP2p { lease_id } => {
+            if !owned.contains(&lease_id) {
+                return Err("lease does not belong to this connection".into());
+            }
+            let mut lease = state
+                .leases
+                .get(&lease_id)
+                .ok_or("lease not found")?
+                .clone();
+            if lease.kind != LeaseKind::DirectWifi {
+                return Err("direct Wi-Fi lease required".into());
+            }
+            stop_child(&mut state, &lease_id).await;
+            restore_p2p(&lease).await?;
+            lease.p2p_group = None;
+            state.leases.insert(lease_id, lease);
+            persist(&state).map_err(|e| e.to_string())?;
+            Ok(Response::Ok)
+        }
+        Request::RecoveryStatus | Request::RetryRecovery => {
+            if matches!(request, Request::RetryRecovery) {
+                let abandoned: Vec<_> = state
+                    .leases
+                    .values()
+                    .filter(|l| l.uid == uid && !state.attached.contains(&l.id))
+                    .cloned()
+                    .collect();
+                for lease in abandoned {
+                    match restore(&lease).await {
+                        Ok(()) => {
+                            state.leases.remove(&lease.id);
+                        }
+                        Err(error) => state
+                            .recovery_errors
+                            .push(format!("{}: {error}", lease.interface)),
+                    }
+                }
+                persist(&state).map_err(|e| e.to_string())?;
+            }
+            let issues = state
+                .leases
+                .values()
+                .filter(|l| l.uid == uid && !state.attached.contains(&l.id))
+                .map(|l| {
+                    let check = if l.kind == LeaseKind::DirectWifi {
+                        Ok(())
+                    } else {
+                        verify_owned(l)
+                    };
+                    RecoveryIssue {
+                        lease_id: l.id.clone(),
+                        interface: l.interface.clone(),
+                        ownership_verified: check.is_ok(),
+                        detail: check.err().unwrap_or_else(|| {
+                            "Orphaned lease; authorized retry restores only this owned resource"
+                                .into()
+                        }),
+                    }
+                })
+                .collect();
+            Ok(Response::Recovery {
+                issues,
+                recent_errors: state
+                    .recovery_errors
+                    .iter()
+                    .rev()
+                    .take(32)
+                    .cloned()
+                    .collect(),
+            })
+        }
+        Request::Reserve { radio_id } => {
+            if owned.len() >= 2 {
+                return Err("two radio leases per client maximum".into());
+            }
+            let inv = inventory().await;
+            let radio = inv
+                .radios
+                .iter()
+                .find(|r| r.id == radio_id)
+                .ok_or("radio not found")?;
+            if radio.protected || radio.rfkill || radio.driver.is_none() {
+                return Err("radio is active, blocked, or has no driver".into());
+            }
+            if state.leases.values().any(|l| l.phy == radio.phy) {
+                return Err("radio is already leased".into());
+            }
+            if !radio.modes.iter().any(|m| m == "managed") {
+                return Err("managed station mode is unavailable".into());
+            }
+            let interface = inv
+                .interfaces
+                .iter()
+                .find(|i| i.phy.as_deref() == Some(&radio.phy) && !i.in_use())
+                .ok_or("no idle interface on selected radio")?;
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            let lease = Lease {
+                id: id.clone(),
+                uid,
+                phy: radio.phy.clone(),
+                interface: interface.name.clone(),
+                channel: 0,
+                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                    .map_err(|e| e.to_string())?
+                    .trim()
+                    .into(),
+                awdl_interface: None,
+                allowed_frequencies: vec![],
+                kind: LeaseKind::DirectWifi,
+                connection_uuid: Some(uuid::Uuid::new_v4().to_string()),
+                p2p_group: None,
+            };
+            state.leases.insert(id.clone(), lease.clone());
+            if let Err(e) = persist(&state) {
+                state.leases.remove(&id);
+                return Err(e.to_string());
+            }
+            state.attached.insert(id.clone());
+            owned.push(id);
+            Ok(Response::Acquired {
+                lease: Box::new(lease),
+            })
+        }
         Request::Status => Ok(Response::State {
             leases: state
                 .leases
@@ -363,6 +629,9 @@ async fn apply(
                     .trim()
                     .into(),
                 awdl_interface: awdl.then(|| format!("la{}", &id[..10])),
+                kind: LeaseKind::Monitor,
+                connection_uuid: None,
+                p2p_group: None,
                 allowed_frequencies: radio
                     .channels
                     .iter()
@@ -506,8 +775,11 @@ async fn apply(
                     return Err("AWDL helper exited or did not create its interface".into());
                 }
             }
+            state.attached.insert(id.clone());
             owned.push(id);
-            Ok(Response::Acquired { lease })
+            Ok(Response::Acquired {
+                lease: Box::new(lease),
+            })
         }
         Request::SetChannel { lease_id, channel } => {
             if !owned.contains(&lease_id) {
@@ -518,6 +790,9 @@ async fn apply(
                 .get(&lease_id)
                 .ok_or("lease not found")?
                 .clone();
+            if lease.kind == LeaseKind::DirectWifi {
+                return Err("direct Wi-Fi reservation cannot change monitor channels".into());
+            }
             if lease.awdl_interface.is_some() {
                 return Err("AWDL channel scheduling belongs to the link helper".into());
             }
@@ -569,6 +844,7 @@ async fn apply(
             stop_child(&mut state, &lease_id).await;
             restore(&lease).await?;
             state.leases.remove(&lease_id);
+            state.attached.remove(&lease_id);
             owned.retain(|id| id != &lease_id);
             persist(&state).map_err(|e| e.to_string())?;
             Ok(Response::Ok)
@@ -595,6 +871,12 @@ fn verify_owned(lease: &Lease) -> Result<(), String> {
     Ok(())
 }
 async fn restore(lease: &Lease) -> Result<(), String> {
+    if lease.kind == LeaseKind::DirectWifi {
+        restore_p2p(lease).await?;
+        return timeout(Duration::from_secs(10), restore_connection(lease))
+            .await
+            .map_err(|_| "direct connection recovery timed out".to_owned())?;
+    }
     let boot =
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
     if boot.trim() != lease.boot_id || !Path::new("/sys/class/net").join(&lease.interface).exists()
@@ -603,6 +885,87 @@ async fn restore(lease: &Lease) -> Result<(), String> {
     }
     verify_owned(lease)?;
     run_command("/usr/sbin/iw", &["dev", &lease.interface, "del"], 5).await
+}
+
+async fn restore_p2p(lease: &Lease) -> Result<(), String> {
+    let Some(group) = &lease.p2p_group else {
+        return Ok(());
+    };
+    let boot =
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
+    let path = Path::new("/sys/class/net").join(&group.interface);
+    if boot.trim() == lease.boot_id && path.exists() {
+        let alias = std::fs::read_to_string(path.join("ifalias")).map_err(|e| e.to_string())?;
+        if alias.trim() != format!("linuxdrop:p2p:{}", lease.id) {
+            return Err("P2P ownership marker changed; manual recovery required".into());
+        }
+        let connection = zbus::Connection::system()
+            .await
+            .map_err(|e| e.to_string())?;
+        timeout(
+            Duration::from_secs(10),
+            linuxdrop_network::p2p::disconnect(&connection, group),
+        )
+        .await
+        .map_err(|_| "P2P disconnect timed out".to_owned())?
+        .map_err(|e| e.to_string())?;
+    }
+    let _ = std::fs::remove_file(format!("/run/linuxdrop/{}.ipv4.json", lease.id));
+    Ok(())
+}
+
+async fn start_p2p_dhcp(lease: &Lease) -> Result<(tokio::process::Child, String), String> {
+    let group = lease.p2p_group.as_ref().ok_or("P2P group missing")?;
+    let result_path = format!("/run/linuxdrop/{}.ipv4.json", lease.id);
+    let _ = std::fs::remove_file(&result_path);
+    let mut child = Command::new("/usr/sbin/udhcpc")
+        .args([
+            "-f",
+            "-n",
+            "-t",
+            "3",
+            "-T",
+            "3",
+            "-i",
+            &group.interface,
+            "-s",
+            "/usr/libexec/linuxdrop/p2p-dhcp",
+        ])
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin")
+        .env("LINUXDROP_P2P_INTERFACE", &group.interface)
+        .env("LINUXDROP_LEASE_ID", &lease.id)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(bytes) = tokio::fs::read(&result_path).await {
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            let address = value["ipv4_address"]
+                .as_str()
+                .ok_or("DHCP address missing")?;
+            let parsed: std::net::Ipv4Addr = address.parse().map_err(|_| "DHCP address invalid")?;
+            if value["interface"] != group.interface
+                || parsed.is_unspecified()
+                || parsed.is_loopback()
+                || parsed.is_multicast()
+            {
+                return Err("DHCP result does not match the leased group".into());
+            }
+            return Ok((child, address.into()));
+        }
+        if !matches!(child.try_wait(), Ok(None)) {
+            return Err("P2P DHCP client stopped before receiving an address".into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("P2P DHCP timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 fn persist(state: &State) -> io::Result<()> {
     use std::io::Write;
@@ -641,6 +1004,126 @@ async fn run_command(program: &str, args: &[&str], seconds: u64) -> Result<(), S
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+fn probe_raw_socket(interface: &str) -> Result<(), String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let name = std::ffi::CString::new(interface).map_err(|e| e.to_string())?;
+    // SAFETY: valid NUL-terminated interface name, initialized sockaddr_ll and
+    // RAII-owned descriptor. Protocol zero receives/transmits no packets.
+    unsafe {
+        let index = libc::if_nametoindex(name.as_ptr());
+        if index == 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let fd = libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0);
+        if fd < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        let _socket = OwnedFd::from_raw_fd(fd);
+        let mut address: libc::sockaddr_ll = std::mem::zeroed();
+        address.sll_family = libc::AF_PACKET as u16;
+        address.sll_ifindex = index as i32;
+        if libc::bind(
+            fd,
+            &address as *const _ as *const libc::sockaddr,
+            std::mem::size_of_val(&address) as u32,
+        ) != 0
+        {
+            return Err(io::Error::last_os_error().to_string());
+        }
+    }
+    Ok(())
+}
+
+async fn restore_connection(lease: &Lease) -> Result<(), String> {
+    let Some(uuid) = &lease.connection_uuid else {
+        return Ok(());
+    };
+    let connection = zbus::Connection::system()
+        .await
+        .map_err(|e| e.to_string())?;
+    let settings = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.NetworkManager",
+        "/org/freedesktop/NetworkManager/Settings",
+        "org.freedesktop.NetworkManager.Settings",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let paths: Vec<zbus::zvariant::OwnedObjectPath> =
+        match settings.call("ListConnections", &()).await {
+            Ok(paths) => paths,
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.DBus.Error.ServiceUnknown" =>
+            {
+                return Ok(())
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+    for path in paths {
+        let profile = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.NetworkManager",
+            path,
+            "org.freedesktop.NetworkManager.Settings.Connection",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let settings: HashMap<String, HashMap<String, zbus::zvariant::OwnedValue>> = profile
+            .call("GetSettings", &())
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some(properties) = settings.get("connection") else {
+            continue;
+        };
+        let text = |key: &str| properties.get(key).and_then(|v| <&str>::try_from(v).ok());
+        if text("uuid") != Some(uuid) {
+            continue;
+        }
+        if text("id") != Some(format!("linuxdrop-{}", lease.id).as_str()) {
+            return Err(
+                "direct connection ownership marker mismatch; retained for inspection".into(),
+            );
+        }
+        let manager = zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.NetworkManager",
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.NetworkManager",
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        let active_paths: Vec<zbus::zvariant::OwnedObjectPath> = manager
+            .get_property("ActiveConnections")
+            .await
+            .map_err(|e| e.to_string())?;
+        for active_path in active_paths {
+            let active = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.NetworkManager",
+                active_path.clone(),
+                "org.freedesktop.NetworkManager.Connection.Active",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            let active_uuid: String = active
+                .get_property("Uuid")
+                .await
+                .map_err(|e| e.to_string())?;
+            if active_uuid == *uuid {
+                let _: () = manager
+                    .call("DeactivateConnection", &(active_path,))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        let _: () = profile
+            .call("Delete", &())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Passive Linux hardware inventory. No method in this crate changes radio state.
 //! `iw` is the kernel nl80211 client; it is invoked directly, never through a shell.
+pub mod details;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -54,6 +55,14 @@ pub struct Radio {
     pub serial: Option<String>,
     pub driver: Option<String>,
     pub kernel: String,
+    #[serde(default)]
+    pub driver_details: details::DriverDetails,
+    #[serde(default)]
+    pub bands: Vec<String>,
+    #[serde(default)]
+    pub combinations: Vec<details::InterfaceCombination>,
+    #[serde(default)]
+    pub evidence_profile: details::EvidenceProfile,
     pub rfkill: bool,
     pub interfaces: Vec<String>,
     pub channels: Vec<Channel>,
@@ -75,6 +84,8 @@ pub struct NetworkInterface {
     pub nm_state: Option<u32>,
     pub nm_managed: Option<bool>,
     pub active_connection: Option<String>,
+    #[serde(default)]
+    pub active_connection_uuid: Option<String>,
 }
 impl NetworkInterface {
     /// Treat NetworkManager's connecting states as use, before carrier appears.
@@ -95,6 +106,12 @@ pub struct BluetoothController {
     pub discovering: bool,
     pub supported_advertisements: Option<u8>,
     pub active_advertisements: Option<u8>,
+    #[serde(default)]
+    pub remaining_advertisements: Option<u8>,
+    #[serde(default)]
+    pub supported_includes: Vec<String>,
+    #[serde(default)]
+    pub supported_secondary_channels: Vec<String>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inventory {
@@ -434,6 +451,28 @@ pub async fn inventory() -> Inventory {
             .filter(|i| i.phy.as_ref() == Some(&phy))
             .collect();
         let protected = interfaces.iter().any(|i| i.in_use());
+        let driver = link_name(device.join("driver"));
+        let mut driver_details = details::DriverDetails::default();
+        if let Some(interface) = interfaces.first() {
+            if let Ok(text) = command("/usr/sbin/ethtool", &["-i", &interface.name]).await {
+                driver_details = details::parse_ethtool(&text);
+            }
+        }
+        let mut bands = Vec::new();
+        for (low, high, name) in [
+            (2400, 2500, "2.4 GHz"),
+            (4900, 5925, "5 GHz"),
+            (5925, 7125, "6 GHz"),
+        ] {
+            if channels
+                .iter()
+                .any(|c| (low..high).contains(&c.frequency_mhz))
+            {
+                bands.push(name.to_owned());
+            }
+        }
+        let evidence_profile = details::profile(driver.as_deref(), &bands);
+        let combinations = details::parse_combinations(&interface_combinations);
         result.radios.push(Radio {
             id,
             phy,
@@ -442,7 +481,11 @@ pub async fn inventory() -> Inventory {
             vendor_id,
             product_id,
             serial,
-            driver: link_name(device.join("driver")),
+            driver,
+            driver_details,
+            bands,
+            combinations,
+            evidence_profile,
             kernel: kernel.clone(),
             rfkill,
             interfaces: interfaces.iter().map(|i| i.name.clone()).collect(),
@@ -492,6 +535,18 @@ async fn network_manager(
                 device.get_property("ActiveConnection").await.ok();
             interface.active_connection =
                 active.filter(|p| p.as_str() != "/").map(|p| p.to_string());
+            if let Some(path) = &interface.active_connection {
+                if let Ok(active) = zbus::Proxy::new(
+                    connection,
+                    "org.freedesktop.NetworkManager",
+                    path.as_str(),
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                )
+                .await
+                {
+                    interface.active_connection_uuid = active.get_property("Uuid").await.ok();
+                }
+            }
         }
     }
     Ok(())
@@ -515,7 +570,23 @@ async fn bluez(
     for (path, interfaces) in objects {
         if let Some(adapter) = interfaces.get("org.bluez.Adapter1") {
             let advertising = interfaces.get("org.bluez.LEAdvertisingManager1");
+            let supported = advertising
+                .and_then(|p| p.get("SupportedInstances"))
+                .and_then(|v| u8::try_from(v).ok());
+            let active = advertising
+                .and_then(|p| p.get("ActiveInstances"))
+                .and_then(|v| u8::try_from(v).ok());
+            let strings = |key: &str| {
+                advertising
+                    .and_then(|p| p.get(key))
+                    .and_then(|v| v.try_clone().ok())
+                    .and_then(|v| Vec::<String>::try_from(v).ok())
+                    .unwrap_or_default()
+            };
             controllers.push(BluetoothController {
+                remaining_advertisements: supported.zip(active).map(|(s, a)| s.saturating_sub(a)),
+                supported_includes: strings("SupportedIncludes"),
+                supported_secondary_channels: strings("SupportedSecondaryChannels"),
                 id: path.to_string(),
                 name: adapter
                     .get("Alias")
@@ -611,6 +682,10 @@ mod tests {
             serial: None,
             driver: Some("ath9k_htc".into()),
             kernel: String::new(),
+            driver_details: Default::default(),
+            bands: vec![],
+            combinations: vec![],
+            evidence_profile: Default::default(),
             rfkill: false,
             interfaces: vec![],
             channels: vec![],

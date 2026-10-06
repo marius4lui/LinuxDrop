@@ -15,6 +15,9 @@ pub async fn notify(shared: Arc<Shared>, transfer: Transfer) {
     let decision = matches!(transfer.state.as_str(), "waiting" | "verification")
         && (transfer.direction == "incoming" || transfer.verification_code.is_some());
     let failure = matches!(transfer.state.as_str(), "failed" | "rejected");
+    if decision && settings["notifications"]["incoming"] != true {
+        return;
+    }
     if !decision
         && !(transfer.state == "completed" && settings["notifications"]["completed"] == true)
         && !(failure && settings["notifications"]["errors"] == true)
@@ -34,18 +37,29 @@ pub async fn notify(shared: Arc<Shared>, transfer: Transfer) {
     else {
         return;
     };
+    let german = settings["general"]["language"] == "de"
+        || (settings["general"]["language"] == "system"
+            && std::env::var("LANG").is_ok_and(|lang| lang.starts_with("de")));
+    let label = |en: &'static str, de: &'static str| if german { de } else { en };
     let summary = if decision {
         if transfer.verification_code.is_some() {
-            "Compare the sharing code"
+            label("Compare the sharing code", "Verbindungscode vergleichen")
         } else {
-            "Incoming files"
+            label("Incoming files", "Eingehende Dateien")
         }
     } else if transfer.state == "completed" {
-        "Transfer complete"
+        label("Transfer complete", "Übertragung abgeschlossen")
     } else {
-        "Transfer stopped"
+        label("Transfer stopped", "Übertragung beendet")
     };
-    let body = if let Some(code) = &transfer.verification_code {
+    let private = settings["notifications"]["private_content"] == true;
+    let body = if private {
+        label(
+            "Open LinuxDrop to view details.",
+            "Details in LinuxDrop ansehen.",
+        )
+        .into()
+    } else if let Some(code) = &transfer.verification_code {
         format!("{} · Code {}", escape(&transfer.peer_name), escape(code))
     } else {
         format!(
@@ -54,20 +68,45 @@ pub async fn notify(shared: Arc<Shared>, transfer: Transfer) {
             transfer.files.len()
         )
     };
-    let actions = if decision {
+    let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await.unwrap_or_default();
+    let actions = if !capabilities.iter().any(|s| s == "actions") {
+        vec![]
+    } else if decision && !private && settings["receive"]["ask_directory"] != true {
         vec![
             format!("accept:{}", transfer.id),
-            "Accept".into(),
+            if transfer.verification_code.is_some() {
+                label("Codes match", "Codes stimmen überein")
+            } else {
+                label("Accept", "Annehmen")
+            }
+            .into(),
             format!("reject:{}", transfer.id),
-            "Reject".into(),
+            label("Reject", "Ablehnen").into(),
         ]
     } else {
-        vec!["default".into(), "Open LinuxDrop".into()]
+        vec![
+            "default".into(),
+            label("Open LinuxDrop", "LinuxDrop öffnen").into(),
+        ]
     };
-    let hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::from([(
+    let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::from([(
         "desktop-entry",
         zbus::zvariant::Value::from("io.github.marius4lui.LinuxDrop"),
     )]);
+    hints.insert(
+        "suppress-sound",
+        zbus::zvariant::Value::from(settings["notifications"]["sound"] != true),
+    );
+    if settings["notifications"]["sound"] == true {
+        hints.insert(
+            "sound-name",
+            zbus::zvariant::Value::from(if failure {
+                "dialog-warning"
+            } else {
+                "message-new-instant"
+            }),
+        );
+    }
     let result: Result<u32, _> = proxy
         .call(
             "Notify",
@@ -177,10 +216,12 @@ pub async fn after_receive(shared: Arc<Shared>, transfer: Transfer) {
     let paths = if settings["receive"]["open_after"] == true {
         transfer.saved_paths
     } else if settings["receive"]["open_folder"] == true {
-        vec![settings["receive"]["directory"]
-            .as_str()
+        transfer
+            .saved_paths
+            .first()
+            .and_then(|p| std::path::Path::new(p).parent())
+            .map(|p| vec![p.to_string_lossy().into_owned()])
             .unwrap_or_default()
-            .into()]
     } else {
         vec![]
     };

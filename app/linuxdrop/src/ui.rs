@@ -4,6 +4,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use serde_json::Value;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 pub struct Ui {
@@ -17,12 +18,16 @@ pub struct Ui {
     connection: gtk::Label,
     peers: gtk::Box,
     file_box: gtk::Box,
+    file_scroll: gtk::ScrolledWindow,
     drop_zone: gtk::Box,
     drop_details: Vec<gtk::Widget>,
     choose_button: gtk::Button,
     files: RefCell<Vec<gio::File>>,
+    file_checks: RefCell<HashMap<String, FileCheck>>,
     selected: RefCell<Option<String>>,
     protocol: gtk::DropDown,
+    protocol_ids: RefCell<Vec<String>>,
+    selected_protocol: RefCell<String>,
     send: gtk::Button,
     share_link: gtk::Button,
     send_caption: gtk::Label,
@@ -31,8 +36,25 @@ pub struct Ui {
     pub settings_body: gtk::Box,
     busy: Cell<bool>,
     refreshing: Cell<bool>,
+    refresh_again: Cell<bool>,
+    closing: Cell<bool>,
+    allow_close: Cell<bool>,
+    pub settings_query: RefCell<String>,
+    pub settings_category: Cell<u32>,
+    pub settings_drafts: RefCell<HashMap<String, String>>,
     rendered_settings: RefCell<Value>,
     revision: RefCell<String>,
+    rendered_peers: RefCell<Value>,
+    rendered_hardware: RefCell<Value>,
+    rendered_transfer_structure: RefCell<Value>,
+    transfer_progress: RefCell<HashMap<String, (gtk::ProgressBar, gtk::Label)>>,
+}
+
+#[derive(Clone)]
+enum FileCheck {
+    Checking,
+    Ready(u64),
+    Invalid(String),
 }
 
 pub fn label(text: &str, class: &str) -> gtk::Label {
@@ -51,6 +73,21 @@ pub fn clear(container: &gtk::Box) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
+}
+
+pub fn restore_focus(container: &impl IsA<gtk::Widget>, name: &str) -> bool {
+    let widget = container.as_ref();
+    if widget.widget_name() == name {
+        return widget.grab_focus();
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if restore_focus(&current, name) {
+            return true;
+        }
+        child = current.next_sibling();
+    }
+    false
 }
 
 fn padded(vertical: i32, horizontal: i32, spacing: i32) -> gtk::Box {
@@ -104,7 +141,7 @@ pub fn protocol_name(id: &str) -> &str {
     }
 }
 
-pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio::File>) {
+pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio::File>) -> Rc<Ui> {
     let review_size = std::env::var("LINUXDROP_REVIEW_SIZE")
         .ok()
         .and_then(|size| {
@@ -131,7 +168,7 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     let status = gtk::Button::with_label(&tr("Connecting…"));
     status.add_css_class("flat");
     status.add_css_class("status-chip");
-    status.set_tooltip_text(Some("Change who can discover this device"));
+    status.set_tooltip_text(Some(&tr("Change who can discover this device")));
     header.pack_end(&status);
     toolbar.add_top_bar(&header);
     let switcher = adw::ViewSwitcherBar::builder()
@@ -139,50 +176,65 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         .reveal(true)
         .build();
     toolbar.add_bottom_bar(&switcher);
+    let top_switcher = adw::ViewSwitcher::builder()
+        .stack(&stack)
+        .policy(adw::ViewSwitcherPolicy::Wide)
+        .build();
+    let wide = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("min-width: 760sp").expect("Static breakpoint"),
+    );
+    wide.add_setter(&header, "title-widget", Some(&top_switcher.to_value()));
+    wide.add_setter(&switcher, "reveal", Some(&false.to_value()));
+    window.add_breakpoint(wide);
     toolbar.set_content(Some(&stack));
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&toolbar));
     window.set_content(Some(&toasts));
 
-    let body = padded(24, 26, 20);
+    let body = padded(16, 20, 12);
     let intro = gtk::Box::new(gtk::Orientation::Vertical, 7);
     intro.append(&label("Send files", "hero-title"));
-    intro.append(&label("Share with nearby devices.", "hero-subtitle"));
     body.append(&intro);
     let connection = label("Connecting to the sharing service…", "compact-note");
     body.append(&connection);
 
-    let drop = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let drop = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     drop.add_css_class("drop-zone");
     let icon = gtk::Image::from_icon_name("document-send-symbolic");
-    icon.set_pixel_size(34);
+    icon.set_pixel_size(28);
     icon.set_halign(gtk::Align::Center);
     icon.add_css_class("drop-icon");
     drop.append(&icon);
-    let title = label("Drop something here", "drop-title");
-    title.set_halign(gtk::Align::Center);
+    let title = label("Drop files here", "drop-title");
+    title.set_hexpand(true);
     drop.append(&title);
-    let hint = label(
-        "Photos, documents, and everything in between",
-        "compact-note",
-    );
-    hint.set_halign(gtk::Align::Center);
-    drop.append(&hint);
     let choose = gtk::Button::with_label(&tr("Choose files"));
     choose.add_css_class("pill");
     choose.set_halign(gtk::Align::Center);
     drop.append(&choose);
     body.append(&drop);
     let file_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    body.append(&file_box);
+    let file_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(120)
+        .child(&file_box)
+        .visible(false)
+        .build();
+    body.append(&file_scroll);
 
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let nearby = label("Nearby", "section-heading");
     nearby.set_hexpand(true);
     heading.append(&nearby);
+    let manage = gtk::Button::from_icon_name("system-users-symbolic");
+    manage.add_css_class("flat");
+    manage.set_tooltip_text(Some(&tr("Manage devices")));
+    heading.append(&manage);
     let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh.add_css_class("flat");
-    refresh.set_tooltip_text(Some("Refresh nearby devices"));
+    refresh.set_tooltip_text(Some(&tr("Refresh nearby devices")));
     heading.append(&refresh);
     body.append(&heading);
     let peers = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -194,7 +246,8 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     let protocol = gtk::DropDown::from_strings(&[&tr("Automatic")]);
     protocol.set_hexpand(true);
-    protocol.set_tooltip_text(Some("Transfer protocol"));
+    protocol.set_tooltip_text(Some(&tr("Transfer protocol")));
+    protocol.update_property(&[gtk::accessible::Property::Label(&tr("Transfer protocol"))]);
     actions.append(&protocol);
     let send = gtk::Button::with_label(&tr("Send files"));
     send.add_css_class("suggested-action");
@@ -211,7 +264,13 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     send_bar.set_margin_bottom(14);
     let send_page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     send_page.append(&page(&body));
-    send_page.append(&send_bar);
+    send_page.append(
+        &adw::Clamp::builder()
+            .maximum_size(760)
+            .tightening_threshold(560)
+            .child(&send_bar)
+            .build(),
+    );
     stack.add_titled_with_icon(
         &send_page,
         Some("send"),
@@ -270,12 +329,16 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         connection,
         peers,
         file_box,
+        file_scroll,
         drop_zone: drop.clone(),
-        drop_details: vec![icon.upcast(), title.upcast(), hint.upcast()],
+        drop_details: vec![icon.upcast(), title.upcast()],
         choose_button: choose.clone(),
         files: RefCell::new(Vec::new()),
+        file_checks: RefCell::new(HashMap::new()),
         selected: RefCell::new(None),
         protocol,
+        protocol_ids: RefCell::new(vec!["auto".to_owned()]),
+        selected_protocol: RefCell::new("auto".to_owned()),
         send,
         share_link,
         send_caption,
@@ -284,10 +347,67 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         settings_body,
         busy: Cell::new(false),
         refreshing: Cell::new(false),
+        refresh_again: Cell::new(false),
+        closing: Cell::new(false),
+        allow_close: Cell::new(false),
+        settings_query: RefCell::new(String::new()),
+        settings_category: Cell::new(0),
+        settings_drafts: RefCell::new(HashMap::new()),
         rendered_settings: RefCell::new(Value::Null),
         revision: RefCell::new(String::new()),
+        rendered_peers: RefCell::new(Value::Null),
+        rendered_hardware: RefCell::new(Value::Null),
+        rendered_transfer_structure: RefCell::new(Value::Null),
+        transfer_progress: RefCell::new(HashMap::new()),
     });
 
+    let weak = Rc::downgrade(&ui);
+    ui.window.connect_close_request(move |_| {
+        let Some(ui) = weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if ui.allow_close.get()
+            || ui.settings.borrow()["general"]["close_behavior"].as_str() != Some("quit_when_idle")
+        {
+            return glib::Propagation::Proceed;
+        }
+        if ui.closing.replace(true) {
+            return glib::Propagation::Stop;
+        }
+        let Some(proxy) = ui.proxy.borrow().clone() else {
+            ui.closing.set(false);
+            ui.toast("The sharing service is not connected yet");
+            return glib::Propagation::Stop;
+        };
+        glib::MainContext::default().spawn_local(async move {
+            match ipc::call(&proxy, "StopWhenIdle", Some(().to_variant())).await {
+                Ok(_) => {
+                    ui.allow_close.set(true);
+                    ui.window.close();
+                }
+                Err(error) => {
+                    ui.closing.set(false);
+                    ui.toast(&error);
+                }
+            }
+        });
+        glib::Propagation::Stop
+    });
+    let weak = Rc::downgrade(&ui);
+    manage.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.manage_devices();
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    ui.protocol.connect_selected_notify(move |dropdown| {
+        if let Some(ui) = weak.upgrade() {
+            if let Some(id) = ui.protocol_ids.borrow().get(dropdown.selected() as usize) {
+                *ui.selected_protocol.borrow_mut() = id.clone();
+            }
+            ui.update_send();
+        }
+    });
     let weak = Rc::downgrade(&ui);
     choose.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
@@ -386,25 +506,7 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     } else {
         ui.window.present();
     }
-    let owned = ui.clone();
-    glib::MainContext::default().spawn_local(async move {
-        match ipc::connect().await {
-            Ok(proxy) => {
-                let weak = Rc::downgrade(&owned);
-                proxy.connect_local("g-signal", false, move |values| {
-                    if values[2].get::<String>().ok().as_deref() == Some("Changed") {
-                        if let Some(ui) = weak.upgrade() {
-                            ui.refresh();
-                        }
-                    }
-                    None
-                });
-                *owned.proxy.borrow_mut() = Some(proxy);
-                owned.refresh();
-            }
-            Err(error) => owned.service_error(&error),
-        }
-    });
+    ui.refresh();
     // Keep the state with the window lifetime. Reconnect catches service activation/restarts.
     let owned = ui.clone();
     glib::timeout_add_seconds_local(3, move || {
@@ -418,7 +520,12 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         owned.refresh();
         glib::ControlFlow::Continue
     });
+    ui
 }
+
+#[cfg(test)]
+#[path = "native_regressions.rs"]
+mod native_regressions;
 
 impl Ui {
     fn notch_drop(self: &Rc<Self>) {
@@ -474,16 +581,16 @@ impl Ui {
             let count = ui.files.borrow().len();
             heading_copy.set_label(&if german() {
                 format!(
-                    "{count} {} bereit",
+                    "{count} {} hinzugefügt",
                     if count == 1 { "Datei" } else { "Dateien" }
                 )
             } else {
                 format!(
-                    "{count} {} ready",
+                    "{count} {} added",
                     if count == 1 { "file" } else { "files" }
                 )
             });
-            detail_copy.set_label(&tr("Your files are ready. Choose who to share with."));
+            detail_copy.set_label(&tr("Review your files and choose a device."));
             next_copy.set_label(&tr("Choose device"));
             true
         });
@@ -527,9 +634,34 @@ impl Ui {
         self.connection.add_css_class("service-error");
         self.status.set_label(&tr("Offline"));
         self.send.set_sensitive(false);
+        self.share_link.set_sensitive(false);
+    }
+    fn install_proxy(self: &Rc<Self>, proxy: &gio::DBusProxy) {
+        // Every new proxy subscribes before its first snapshot, including reconnects.
+        let weak = Rc::downgrade(self);
+        proxy.connect_local("g-signal", false, move |values| {
+            if values[2].get::<String>().ok().as_deref() == Some("Changed") {
+                if let Some(ui) = weak.upgrade() {
+                    ui.refresh();
+                }
+            }
+            None
+        });
+        let weak = Rc::downgrade(self);
+        proxy.connect_notify_local(Some("g-name-owner"), move |proxy, _| {
+            if let Some(ui) = weak.upgrade() {
+                ui.revision.borrow_mut().clear();
+                if proxy.g_name_owner().is_none() {
+                    ui.service_error("Service owner disappeared");
+                }
+                ui.refresh();
+            }
+        });
+        *self.proxy.borrow_mut() = Some(proxy.clone());
     }
     pub fn refresh(self: &Rc<Self>) {
         if self.refreshing.replace(true) {
+            self.refresh_again.set(true);
             return;
         }
         let ui = self.clone();
@@ -537,7 +669,10 @@ impl Ui {
             let existing = ui.proxy.borrow().clone();
             let proxy = match existing {
                 Some(proxy) => Ok(proxy),
-                None => ipc::connect().await,
+                None => match ipc::connect().await {
+                    Ok(proxy) => { ui.install_proxy(&proxy); Ok(proxy) }
+                    Err(error) => Err(error),
+                },
             };
             let result = match proxy {
                 Ok(proxy) => {
@@ -568,9 +703,31 @@ impl Ui {
                         .set_label(&tr(if visible { "● Visible" } else { "○ Hidden" }));
                     if *ui.revision.borrow() != revision {
                         *ui.revision.borrow_mut() = revision;
-                        ui.render_peers();
-                        ui.render_transfers();
-                        ui.render_hardware();
+                        let peers = ui.snapshot.borrow()["peers"].clone();
+                        if *ui.rendered_peers.borrow() != peers {
+                            *ui.rendered_peers.borrow_mut() = peers;
+                            ui.render_peers();
+                        }
+                        let mut structure = ui.snapshot.borrow()["transfers"].clone();
+                        if let Some(transfers) = structure.as_array_mut() {
+                            for transfer in transfers {
+                                if let Some(object) = transfer.as_object_mut() { object.remove("transferred_bytes"); }
+                                if let Some(files) = transfer["files"].as_array_mut() {
+                                    for file in files { if let Some(object) = file.as_object_mut() { object.remove("transferred"); } }
+                                }
+                            }
+                        }
+                        if *ui.rendered_transfer_structure.borrow() != structure {
+                            *ui.rendered_transfer_structure.borrow_mut() = structure;
+                            ui.render_transfers();
+                        } else { ui.update_transfer_progress(); }
+                        let mut hardware = ui.snapshot.borrow()["hardware"].clone();
+                        if let Some(object) = hardware.as_object_mut() { object.remove("observed_unix"); }
+                        let hardware_view = serde_json::json!({"hardware":hardware,"backends":ui.snapshot.borrow()["backends"]});
+                        if *ui.rendered_hardware.borrow() != hardware_view {
+                            *ui.rendered_hardware.borrow_mut() = hardware_view;
+                            ui.render_hardware();
+                        }
                     }
                     if *ui.rendered_settings.borrow() != settings_value {
                         *ui.rendered_settings.borrow_mut() = settings_value.clone();
@@ -590,6 +747,11 @@ impl Ui {
                     ui.service_error(&error);
                     *ui.proxy.borrow_mut() = None;
                 }
+            }
+            if ui.refresh_again.replace(false) {
+                // An event arrived while reading the snapshot: resync once, without
+                // guessing whether its revision is already represented in the reply.
+                glib::idle_add_local_once(move || ui.refresh());
             }
         });
     }
@@ -625,28 +787,66 @@ impl Ui {
         });
     }
     pub fn add_files(self: &Rc<Self>, files: Vec<gio::File>) {
-        let mut invalid = 0;
+        let mut added = Vec::new();
         {
             let mut current = self.files.borrow_mut();
             for file in files {
-                if file.path().is_none() {
-                    invalid += 1;
-                    continue;
-                }
                 if !current.iter().any(|f| f == &file) {
-                    current.push(file);
+                    self.file_checks
+                        .borrow_mut()
+                        .insert(file.uri().to_string(), FileCheck::Checking);
+                    current.push(file.clone());
+                    added.push(file);
                 }
             }
         }
-        if invalid > 0 {
-            self.toast("Remote files must be downloaded locally before sharing");
-        }
         self.render_files();
         self.update_send();
+        for file in added {
+            let ui = self.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let result = if file.path().is_none() {
+                    FileCheck::Invalid(tr("Remote files must be downloaded locally before sharing"))
+                } else {
+                    match file
+                        .query_info_future(
+                            "standard::type,standard::size,access::can-read",
+                            gio::FileQueryInfoFlags::NONE,
+                            glib::Priority::DEFAULT,
+                        )
+                        .await
+                    {
+                        Ok(info) if info.file_type() != gio::FileType::Regular => {
+                            FileCheck::Invalid(tr(
+                                "Select regular files; folders need to be imported first",
+                            ))
+                        }
+                        Ok(info)
+                            if info.has_attribute("access::can-read")
+                                && !info.boolean("access::can-read") =>
+                        {
+                            FileCheck::Invalid(tr("You do not have permission to read this file"))
+                        }
+                        Ok(info) => FileCheck::Ready(info.size().max(0) as u64),
+                        Err(error) => FileCheck::Invalid(error.to_string()),
+                    }
+                };
+                if ui.files.borrow().iter().any(|current| current == &file) {
+                    ui.file_checks
+                        .borrow_mut()
+                        .insert(file.uri().to_string(), result);
+                    ui.render_files();
+                    ui.update_send();
+                }
+            });
+        }
     }
     fn render_files(self: &Rc<Self>) {
+        let focus = gtk::prelude::GtkWindowExt::focus(&self.window)
+            .map(|widget| widget.widget_name().to_string());
         clear(&self.file_box);
         let empty = self.files.borrow().is_empty();
+        self.file_scroll.set_visible(!empty);
         for widget in &self.drop_details {
             widget.set_visible(empty);
         }
@@ -672,15 +872,34 @@ impl Ui {
             title.set_hexpand(true);
             title.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
             title.set_wrap(false);
-            row.append(&title);
+            let details = gtk::Box::new(gtk::Orientation::Vertical, 4);
+            details.set_hexpand(true);
+            details.append(&title);
+            match self.file_checks.borrow().get(file.uri().as_str()) {
+                Some(FileCheck::Ready(size)) => {
+                    details.append(&label(&bytes(*size), "compact-note"))
+                }
+                Some(FileCheck::Invalid(reason)) => {
+                    details.append(&label(reason, "error"));
+                    row.add_css_class("invalid-file");
+                }
+                _ => details.append(&label("Checking file…", "compact-note")),
+            }
+            row.append(&details);
             let remove = gtk::Button::from_icon_name("window-close-symbolic");
             remove.add_css_class("flat");
-            remove.set_tooltip_text(Some("Remove file"));
+            remove.set_tooltip_text(Some(&tr("Remove file")));
+            remove.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{}: {name}",
+                tr("Remove file")
+            ))]);
+            remove.set_widget_name(&format!("remove:{}", file.uri()));
             let weak = Rc::downgrade(self);
             let file = file.clone();
             remove.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     ui.files.borrow_mut().retain(|f| f != &file);
+                    ui.file_checks.borrow_mut().remove(file.uri().as_str());
                     ui.render_files();
                     ui.update_send();
                 }
@@ -688,25 +907,57 @@ impl Ui {
             row.append(&remove);
             self.file_box.append(&row);
         }
+        if let Some(focus) = focus {
+            restore_focus(&self.file_box, &focus);
+        }
     }
     fn update_send(&self) {
         let count = self.files.borrow().len();
+        let ready = self.files.borrow().iter().all(|file| {
+            matches!(
+                self.file_checks.borrow().get(file.uri().as_str()),
+                Some(FileCheck::Ready(_))
+            )
+        });
+        let connected = self
+            .proxy
+            .borrow()
+            .as_ref()
+            .is_some_and(|proxy| proxy.g_name_owner().is_some());
         let selected = self.selected.borrow().clone();
         let peers = array(&self.snapshot.borrow(), "peers");
         let peer = peers.iter().find(|p| {
-            Some(text(p, "id").to_owned()) == selected && p["available"].as_bool().unwrap_or(true)
+            Some(text(p, "id").to_owned()) == selected
+                && p["available"].as_bool().unwrap_or(true)
+                && !p["blocked"].as_bool().unwrap_or(false)
         });
+        let chosen = self.selected_protocol.borrow().clone();
+        let protocol_available = chosen == "auto"
+            || peer.is_some_and(|peer| {
+                array(peer, "protocols")
+                    .iter()
+                    .any(|id| id.as_str() == Some(&chosen))
+            });
         self.send.set_sensitive(
-            count > 0 && peer.is_some() && self.proxy.borrow().is_some() && !self.busy.get(),
+            count > 0
+                && ready
+                && peer.is_some()
+                && protocol_available
+                && connected
+                && !self.busy.get(),
         );
         self.share_link
-            .set_sensitive(count > 0 && self.proxy.borrow().is_some() && !self.busy.get());
+            .set_sensitive(count > 0 && ready && connected && !self.busy.get());
         self.send.set_label(&tr(if self.busy.get() {
             "Preparing…"
         } else {
             "Send files"
         }));
         self.send_caption.set_label(&match (count, peer) {
+            (count, _) if count > 0 && !ready => tr("Check the marked files before sending"),
+            (_, Some(_)) if !protocol_available => {
+                tr("The selected protocol is unavailable; choose another protocol")
+            }
             (0, Some(peer)) => {
                 if german() {
                     format!("Dateien für {} hinzufügen", text(peer, "name"))
@@ -736,8 +987,65 @@ impl Ui {
         });
     }
     fn render_peers(self: &Rc<Self>) {
+        let focus = gtk::prelude::GtkWindowExt::focus(&self.window)
+            .map(|widget| widget.widget_name().to_string());
         clear(&self.peers);
-        let peers = array(&self.snapshot.borrow(), "peers");
+        let mut peers = array(&self.snapshot.borrow(), "peers");
+        peers.sort_by_key(|peer| {
+            (
+                !peer["favorite"].as_bool().unwrap_or(false),
+                text(peer, "display_name").to_lowercase(),
+                text(peer, "name").to_lowercase(),
+            )
+        });
+        let selected = self.selected.borrow().clone();
+        let mut ids = vec!["auto".to_owned()];
+        if let Some(peer) = peers
+            .iter()
+            .find(|peer| Some(text(peer, "id")) == selected.as_deref())
+        {
+            ids.extend(
+                array(peer, "protocols")
+                    .iter()
+                    .filter_map(|id| id.as_str().map(str::to_owned)),
+            );
+        }
+        let chosen = self.selected_protocol.borrow().clone();
+        let missing = !ids.contains(&chosen);
+        if missing {
+            ids.push(chosen.clone());
+        }
+        let names: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                if id == "auto" {
+                    tr("Automatic")
+                } else if missing && id == &chosen {
+                    format!("{} · {}", protocol_name(id), tr("Unavailable"))
+                } else {
+                    protocol_name(id).to_owned()
+                }
+            })
+            .collect();
+        let old_names: Vec<String> = self
+            .protocol
+            .model()
+            .and_downcast::<gtk::StringList>()
+            .map(|model| {
+                (0..model.n_items())
+                    .filter_map(|index| model.string(index).map(|value| value.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if *self.protocol_ids.borrow() != ids || old_names != names {
+            *self.protocol_ids.borrow_mut() = ids.clone();
+            self.protocol.set_model(Some(&gtk::StringList::new(
+                &names.iter().map(String::as_str).collect::<Vec<_>>(),
+            )));
+        }
+        self.protocol
+            .set_selected(ids.iter().position(|id| id == &chosen).unwrap_or(0) as u32);
+        *self.selected_protocol.borrow_mut() = chosen;
         if peers.is_empty() {
             let empty = padded(12, 8, 7);
             empty.append(&label("No devices nearby yet", "section-heading"));
@@ -746,7 +1054,13 @@ impl Ui {
         }
         for peer in peers {
             let id = text(&peer, "id").to_owned();
-            let button = gtk::Button::new();
+            let button = gtk::ToggleButton::new();
+            button.set_widget_name(&format!("peer:{id}"));
+            button.set_active(self.selected.borrow().as_ref() == Some(&id));
+            button.set_sensitive(
+                peer["available"].as_bool().unwrap_or(true)
+                    && !peer["blocked"].as_bool().unwrap_or(false),
+            );
             button.add_css_class("peer-card");
             if self.selected.borrow().as_ref() == Some(&id) {
                 button.add_css_class("selected");
@@ -761,7 +1075,14 @@ impl Ui {
             row.append(&icon);
             let details = gtk::Box::new(gtk::Orientation::Vertical, 4);
             details.set_hexpand(true);
-            details.append(&label(text(&peer, "name"), "heading"));
+            let display_name = peer["display_name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| text(&peer, "name"));
+            details.append(&label(display_name, "heading"));
+            if peer["favorite"].as_bool().unwrap_or(false) {
+                row.prepend(&gtk::Image::from_icon_name("starred-symbolic"));
+            }
             let protocols: Vec<String> = array(&peer, "protocols")
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| protocol_name(s).to_owned()))
@@ -781,20 +1102,19 @@ impl Ui {
             button.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
                     *ui.selected.borrow_mut() = Some(id.clone());
-                    let mut names = vec![tr("Automatic")];
-                    names.extend(
-                        array(&peer_copy, "protocols")
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| protocol_name(s).to_owned())),
-                    );
-                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
-                    ui.protocol.set_model(Some(&gtk::StringList::new(&names)));
-                    ui.protocol.set_selected(0);
+                    *ui.selected_protocol.borrow_mut() = peer_copy["preferred_protocol"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("auto")
+                        .to_owned();
                     ui.render_peers();
                     ui.update_send();
                 }
             });
             self.peers.append(&button);
+        }
+        if let Some(focus) = focus {
+            restore_focus(&self.peers, &focus);
         }
     }
     fn start_send(self: &Rc<Self>) {
@@ -813,21 +1133,13 @@ impl Ui {
             .iter()
             .filter_map(|f| f.path().map(|p| p.to_string_lossy().into_owned()))
             .collect();
-        let chosen = self.protocol.selected();
-        let protocol = if chosen == 0 {
-            "auto".to_owned()
-        } else {
-            array(&self.snapshot.borrow(), "peers")
-                .iter()
-                .find(|p| text(p, "id") == peer)
-                .and_then(|p| {
-                    array(p, "protocols")
-                        .get(chosen as usize - 1)
-                        .and_then(|v| v.as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| "auto".into())
-        };
+        let protocol = self.selected_protocol.borrow().clone();
+        let submitted: Vec<String> = self
+            .files
+            .borrow()
+            .iter()
+            .map(|file| file.uri().to_string())
+            .collect();
         self.update_send();
         let ui = self.clone();
         glib::MainContext::default().spawn_local(async move {
@@ -846,7 +1158,14 @@ impl Ui {
             ui.busy.set(false);
             match result {
                 Ok(_) => {
-                    ui.files.borrow_mut().clear();
+                    // A user can add another batch while preparation is in flight.
+                    // Only consume the exact identities submitted by this send.
+                    ui.files
+                        .borrow_mut()
+                        .retain(|file| !submitted.contains(&file.uri().to_string()));
+                    ui.file_checks
+                        .borrow_mut()
+                        .retain(|uri, _| !submitted.contains(uri));
                     ui.render_files();
                     ui.stack.set_visible_child_name("transfers");
                     ui.refresh();
@@ -942,6 +1261,7 @@ impl Ui {
         content.append(&actions);
         let dialog = adw::AlertDialog::builder()
             .heading(tr("Share with a link"))
+            .body(tr("Keep this window open while sharing. Closing it or pressing Escape immediately disables the link, including copied links."))
             .extra_child(&content)
             .build();
         dialog.add_responses(&[("stop", &tr("Stop sharing"))]);
@@ -958,7 +1278,10 @@ impl Ui {
         dialog.present(Some(&self.window));
     }
     fn render_transfers(self: &Rc<Self>) {
+        let focus = gtk::prelude::GtkWindowExt::focus(&self.window)
+            .map(|widget| widget.widget_name().to_string());
         clear(&self.transfers);
+        self.transfer_progress.borrow_mut().clear();
         let transfers = array(&self.snapshot.borrow(), "transfers");
         if transfers.is_empty() {
             let empty = adw::StatusPage::builder()
@@ -989,6 +1312,7 @@ impl Ui {
                 "waiting" if incoming => "Wants to share with you",
                 "waiting" => "Waiting for the other device",
                 "verification" => "Compare this code on both devices",
+                "pin_required" => "Enter the receiving device's PIN",
                 "transferring" => "Transferring",
                 "completed" => "Completed",
                 "cancelled" => "Cancelled",
@@ -996,14 +1320,25 @@ impl Ui {
                 "failed" => "Transfer failed",
                 _ => state,
             };
+            card.append(&label(status, "transfer-state"));
             card.append(&label(
                 &format!(
                     "{} · {}",
                     protocol_name(text(transfer, "protocol")),
-                    tr(status)
+                    bytes(total)
                 ),
                 "protocol-badge",
             ));
+            if incoming && state == "waiting" {
+                let destination = self.settings.borrow()["receive"]["directory"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned();
+                card.append(&label(
+                    &format!("{}: {destination}", tr("Save files to")),
+                    "compact-note",
+                ));
+            }
             if let Some(code) = transfer["verification_code"]
                 .as_str()
                 .filter(|_| state == "verification")
@@ -1020,14 +1355,23 @@ impl Ui {
                     0.0
                 });
                 card.append(&progress);
-                card.append(&label(
+                progress.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "{}: {}",
+                    tr("Transfer progress"),
+                    text(transfer, "peer_name")
+                ))]);
+                let description = label(
                     &if german() {
                         format!("{} von {}", bytes(done), bytes(total))
                     } else {
                         format!("{} of {}", bytes(done), bytes(total))
                     },
                     "compact-note",
-                ));
+                );
+                card.append(&description);
+                self.transfer_progress
+                    .borrow_mut()
+                    .insert(text(transfer, "id").to_owned(), (progress, description));
             }
             if let Some(error) = transfer["error"].as_str() {
                 let message = label(error, "error");
@@ -1037,7 +1381,25 @@ impl Ui {
             let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             actions.set_halign(gtk::Align::End);
             let pending = (state == "waiting" && incoming) || state == "verification";
-            if pending {
+            if state == "pin_required" {
+                let button = gtk::Button::with_label(&tr("Enter PIN"));
+                button.add_css_class("suggested-action");
+                let weak = Rc::downgrade(self);
+                let request = transfer.clone();
+                button.connect_clicked(move |_| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.provide_pin(&request);
+                    }
+                });
+                actions.append(&button);
+                self.transfer_button(
+                    &actions,
+                    "Cancel",
+                    "CancelTransfer",
+                    text(transfer, "id"),
+                    false,
+                );
+            } else if pending {
                 self.transfer_button(
                     &actions,
                     "Decline",
@@ -1045,17 +1407,30 @@ impl Ui {
                     text(transfer, "id"),
                     false,
                 );
-                self.transfer_button(
-                    &actions,
-                    if state == "verification" {
-                        "Codes match"
-                    } else {
-                        "Accept"
-                    },
-                    "AcceptTransfer",
-                    text(transfer, "id"),
-                    true,
-                );
+                if state == "verification" && !incoming {
+                    self.transfer_button(
+                        &actions,
+                        "Codes match",
+                        "AcceptTransfer",
+                        text(transfer, "id"),
+                        true,
+                    );
+                } else {
+                    let button = gtk::Button::with_label(&tr("Review and accept"));
+                    button.add_css_class("suggested-action");
+                    button.set_widget_name(&format!(
+                        "transfer:{}:AcceptTransfer",
+                        text(transfer, "id")
+                    ));
+                    let weak = Rc::downgrade(self);
+                    let request = transfer.clone();
+                    button.connect_clicked(move |_| {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.accept_request(&request);
+                        }
+                    });
+                    actions.append(&button);
+                }
             } else if !matches!(state, "completed" | "failed" | "cancelled" | "rejected") {
                 self.transfer_button(
                     &actions,
@@ -1085,6 +1460,31 @@ impl Ui {
             card.append(&actions);
             self.transfers.append(&card);
         }
+        if let Some(focus) = focus {
+            restore_focus(&self.transfers, &focus);
+        }
+    }
+    fn update_transfer_progress(&self) {
+        for transfer in array(&self.snapshot.borrow(), "transfers") {
+            if let Some((progress, description)) =
+                self.transfer_progress.borrow().get(text(&transfer, "id"))
+            {
+                let total = transfer["total_bytes"].as_u64().unwrap_or(0);
+                let done = transfer["transferred_bytes"].as_u64().unwrap_or(0);
+                progress.set_fraction(if text(&transfer, "state") == "completed" {
+                    1.0
+                } else if total > 0 {
+                    (done as f64 / total as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                });
+                description.set_label(&if german() {
+                    format!("{} von {}", bytes(done), bytes(total))
+                } else {
+                    format!("{} of {}", bytes(done), bytes(total))
+                });
+            }
+        }
     }
     fn transfer_button(
         self: &Rc<Self>,
@@ -1095,6 +1495,7 @@ impl Ui {
         primary: bool,
     ) {
         let button = gtk::Button::with_label(&tr(title));
+        button.set_widget_name(&format!("transfer:{id}:{method}"));
         if primary {
             button.add_css_class("suggested-action");
         }
@@ -1170,6 +1571,11 @@ impl Ui {
                         let title = match key.as_str() {
                             "driver" => "Driver",
                             "bus" => "Connection type",
+                            "vendor_id" => "Vendor ID",
+                            "product_id" => "Product ID",
+                            "serial" => "Serial number",
+                            "kernel" => "Kernel version",
+                            "bands" => "Wireless bands",
                             "state" => "State",
                             "default_route" => "Internet connection",
                             "active_connection" => "Network name",
@@ -1210,6 +1616,77 @@ impl Ui {
                         row.add_row(&detail);
                     }
                 }
+                if key == "radios" {
+                    let test = adw::ActionRow::builder()
+                        .title(tr("Run active hardware test"))
+                        .subtitle(tr(
+                            "An explicit test; protected or busy adapters are refused",
+                        ))
+                        .build();
+                    let button = gtk::Button::from_icon_name("system-run-symbolic");
+                    button.set_valign(gtk::Align::Center);
+                    button.set_tooltip_text(Some(&tr("Run active hardware test")));
+                    button.set_sensitive(
+                        !item["protected"].as_bool().unwrap_or(false)
+                            && !item["rfkill"].as_bool().unwrap_or(false),
+                    );
+                    let id = text(&item, "id").to_owned();
+                    let weak = Rc::downgrade(self);
+                    button.connect_clicked(move |_| {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.run_hardware_diagnostic(&id);
+                        }
+                    });
+                    test.add_suffix(&button);
+                    test.set_activatable_widget(Some(&button));
+                    row.add_row(&test);
+                }
+                if matches!(key, "radios" | "bluetooth") {
+                    let prefer = adw::ActionRow::builder()
+                        .title(tr("Use as preferred adapter"))
+                        .subtitle(tr(
+                            "Selection still respects availability and connection protection",
+                        ))
+                        .build();
+                    let button = gtk::Button::from_icon_name("emblem-favorite-symbolic");
+                    button.set_valign(gtk::Align::Center);
+                    button.set_tooltip_text(Some(&tr("Use as preferred adapter")));
+                    let id = text(&item, "id").to_owned();
+                    let kind = key.to_owned();
+                    let weak = Rc::downgrade(self);
+                    button.connect_clicked(move |_| {
+                        if let Some(ui) = weak.upgrade() {
+                            let patch = if kind == "radios" {
+                                serde_json::json!({"hardware":{"preferred_adapter":id}})
+                            } else {
+                                serde_json::json!({"bluetooth":{"adapter":id}})
+                            };
+                            ui.mutate("UpdateSettings", (patch.to_string(),).to_variant());
+                        }
+                    });
+                    prefer.add_suffix(&button);
+                    prefer.set_activatable_widget(Some(&button));
+                    row.add_row(&prefer);
+                }
+                let details = adw::ActionRow::builder()
+                    .title(tr("Full adapter details"))
+                    .subtitle(tr(
+                        "Capabilities, evidence sources, channel limits and driver information",
+                    ))
+                    .build();
+                let button = gtk::Button::from_icon_name("go-next-symbolic");
+                button.set_valign(gtk::Align::Center);
+                button.set_tooltip_text(Some(&tr("Full adapter details")));
+                let weak = Rc::downgrade(self);
+                let report = item.clone();
+                button.connect_clicked(move |_| {
+                    if let Some(ui) = weak.upgrade() {
+                        crate::diagnostics::report_dialog(&ui, "Full adapter details", &report);
+                    }
+                });
+                details.add_suffix(&button);
+                details.set_activatable_widget(Some(&button));
+                row.add_row(&details);
                 group.add(&row);
             }
             self.hardware.append(&group);

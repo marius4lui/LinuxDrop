@@ -1,6 +1,31 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionPolicy {
+    #[default]
+    Rename,
+    Reject,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReceiveOptions {
+    pub directory: Option<PathBuf>,
+    pub selected_indices: Option<Vec<usize>>,
+    pub collision_policy: CollisionPolicy,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TransferPolicy {
+    pub allowed_interfaces: Vec<String>,
+    pub allow_virtual_interfaces: bool,
+    pub bandwidth_bytes_per_second: Option<u64>,
+    pub bluetooth_adapter: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub id: String,
@@ -67,6 +92,14 @@ pub enum BackendCommand {
     },
     Accept {
         transfer_id: String,
+    },
+    AcceptWithOptions {
+        transfer_id: String,
+        options: ReceiveOptions,
+    },
+    ProvidePin {
+        transfer_id: String,
+        pin: String,
     },
     Reject {
         transfer_id: String,

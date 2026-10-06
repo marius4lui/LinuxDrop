@@ -1,0 +1,8 @@
+// The restricted helper can restore only UUIDs it allocated and journaled.
+// Interactive callers are separately checked against logind and manage-radio.
+polkit.addRule(function(action, subject) {
+    if (subject.user === 'linuxdrop-netd' &&
+        (action.id === 'org.freedesktop.NetworkManager.network-control' ||
+         action.id === 'org.freedesktop.NetworkManager.settings.modify.system'))
+        return polkit.Result.YES;
+});

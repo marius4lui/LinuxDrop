@@ -103,8 +103,7 @@ impl ReceiverGattServer {
         sender: Sender<ChannelMessage>,
         tcp_port: u16,
     ) -> Result<Self, anyhow::Error> {
-        let session = bluer::Session::new().await?;
-        let adapter = session.default_adapter().await?;
+        let adapter = crate::bluetooth_adapter().await?;
         if !adapter.is_powered().await? {
             anyhow::bail!("Bluetooth is switched off");
         }

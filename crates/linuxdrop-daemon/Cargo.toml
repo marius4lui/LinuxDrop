@@ -10,6 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 linuxdrop-core = { path = "../linuxdrop-core" }
+linuxdrop-storage = { path = "../linuxdrop-storage" }
+linuxdrop-network = { path = "../linuxdrop-network" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 linuxdrop-localsend = { path = "../linuxdrop-localsend" }
 linuxdrop-hardware = { path = "../linuxdrop-hardware" }
 linuxdrop-quickshare = { path = "../linuxdrop-quickshare" }

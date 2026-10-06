@@ -3,6 +3,29 @@
 //! represented as verified. The AWDL interface must be leased by linuxdrop-netd.
 mod archive;
 mod transport;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    use std::io::{Seek, Write};
+    pub fn archive_input(data: &[u8], compressed: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(data.len() <= 65536, "Input too large");
+        let mut file = tempfile::tempfile()?;
+        file.write_all(data)?;
+        file.rewind()?;
+        let mut decoded = if compressed {
+            super::archive::inflate(file, "application/x-dvzip", 65536, None)?
+        } else {
+            file
+        };
+        let offer = luftlift_rs::plist_impl::AskFile {
+            file_name: "file".into(),
+            file_type: "public.data".into(),
+            file_size: 0,
+            file_bom_path: "./file".into(),
+        };
+        super::archive::index(&mut decoded, &[offer])?;
+        Ok(())
+    }
+}
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -36,12 +59,15 @@ pub struct Config {
     pub ble_wake: bool,
     pub max_receive_bytes: u64,
     pub max_files: usize,
+    pub policy: linuxdrop_core::TransferPolicy,
 }
 struct Offer {
     request: AskRequest,
     transfer: Transfer,
     expires: Instant,
     cancel: CancellationToken,
+    options: linuxdrop_core::ReceiveOptions,
+    store: ReceiveStore,
 }
 struct Shared {
     name: String,
@@ -51,7 +77,7 @@ struct Shared {
     max: u64,
     max_files: usize,
     asking: std::sync::Mutex<std::collections::HashSet<IpAddr>>,
-    pending: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<Option<linuxdrop_core::ReceiveOptions>>>>,
     offers: Mutex<HashMap<IpAddr, Offer>>,
     jobs: Mutex<HashMap<String, CancellationToken>>,
 }
@@ -147,7 +173,7 @@ pub async fn start(
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         let mut advertisement = None;
         if config.ble_wake {
-            match transport::ble_wake().await {
+            match transport::ble_wake(config.policy.bluetooth_adapter.as_deref()).await {
                 Ok(handle) => advertisement = Some(handle),
                 Err(error) => {
                     events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:format!("AirDrop AWDL receive is ready. Bluetooth wake unavailable: {error}. Enable a BlueZ controller or open the Apple device's AirDrop panel manually.")})).await.ok();
@@ -168,10 +194,11 @@ pub async fn start(
                         shared.visible.store(visible,Ordering::Relaxed);
                         if visible {let _=mdns.register(service.clone());} else {let _=mdns.unregister(service.get_fullname());}
                     }
-                    Some(BackendCommand::Accept{transfer_id})=>{if let Some(reply)=shared.pending.lock().await.remove(&transfer_id){let _=reply.send(true);}}
-                    Some(BackendCommand::Reject{transfer_id})=>{if let Some(reply)=shared.pending.lock().await.remove(&transfer_id){let _=reply.send(false);}}
+                    Some(BackendCommand::Accept{transfer_id})=>{if let Some(reply)=shared.pending.lock().await.remove(&transfer_id){let _=reply.send(Some(Default::default()));}}
+                    Some(BackendCommand::AcceptWithOptions{transfer_id,options})=>{if let Some(reply)=shared.pending.lock().await.remove(&transfer_id){let _=reply.send(Some(options));}}
+                    Some(BackendCommand::Reject{transfer_id})|Some(BackendCommand::ProvidePin{transfer_id,..})=>{if let Some(reply)=shared.pending.lock().await.remove(&transfer_id){let _=reply.send(None);}}
                     Some(BackendCommand::Cancel{transfer_id})=>{if let Some(cancel)=shared.jobs.lock().await.get(&transfer_id){cancel.cancel();}
-                    if let Some(reply)=shared.pending.lock().await.remove(&transfer_id){let _=reply.send(false);}}
+                    if let Some(reply)=shared.pending.lock().await.remove(&transfer_id){let _=reply.send(None);}}
                     Some(BackendCommand::Send{transfer_id,peer_id,files})=>{
                         let peer=peers.get(&peer_id).map(|(address,_)|*address);
                         let cancel=stop.child_token();shared.jobs.lock().await.insert(transfer_id.clone(),cancel.clone());
@@ -367,13 +394,13 @@ async fn route(
                 .events
                 .send(BackendEvent::Incoming(transfer.clone()))
                 .await?;
-            let accepted = tokio::time::timeout(Duration::from_secs(120), rx)
+            let options = tokio::time::timeout(Duration::from_secs(120), rx)
                 .await
                 .ok()
                 .and_then(|r| r.ok())
-                .unwrap_or(false);
+                .flatten();
             shared.pending.lock().await.remove(&id);
-            if !accepted || !shared.visible.load(Ordering::Relaxed) {
+            if options.is_none() || !shared.visible.load(Ordering::Relaxed) {
                 transfer.state = "rejected".into();
                 shared
                     .events
@@ -383,6 +410,22 @@ async fn route(
                 guard.finish();
                 return Ok(response(StatusCode::FORBIDDEN, vec![]));
             }
+            let options = options.unwrap();
+            if options.selected_indices.as_ref().is_some_and(|indices| {
+                indices.is_empty()
+                    || indices.iter().any(|index| *index >= ask.files.len())
+                    || indices
+                        .iter()
+                        .collect::<std::collections::HashSet<_>>()
+                        .len()
+                        != indices.len()
+            }) {
+                bail!("Invalid file selection");
+            }
+            let store = match &options.directory {
+                Some(path) => ReceiveStore::open(path)?,
+                None => shared.store.clone(),
+            };
             let cancel = CancellationToken::new();
             shared.jobs.lock().await.insert(id, cancel.clone());
             shared.offers.lock().await.insert(
@@ -392,6 +435,8 @@ async fn route(
                     transfer,
                     expires: Instant::now() + Duration::from_secs(120),
                     cancel,
+                    options,
+                    store,
                 },
             );
             guard.finish();
@@ -418,7 +463,7 @@ async fn route(
                 .send(BackendEvent::TransferUpdated(transfer.clone()))
                 .await
                 .ok();
-            let result = tokio::select! {_=offer.cancel.cancelled()=>Err(anyhow::anyhow!("Transfer cancelled")),result=receive_upload(shared.clone(),request,&offer.request,&mut transfer,offer.cancel.clone())=>result};
+            let result = tokio::select! {_=offer.cancel.cancelled()=>Err(anyhow::anyhow!("Transfer cancelled")),result=receive_upload(shared.clone(),request,&offer.request,&mut transfer,offer.cancel.clone(),&offer.store,&offer.options)=>result};
             shared.jobs.lock().await.remove(&transfer.id);
             let status = match result {
                 Ok(paths) => {
@@ -456,6 +501,8 @@ async fn receive_upload(
     ask: &AskRequest,
     transfer: &mut Transfer,
     cancel: CancellationToken,
+    store: &ReceiveStore,
+    options: &linuxdrop_core::ReceiveOptions,
 ) -> Result<Vec<String>> {
     let content_type = request
         .headers()
@@ -508,7 +555,14 @@ async fn receive_upload(
         bail!("Receive size limit exceeded");
     }
     for entry in entries {
-        let mut file = shared.store.create(&entry.name)?;
+        if options.selected_indices.as_ref().is_some_and(|indices| {
+            !indices
+                .iter()
+                .any(|index| ask.files[*index].file_name == entry.name)
+        }) {
+            continue;
+        }
+        let mut file = store.create(&entry.name)?;
         decoded.seek(std::io::SeekFrom::Start(entry.offset)).await?;
         let copied = tokio::io::copy(&mut (&mut decoded).take(entry.size), &mut file.file).await?;
         if copied != entry.size {
@@ -525,7 +579,12 @@ async fn receive_upload(
     }
     let mut saved = vec![];
     for file in pending {
-        saved.push(file.commit().await?.to_string_lossy().into());
+        saved.push(
+            file.commit_with_policy(options.collision_policy)
+                .await?
+                .to_string_lossy()
+                .into(),
+        );
     }
     Ok(saved)
 }
@@ -622,7 +681,7 @@ mod tests {
                             .await
                             .remove(&transfer.id)
                             .unwrap()
-                            .send(true)
+                            .send(Some(Default::default()))
                             .unwrap();
                     }
                     BackendEvent::TransferUpdated(transfer)

@@ -28,6 +28,19 @@ pub mod hdl;
 pub mod manager;
 pub mod utils;
 
+static BLUETOOTH_ADAPTER: RwLock<Option<String>> = RwLock::new(None);
+pub fn set_bluetooth_adapter(name: Option<String>) {
+    *BLUETOOTH_ADAPTER.write().unwrap() = name;
+}
+pub fn bluetooth_adapter_name() -> Option<String> {
+    BLUETOOTH_ADAPTER.read().unwrap().clone()
+}
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub async fn bluetooth_adapter() -> Result<bluer::Adapter, anyhow::Error> {
+    let name = bluetooth_adapter_name();
+    linuxdrop_network::bluetooth_adapter(name.as_deref()).await
+}
+
 static SESSION_SHUTDOWN: Lazy<RwLock<CancellationToken>> =
     Lazy::new(|| RwLock::new(CancellationToken::new()));
 pub fn session_shutdown() -> CancellationToken {
@@ -74,8 +87,14 @@ pub mod location_nearby_connections {
 }
 
 static CUSTOM_DOWNLOAD: Lazy<RwLock<Option<PathBuf>>> = Lazy::new(|| RwLock::new(None));
-static DEVICE_NAME: Lazy<RwLock<String>> =
-    Lazy::new(|| RwLock::new(sys_metrics::host::get_hostname().unwrap_or("Unknown device".into())));
+static DEVICE_NAME: Lazy<RwLock<String>> = Lazy::new(|| RwLock::new(hostname()));
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "LinuxDrop".into())
+}
 
 #[derive(Debug)]
 pub struct RQS {
@@ -100,12 +119,7 @@ pub struct RQS {
 
 impl Default for RQS {
     fn default() -> Self {
-        Self::new(
-            Visibility::Visible,
-            None,
-            None,
-            Some(sys_metrics::host::get_hostname().unwrap_or("Unknown device".into())),
-        )
+        Self::new(Visibility::Visible, None, None, Some(hostname()))
     }
 }
 

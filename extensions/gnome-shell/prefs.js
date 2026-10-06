@@ -21,10 +21,15 @@ export default class LinuxDropPreferences extends ExtensionPreferences {
         }
         const position = new Adw.PreferencesGroup({title: t('Position and behavior')});
         page.add(position);
+        const modes = ['primary', 'pointer', 'fixed'];
+        const monitorMode = new Adw.ComboRow({title: t('Open bubble on'), model: Gtk.StringList.new(['Primary monitor', 'Pointer monitor', 'Fixed monitor'].map(t)), selected: Math.max(0, modes.indexOf(settings.get_string('monitor-mode')))});
+        monitorMode.connect('notify::selected', () => settings.set_string('monitor-mode', modes[monitorMode.selected]));
+        position.add(monitorMode);
         for (const [key, title, subtitle, lower, upper] of [
             ['monitor', 'Monitor', '−1 follows the primary monitor; otherwise use a monitor index', -1, 32],
             ['top-offset', 'Top spacing', 'Logical pixels below the panel', 0, 200],
             ['auto-collapse', 'Close after inactivity', 'Seconds; 0 keeps the expanded menu open', 0, 120],
+            ['drag-hover-delay', 'Drag hover delay', 'Milliseconds before the open bubble accepts file drops', 100, 2000],
         ]) {
             const row = new Adw.SpinRow({title: t(title), subtitle: t(subtitle), adjustment: new Gtk.Adjustment({lower, upper, step_increment: 1, page_increment: 10})});
             settings.bind(key, row, 'value', Gio.SettingsBindFlags.DEFAULT);

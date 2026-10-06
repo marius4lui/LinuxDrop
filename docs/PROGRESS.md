@@ -1,6 +1,6 @@
 # Implementation and acceptance status
 
-Updated 2026-10-06. Branch: `feature/linuxdrop-implementation`. Version: **0.1.0 experimental**, Ubuntu 24.04 amd64 / GNOME 46. This is an implemented application; physical protocol interoperability is a separate open acceptance gate.
+Updated 2026-10-06. Branch: `feature/linuxdrop-implementation`. **Full implementation is active, not complete.** The packaged 0.1.0 experimental baseline on Ubuntu 24.04 amd64 / GNOME 46 is a milestone, not acceptance of the full plan. The evidence below describes that baseline; current completion changes require their own validation. See [completion requirements](completion/REQUIREMENTS.md).
 
 ## Implemented
 
@@ -40,8 +40,8 @@ No physical Android, iPhone, macOS, Bluetooth or Wi-Fi adapter was available in 
 
 Also not yet validated: GNOME versions other than 46, fractional scaling and monitor hotplug, sandbox file-portal drops, a complete screen-reader traversal, native RPM/Arch installation, exhaustive fuzzing and an independent security audit. The verified Wayland drop source was native Nautilus. These limits do not prevent the tested Ubuntu package or live local demo from running.
 
-## Scope notes
+## Completion scope
 
-The original plan's settings inventory was a set of proposed options. 0.1.0 exposes implemented controls; it does not show nonfunctional switches for trusted contacts, per-peer favorites/blocking, bandwidth shaping, source-interface policy or per-transfer folders. Folder trees, text/contact payloads, resumable transfers and Apple Contacts Only are not implemented. Quick Share direct networking is a negotiated transport upgrade, not universal independent P2P discovery.
+The full agreed settings inventory and integrations remain in scope. The current completion pass implements per-peer preferences, bandwidth/interface policy, per-transfer destinations and selections, LocalSend PIN handling and the remaining native UX and hardware controls. A control is only complete when its backend behavior and meaningful acceptance checks exist. Apple Contacts Only cannot be promised without the required Apple identity mechanism. Quick Share direct networking is a negotiated transport upgrade; its missing software paths remain work items.
 
 All production backends use real protocol paths. The separate opt-in demo receiver automatically accepts only on loopback and is never installed as a production service. The main application always retains its consent flow.

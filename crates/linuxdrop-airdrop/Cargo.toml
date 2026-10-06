@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 [dependencies]
 anyhow = "1"
 linuxdrop-core = { path = "../linuxdrop-core" }
+linuxdrop-network = { path = "../linuxdrop-network" }
 linuxdrop-storage = { path = "../linuxdrop-storage" }
 luftlift-rs = { path = "../../vendor/opendrop-rs/crates/luftlift-rs" }
 tokio = { version = "1", features = ["full"] }
@@ -25,3 +26,6 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 mdns-sd = "0.11"
 bluer = { version = "0.17", features = ["bluetoothd"] }
+
+[features]
+fuzzing = []

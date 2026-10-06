@@ -1,6 +1,11 @@
 import GLib from 'gi://GLib';
 const german = GLib.get_language_names().some(language => language.startsWith('de'));
 const de = {
+    'Previous': 'Zurück', 'Next': 'Weiter', 'Active transfers': 'Aktive Übertragungen',
+    'completed': 'Abgeschlossen', 'failed': 'Fehlgeschlagen', 'cancelled': 'Abgebrochen', 'rejected': 'Abgelehnt',
+    'Open folder': 'Ordner öffnen', 'Done': 'Fertig', 'Review files': 'Dateien prüfen', 'Enter PIN': 'PIN eingeben',
+    'Open bubble on': 'Bubble öffnen auf', 'Primary monitor': 'Hauptbildschirm', 'Pointer monitor': 'Bildschirm des Mauszeigers', 'Fixed monitor': 'Festgelegter Bildschirm',
+    'Drag hover delay': 'Verzögerung beim Ablegen', 'Milliseconds before the open bubble accepts file drops': 'Millisekunden, bevor die offene Bubble Dateien annimmt',
     'Connecting…': 'Verbinden …', 'Nearby sharing': 'Teilen in der Nähe',
     'Open LinuxDrop': 'LinuxDrop öffnen', 'Close LinuxDrop': 'LinuxDrop schließen', 'Transfer in progress': 'Übertragung läuft',
     'Send files…': 'Dateien senden …', 'LinuxDrop settings': 'LinuxDrop-Einstellungen',

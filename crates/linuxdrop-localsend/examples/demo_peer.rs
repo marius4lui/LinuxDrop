@@ -75,14 +75,16 @@ async fn main() -> Result<()> {
             multicast: false,
             max_files: 100,
             max_bytes: 1024 * 1024 * 1024,
+            policy: Default::default(),
+            receive_pin: None,
         },
         events,
         Ipv4Addr::LOCALHOST,
     )
     .await?;
     let (_, _, fingerprint) = tls::identity(&identity)?;
-    let own_client = tls::client("https", &fingerprint)?;
-    let client = tls::client("https", &daemon_fingerprint)?;
+    let own_client = tls::client_on("https", &fingerprint, None)?;
+    let client = tls::client_on("https", &daemon_fingerprint, None)?;
     let info = json!({"alias":"Demo-Empfänger (Ubuntu)","version":"2.1","deviceModel":"LinuxDrop local demo","deviceType":"desktop","fingerprint":fingerprint,"port":port,"protocol":"https","download":false});
     let daemon_info = json!({"alias":"LinuxDrop (echte Oberfläche)","version":"2.1","deviceType":"desktop","fingerprint":daemon_fingerprint,"port":daemon_port,"protocol":"https","download":false});
     let daemon_register = format!("https://127.0.0.1:{daemon_port}/api/localsend/v2/register");

@@ -94,6 +94,9 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             pending = executor.submit(request, "/prepare-upload", offer)
             transfer = wait(lambda: next((t for t in snapshot()["transfers"] if t["state"] == "waiting"), None))
             assert list((root / "received").iterdir()) == []
+            call("UpdateSettings", "(s)", (json.dumps({"general": {"appearance": "dark"}}),))
+            assert snapshot()["settings"]["general"]["appearance"] == "dark"
+            assert not pending.done(), "Presentation settings interrupted incoming consent"
             call("AcceptTransfer", "(s)", (transfer["id"],))
             accepted = json.loads(pending.result())
             request(f'/upload?sessionId={accepted["sessionId"]}&fileId=file&token={accepted["files"]["file"]}', raw=payload)
@@ -102,6 +105,33 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             assert (root / "received/integration.txt").read_bytes() == payload
             call("CancelTransfer", "(s)", (transfer["id"],))
             assert snapshot()["transfers"][0]["state"] == "completed"
+        # Exercise the actual per-request destination/subset contract and the
+        # duplicate-decision guard, rather than just serializing option values.
+        offer["files"]["skip"] = {"id": "skip", "fileName": "excluded.txt", "size": 999, "fileType": "text/plain"}
+        custom = root / "chosen-folder"
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            pending = executor.submit(request, "/prepare-upload", offer)
+            transfer = wait(lambda: next((t for t in snapshot()["transfers"] if t["state"] == "waiting"), None))
+            index = next(i for i, f in enumerate(transfer["files"]) if f["name"] == "integration.txt")
+            call("AcceptTransferWithOptions", "(ss)", (transfer["id"], json.dumps({"directory": str(custom), "selected_indices": [index], "collision_policy": "reject"})))
+            accepted = json.loads(pending.result())
+            assert set(accepted["files"]) == {"file"}
+            try:
+                call("AcceptTransfer", "(s)", (transfer["id"],))
+                raise AssertionError("Second client could accept the same request again")
+            except GLib.Error:
+                pass
+            request(f'/upload?sessionId={accepted["sessionId"]}&fileId=file&token={accepted["files"]["file"]}', raw=payload)
+            done = wait(lambda: next((t for t in snapshot()["transfers"] if t["id"] == transfer["id"] and t["state"] == "completed"), None))
+            assert (custom / "integration.txt").read_bytes() == payload
+            assert not (custom / "excluded.txt").exists()
+        request("/register", offer["info"])
+        peer = wait(lambda: next((p for p in snapshot()["peers"] if p["name"] == "Integration sender"), None))
+        call("UpdatePeerPreferences", "(ss)", (peer["id"], json.dumps({"favorite": True, "display_name": "Private nickname", "blocked": True})))
+        assert next(p for p in snapshot()["peers"] if p["id"] == peer["id"])["available"] is False
+        redacted = call("ExportDiagnostics")
+        assert "Private nickname" not in redacted and str(root) not in redacted and "integration.txt" not in redacted
+        assert json.loads(call("GetDefaults"))["receive"]["collision_policy"] == "rename"
         try:
             call("UpdateSettings", "(s)", (json.dumps({"localsend": {"port": 1}}),))
             raise AssertionError("Unsafe settings accepted")
@@ -119,11 +149,14 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         assert restored["settings"]["visibility"]["mode"] == "hidden"
         assert restored["transfers"][0]["id"] == done["id"]
         assert restored["transfers"][0]["state"] == "completed"
+        assert next(p for p in restored["known_peers"] if p["id"] == peer["id"])["blocked"] is True
         call("ClearHistory")
         assert snapshot()["transfers"] == []
         assert json.loads(history.read_text()) == []
         assert (root / "received/integration.txt").read_bytes() == payload
-        print("PASS actual D-Bus snapshot, visibility, consent, HTTPS bytes, terminal state, settings validation, private history restart and clear")
+        call("StopWhenIdle")
+        assert daemon.wait(timeout=5) == 0
+        print("PASS actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, idle shutdown")
     finally:
         daemon.terminate()
         try:

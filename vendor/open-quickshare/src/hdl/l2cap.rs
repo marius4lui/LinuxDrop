@@ -125,8 +125,7 @@ impl L2capServer {
     /// Binds an LE CoC server socket on this adapter with a kernel-assigned
     /// dynamic PSM and returns it together with that PSM.
     pub async fn bind() -> Result<(Self, u16), anyhow::Error> {
-        let session = bluer::Session::new().await?;
-        let adapter = session.default_adapter().await?;
+        let adapter = crate::bluetooth_adapter().await?;
 
         let socket = Socket::<Stream>::new_stream()?;
         // Android connects with an *insecure* L2CAP channel (no bonding), so

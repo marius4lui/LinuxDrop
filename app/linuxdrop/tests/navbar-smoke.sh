@@ -15,6 +15,10 @@ glib-compile-schemas "$root/data/gnome-shell/extensions/$uuid/schemas"
 printf '%s' '{"localsend":{"enabled":false},"quickshare":{"enabled":false},"airdrop":{"enabled":false}}' > "$root/config/linuxdrop/settings.json"
 exec dbus-run-session -- sh -c '
     printf "%s" "$DBUS_SESSION_BUS_ADDRESS" > /tmp/linuxdrop-navbar-smoke-1001/bus
+    if [ "${LINUXDROP_SHELL_REVIEW_FIXTURE:-0}" = 1 ]; then
+        python3 app/linuxdrop/tests/shell-review-fixture.py > /tmp/linuxdrop-navbar-smoke-1001/fixture.log 2>&1 &
+        sleep 1
+    fi
     gsettings set org.gnome.shell enabled-extensions "['"'"'linuxdrop@marius4lui.github.io'"'"']"
     gsettings set org.gnome.desktop.interface enable-hot-corners false
     gsettings set org.gnome.desktop.interface enable-animations false

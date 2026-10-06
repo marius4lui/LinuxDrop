@@ -87,8 +87,26 @@ impl BleListener {
             return Err(anyhow!("no bluetooth adapter"));
         }
 
+        let selected = crate::bluetooth_adapter_name();
+        let mut chosen = None;
+        for adapter in adapters {
+            let information = adapter.adapter_info().await?;
+            let name = information
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+            if selected.as_deref().is_none_or(|selected| name == selected) {
+                chosen = Some(adapter);
+                break;
+            }
+        }
         Ok(Self {
-            adapter: adapters[0].clone(),
+            adapter: chosen.ok_or_else(|| {
+                anyhow!("Selected Bluetooth controller is unavailable to the scanner")
+            })?,
             sender,
         })
     }
