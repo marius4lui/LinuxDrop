@@ -68,12 +68,13 @@ pub async fn advertise(
     Ok(adapter.advertise(advertisement).await?)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct InterfaceAddress {
     pub name: String,
     pub address: IpAddr,
     pub netmask: IpAddr,
     pub index: u32,
+    pub loopback: bool,
 }
 impl InterfaceAddress {
     pub fn contains(&self, peer: IpAddr) -> bool {
@@ -186,6 +187,7 @@ pub fn interfaces(
                 address,
                 netmask,
                 index: unsafe { libc::if_nametoindex(item.ifa_name) },
+                loopback,
             });
         }
     }
@@ -239,6 +241,7 @@ mod tests {
             address: "192.0.2.2".parse().unwrap(),
             netmask: "255.255.255.0".parse().unwrap(),
             index: 1,
+            loopback: false,
         };
         assert!(interface.contains("192.0.2.99".parse().unwrap()));
         assert!(!interface.contains("192.0.3.1".parse().unwrap()));

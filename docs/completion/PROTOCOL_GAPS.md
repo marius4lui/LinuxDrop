@@ -13,8 +13,9 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Per-request destination and collision policy using shared ReceiveOptions/storage policy.
 - [x] Upload PIN policy and sender PIN challenge/retry with bounded attempts (401/429).
 - [ ] Metadata timestamps preserved safely when present; unknown optional fields remain forward-compatible.
-- [ ] HTTP registration reply to multicast announcement, with UDP fallback; interface-scoped multicast and LAN-only reachability policy.
-- [ ] Allowed network interfaces, VPN/virtual exclusions, upload request rate limits, bandwidth policy.
+- [x] HTTP registration reply to multicast announcement, with UDP fallback; interface-scoped multicast and LAN-only reachability policy.
+- [x] Allowed network interfaces, VPN/virtual exclusions, upload request rate limits, shared bandwidth policy.
+- [x] Live IPv4 address/interface reconciliation with listener and discovery retirement, stale-peer removal and preservation of connections on unaffected interfaces.
 - [ ] Download API client usable through explicit peer offers (server implementation already present).
 
 ## Quick Share / Nearby Share (one backend)
@@ -121,7 +122,40 @@ The LAN socket test also passed as the unprivileged Ubuntu user. The daemon's
 D-Bus/HTTPS integration passed including repeated refusal of a download link on
 an excluded network while retaining the prepared draft.
 
-Still open: LocalSend multicast interface scoping and HTTP-first discovery replies,
+Still open after that pass: LocalSend multicast interface scoping and HTTP-first discovery replies,
 live network reconfiguration, reverse-download client, protocol metadata/IPv6/P2P
 completion, and the remaining desktop/distribution acceptance. These are software
 tasks in the full goal, not physical-device exceptions.
+
+## LocalSend discovery and network changes, 2026-10-06
+
+Announcements now receive a bounded HTTPS/HTTP registration reply first; failure
+falls back to a non-announcing UDP response. Certificate pinning also applies to
+registration. Discovery responses have a three-second timeout, an eight-request
+concurrency bound per interface, bounded datagrams and per-source rate limits.
+No response body is downloaded merely to acknowledge registration. Hidden state
+suppresses new replies and fallback, and backend removal cancels pending replies.
+
+Every IPv4 multicast socket joins and sends on its selected address and uses
+`SO_BINDTODEVICE` plus `IP_MULTICAST_ALL=0`. TCP listeners bind both the selected
+local address and interface. Off-subnet, unspecified, multicast and broadcast
+peer targets are rejected; outgoing transfers no longer fall back to an arbitrary
+adapter. Linux loopback interface flags are preserved even when an address on
+that interface is outside 127/8, as with WSL's local DNS alias.
+
+A three-second network watcher reconciles HTTP listeners and multicast workers,
+retries newly available interfaces, removes stale peers and updates readiness.
+Connections on unchanged interfaces survive reconciliation. Removed interfaces
+retire their discovery tasks and drain their listener connections with a bounded
+shutdown. This does not restart the other protocols or the visible application.
+
+The workspace passed 40 tests and Clippy with warnings denied. The rebuilt
+daemon passed its real D-Bus/HTTPS consent and settings integration. LocalSend's
+ten tests also passed as the unprivileged Ubuntu user. New checks use actual UDP/TLS/TCP sockets for HTTP-first
+registration, fingerprint-failure fallback, hidden replies and address addition,
+removal, recovery and connection continuity. Interface changes are supplied to
+the same reconciler used by the watcher, without mutating the host's network.
+These checks do not replace interoperability tests with official clients or real
+adapter hotplug. Quick Share's live listener/mDNS reconciliation remains open,
+along with the other unchecked software items above. Release packages have not
+yet been rebuilt with these changes.

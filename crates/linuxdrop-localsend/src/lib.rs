@@ -1,5 +1,7 @@
+mod discovery;
 mod rate;
 pub mod reverse;
+mod server;
 mod tls;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {
@@ -160,7 +162,7 @@ struct Shared {
     registration_gate: rate::RequestGate,
     pin_gate: rate::RequestGate,
     pin_requests: Mutex<HashMap<String, oneshot::Sender<String>>>,
-    interfaces: Vec<linuxdrop_network::InterfaceAddress>,
+    interfaces: std::sync::RwLock<Vec<linuxdrop_network::InterfaceAddress>>,
     bandwidth: linuxdrop_network::BandwidthLimiter,
 }
 type SharedState = Arc<Shared>;
@@ -213,7 +215,7 @@ async fn start_bound_with_budget(
         announce: false,
     };
     let shared = Arc::new(Shared {
-        interfaces: linuxdrop_network::interfaces(&config.policy, true)?,
+        interfaces: std::sync::RwLock::new(Vec::new()),
         bandwidth,
         prepare_gate: rate::RequestGate::new(20, Duration::from_secs(60)),
         registration_gate: rate::RequestGate::new(120, Duration::from_secs(60)),
@@ -240,74 +242,12 @@ async fn start_bound_with_budget(
         .route("/api/localsend/v2/cancel", post(cancel))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(shared.clone());
-    let addresses: Vec<_> = if bind.is_unspecified() {
-        shared
-            .interfaces
-            .iter()
-            .filter_map(|interface| match interface.address {
-                IpAddr::V4(ip) => Some(ip),
-                _ => None,
-            })
-            .collect()
-    } else {
-        vec![bind]
-    };
-    if addresses.is_empty() {
-        bail!("No permitted IPv4 network interfaces are available");
-    }
-    let mut listeners = Vec::new();
-    for address in addresses {
-        let listener = std::net::TcpListener::bind((address, config.port))?;
-        listener.set_nonblocking(true)?;
-        listeners.push(listener);
-    }
-    let handle = axum_server::Handle::new();
-    let stop_handle = handle.clone();
-    let stopper = shared.stop.clone();
-    tokio::spawn(async move {
-        stopper.cancelled().await;
-        stop_handle.graceful_shutdown(Some(Duration::from_secs(2)));
-    });
     let tls = if config.https {
         Some(axum_server::tls_rustls::RustlsConfig::from_pem(cert, key).await?)
     } else {
         None
     };
-    for listener in listeners {
-        let state = shared.clone();
-        let handle = handle.clone();
-        let routes = routes.clone();
-        if config.https {
-            let tls = tls.clone().unwrap();
-            tokio::spawn(async move {
-                if let Err(error) = axum_server::from_tcp_rustls(listener, tls)
-                    .handle(handle)
-                    .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                {
-                    state.error(format!("LocalSend server: {error}")).await;
-                }
-            });
-        } else {
-            tokio::spawn(async move {
-                if let Err(error) = axum_server::from_tcp(listener)
-                    .handle(handle)
-                    .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
-                    .await
-                {
-                    state.error(format!("LocalSend server: {error}")).await;
-                }
-            });
-        }
-    }
-    if config.multicast {
-        let s = shared.clone();
-        tokio::spawn(async move {
-            if let Err(e) = discovery(s.clone()).await {
-                s.error(format!("Multicast discovery: {e}")).await;
-            }
-        });
-    }
+    server::start(shared.clone(), routes, tls, bind)?;
     let (tx, mut rx) = mpsc::channel(64);
     let s = shared.clone();
     tokio::spawn(async move {
@@ -374,18 +314,13 @@ async fn start_bound_with_budget(
             }
         }
     });
-    let _ = shared
-        .events
-        .send(BackendEvent::StateChanged(BackendState {
-            id: "localsend".into(),
-            state: "ready".into(),
-            detail: format!("{} on port {}", shared.info.protocol, config.port),
-        }))
-        .await;
     Ok(tx)
 }
 
 impl Shared {
+    fn interfaces(&self) -> Vec<linuxdrop_network::InterfaceAddress> {
+        self.interfaces.read().unwrap().clone()
+    }
     async fn error(&self, detail: String) {
         let _ = self
             .events
@@ -425,11 +360,28 @@ impl Shared {
         }
     }
     async fn remember(&self, info: DeviceInfo, ip: IpAddr) -> Result<()> {
+        if !self
+            .interfaces()
+            .iter()
+            .any(|interface| discovery::permits(interface, ip))
+        {
+            bail!("Peer is outside permitted local networks");
+        }
         if info.fingerprint == self.info.fingerprint {
             return Ok(());
         }
         if info.alias.len() > 256
+            || info.fingerprint.is_empty()
             || info.fingerprint.len() > 128
+            || info.version.len() > 32
+            || info
+                .device_model
+                .as_ref()
+                .is_some_and(|model| model.len() > 256)
+            || info
+                .device_type
+                .as_ref()
+                .is_some_and(|kind| kind.len() > 64)
             || info.port == 0
             || !matches!(info.protocol.as_str(), "http" | "https")
         {
@@ -868,43 +820,6 @@ async fn cancel(
     StatusCode::OK
 }
 
-async fn discovery(s: SharedState) -> Result<()> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
-    socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, s.config.port)).into())?;
-    socket.join_multicast_v4(&Ipv4Addr::new(224, 0, 0, 167), &Ipv4Addr::UNSPECIFIED)?;
-    socket.set_multicast_ttl_v4(1)?;
-    socket.set_nonblocking(true)?;
-    let udp = tokio::net::UdpSocket::from_std(socket.into())?;
-    let mut interval = tokio::time::interval(Duration::from_secs(20));
-    let target = SocketAddr::from((Ipv4Addr::new(224, 0, 0, 167), s.config.port));
-    let mut buffer = vec![0u8; 65536];
-    loop {
-        tokio::select! {
-            _=s.stop.cancelled()=>break,
-            _=interval.tick()=> {
-                if s.visible.load(Ordering::Relaxed) {let mut info=s.info.clone();info.announce=true;udp.send_to(&serde_json::to_vec(&info)?,target).await?;}
-            },
-            packet=udp.recv_from(&mut buffer)=> {
-                let (length,addr)=packet?;
-                if let Ok(info)=serde_json::from_slice::<DeviceInfo>(&buffer[..length]) {
-                    if info.fingerprint==s.info.fingerprint {continue;}
-                    let announce=info.announce;
-                    if s.remember(info,addr.ip()).await.is_ok() && announce && s.visible.load(Ordering::Relaxed) {
-                        udp.send_to(&serde_json::to_vec(&s.info)?,target).await?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 async fn send(s: SharedState, id: String, peer_id: String, paths: Vec<PathBuf>) {
     let peer = s
         .peers
@@ -954,14 +869,10 @@ async fn send_files(
 ) -> Result<()> {
     let (info, address) = peer.context("Device is no longer available")?;
     let interface = s
-        .interfaces
+        .interfaces()
         .iter()
-        .find(|interface| interface.contains(address.ip()))
-        .or_else(|| {
-            s.interfaces
-                .iter()
-                .find(|interface| !interface.address.is_loopback())
-        })
+        .find(|interface| discovery::permits(interface, address.ip()))
+        .cloned()
         .context("No permitted interface can reach this peer")?;
     let client = tls::client_on(&info.protocol, &info.fingerprint, Some(&interface.name))?;
     let base = format!("{}://{address}/api/localsend/v2", info.protocol);
@@ -1169,7 +1080,7 @@ async fn send_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn config(root: &std::path::Path, name: &str) -> Config {
+    pub(super) fn config(root: &std::path::Path, name: &str) -> Config {
         let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = socket.local_addr().unwrap().port();
         drop(socket);
