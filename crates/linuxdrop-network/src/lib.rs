@@ -65,7 +65,13 @@ pub async fn advertise(
     if supported == 0 || active >= supported {
         bail!("Bluetooth controller {} has no free advertisement slots ({active}/{supported}). Select another controller or disable the other protocol's Bluetooth advertisements.",adapter.name());
     }
-    Ok(adapter.advertise(advertisement).await?)
+    // Give each registration its own bus owner. If a RegisterAdvertisement
+    // reply times out after BlueZ started processing it, ending this dedicated
+    // owner also revokes any late registration without disconnecting GATT or
+    // another protocol's advertisement.
+    let session = bluer::Session::new().await?;
+    let advertising_adapter = session.adapter(adapter.name())?;
+    Ok(advertising_adapter.advertise(advertisement).await?)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

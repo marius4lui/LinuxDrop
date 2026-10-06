@@ -24,6 +24,7 @@ jobs:
         run: |
           cargo test --workspace --locked
           sh crates/linuxdrop-network/tests/run-nm-lifecycle.sh
+          sh crates/linuxdrop-network/tests/run-bluetooth-lifecycle.sh
           cargo test --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs linuxdrop_policy_tests --lib
       - name: Native resources
         run: |

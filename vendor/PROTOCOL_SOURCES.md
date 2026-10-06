@@ -6,6 +6,7 @@ LinuxDrop incorporates the following source snapshots, retaining their LICENSE f
 |---|---|---|---|
 | [open-quickshare](https://github.com/ignotusbucius/open-quickshare) | `5a31145163ee22ab9cf1c7d3dffd74355febe93f` | `core_lib` | GNU GPL version 3; upstream LICENSE retained |
 | [opendrop-rs](https://github.com/ayourtch-llm/opendrop-rs) | `dccc798e244363eb92d35e3c52e9a913188dda91` | `filin-rs`, `luftlift-rs` and workspace manifest | GPL-3.0-only, declared by upstream workspace |
+| [BlueR](https://github.com/bluez/bluer) | crate 0.17.4, upstream `8072d9cc6d034f1bfc464dda338d19a14f9badaf` | Published crate sources | BSD-2-Clause; upstream LICENSE retained |
 
 Quick Share's remaining upstream Git dependency is pinned in its manifest: `Martichou/mdns-sd` at `c3d6ec2e173ac2cf8306943f70026c37c2ab1dd7`. The upstream AGPL-licensed `sys_metrics` dependency was removed: its only two calls obtained the hostname, now implemented independently using the Linux kernel's hostname file and a constant fallback. Cargo.lock pins registry packages. Do not replace pins with branch references.
 
@@ -39,3 +40,32 @@ AirDrop / AWDL:
 - Upload streams share the daemon payload budget; outbound IPv6 sockets bind the source address/device of the scoped leased AWDL interface instead of relying on the default route.
 
 The upstream library and CLI sources are retained for attribution and reproducible builds. Only LinuxDrop's adapter paths and the netd-launched Filin binary form the product runtime.
+
+## BlueR lifecycle patch
+
+`vendor/bluer` contains the crates.io 0.17.4 source snapshot identified by its
+original `.cargo_vcs_info.json`. The workspace patches that exact package locally.
+Only `src/adv.rs` and `src/session.rs` differ from the published source (including
+Rust formatting). The normalized upstream Cargo.toml and original Cargo.toml.orig
+are retained. Registry cache markers and its package lockfile are omitted.
+
+- `AdvertisementHandle::unregister()` waits for the BlueZ method reply and local
+  object removal. The result persists; cancelling the wait does not cancel cleanup.
+- An owned worker retains in-flight registration until its reply, including when
+  the caller was cancelled. Failed registration is cleaned before reporting its
+  error. Advertising calls have a 15-second D-Bus deadline; transient unregister
+  errors retry while the daemon's separate cleanup receipt can time out honestly.
+- Session teardown aborts its event/method dispatch tasks as well as the I/O
+  driver, so stale connection clones do not retain a D-Bus owner.
+- LinuxDrop uses a dedicated session per advertisement, isolating owner-loss
+  cleanup from GATT and other protocols. ActiveInstances capacity checks remain
+  serialized and never evict existing advertisements.
+- Quick Share and AirDrop explicitly await unregister. Quick Share's former
+  1.5-second replacement sleep and outer registration timeout are removed.
+
+The private BlueZ mock test covers selected controllers, actual exported Apple
+manufacturer/Quick Share service properties, slot exhaustion, held unregister
+replies, retry, registration cancellation, drop cleanup and bus-owner removal.
+Physical Bluetooth packet/controller acceptance remains separate.
+
+Reference: [BlueZ LEAdvertisingManager1](https://bluez.readthedocs.io/en/latest/advertising-api/).

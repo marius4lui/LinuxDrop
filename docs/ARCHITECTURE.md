@@ -79,9 +79,11 @@ listener task also waits for the connection watcher count to reach zero: the
 server's forced-shutdown return alone does not prove that accepted TLS sockets
 have closed. Quick Share waits for its engine tracker; AirDrop waits for its
 connection/transfer tracker, cancellation guards and mDNS shutdown response.
-BlueZ unregister acknowledgements and helper-loss recovery remain separate
-lifecycle work; this receipt is not a claim that those outstanding paths have
-been verified.
+BlueZ unregister acknowledgements now use a pinned BlueR lifecycle extension:
+Quick Share and AirDrop await registration removal; each advertisement has its
+own D-Bus owner, and session dispatcher tasks are cancelled on teardown. A private
+BlueZ mock exercises delayed replies, transient failure, capacity and cancellation.
+Helper-loss recovery and physical radio acceptance remain separate work.
 
 Reverse-download links use the same persistent shutdown receipt. Revocation and
 expiry force-close HTTP connections and await tracked file reads before port

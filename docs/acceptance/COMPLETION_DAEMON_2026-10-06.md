@@ -73,3 +73,29 @@ reverse-offer drain or installed-package acceptance. No live demo was restarted.
 
 No running demo or installed package was changed. BlueZ unregister and helper-loss
 recovery are still separate open lifecycle work.
+
+## 2026-10-07: acknowledged Bluetooth advertising cleanup
+
+The workspace now pins BlueR 0.17.4 sources with a focused lifecycle extension.
+AirDrop and Quick Share await UnregisterAdvertisement; Quick Share cycles stop
+using a guessed 1.5-second grace period. Registration cancellation is owned by a
+worker until the D-Bus reply and cleanup. Each advertisement uses an isolated
+D-Bus owner without disconnecting the controller/GATT session. The source and
+license are retained and packaging installs the BlueR license.
+
+The private-bus BlueZ test passed after reproducing and fixing an additional
+session teardown problem: event/method dispatch tasks retained connection clones
+after the I/O driver had been stopped. The test now verifies the bus owner
+actually disappears, as well as explicit/automatic powered-controller choice,
+Apple manufacturer data, Quick Share service/discoverability/interval properties,
+full capacity, a held unregister reply, transient-error retry, late registration
+cleanup after caller cancellation and handle Drop cleanup. No real BlueZ service
+or physical radio is contacted. CI includes the isolated test.
+
+Full-workspace tests passed (53 executed, 4 environment-dependent tests skipped);
+the new private BlueZ lifecycle test passed separately. Workspace/all-target
+Clippy with warnings denied passed. The live demo was not restarted.
+
+Physical advertising, external Release/power-loss recovery and the complete
+scanner/GATT/L2CAP controller matrix remain open; this test only proves the
+specific software lifecycle above.

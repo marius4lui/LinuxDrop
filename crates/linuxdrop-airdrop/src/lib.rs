@@ -255,7 +255,14 @@ pub async fn start_with_budget(
                 .await
                 .ok();
         }
-        drop(advertisement);
+        let bluetooth_cleanup = if let Some(mut advertisement) = advertisement {
+            advertisement
+                .unregister()
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
         server.await.map_err(|error| error.to_string())?;
         workers.close();
         workers.wait().await;
@@ -264,6 +271,7 @@ pub async fn start_with_budget(
             .recv_async()
             .await
             .map_err(|error| error.to_string())?;
+        bluetooth_cleanup?;
         Ok(())
     });
     Ok(linuxdrop_core::CommandSender::track(tx, task))

@@ -67,14 +67,14 @@ impl BleAdvertiser {
         let _suppressor = BleScanSuppressor::new();
 
         let service_uuid = Uuid::from_u16(0xFE2C);
-        let handle = linuxdrop_network::advertise(
+        let mut handle = linuxdrop_network::advertise(
             &self.adapter,
             self.get_advertisement(service_uuid, SERVICE_DATA),
         )
         .await?;
         ctk.cancelled().await;
         info!("{INNER_NAME}: tracker cancelled, returning");
-        drop(handle);
+        handle.unregister().await?;
 
         Ok(())
     }
@@ -492,18 +492,8 @@ impl ReceiverAdvertiser {
     /// How often the held registration is checked against the adapter's
     /// active-instance count while idle.
     const WATCH: Duration = Duration::from_secs(20);
-    /// Hard cap on one RegisterAdvertisement round-trip. bluer's own D-Bus
-    /// timeout is 120s, and a hung call parked the advertiser for good once --
-    /// with zero instances on the air and no error logged.
-    const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
     /// Delay before retrying a registration that outright failed.
     const RETRY: Duration = Duration::from_secs(3);
-    /// Pause between dropping a consumed registration and registering anew.
-    /// Generous on purpose: the unregisters run as spawned background tasks,
-    /// and re-registering while they're still mid-flight on the same D-Bus
-    /// session once raced the whole process into a silent lockup.
-    const CYCLE_GRACE: Duration = Duration::from_millis(1500);
-
     pub async fn run(
         &self,
         mut visibility: watch::Receiver<Visibility>,
@@ -549,7 +539,7 @@ impl ReceiverAdvertiser {
             // connectable set while a previous LE connection is still winding
             // down).
             let mut failures = 0;
-            let handles = loop {
+            let mut handles = loop {
                 match self.register_all().await {
                     Ok(handles) => break handles,
                     Err(e) => {
@@ -575,6 +565,7 @@ impl ReceiverAdvertiser {
                 tokio::select! {
                     _ = ctk.cancelled() => {
                         info!("{RX_INNER_NAME}: tracker cancelled, returning");
+                        for handle in &mut handles { handle.unregister().await?; }
                         return Ok(());
                     }
                     _ = ADV_CYCLE.notified() => {
@@ -583,7 +574,8 @@ impl ReceiverAdvertiser {
                     }
                     changed = visibility.changed() => {
                         if changed.is_err() {
-                            return Ok(());
+                            for handle in &mut handles { handle.unregister().await?; }
+                        return Ok(());
                         }
                         if *visibility.borrow() == Visibility::Invisible {
                             info!("{RX_INNER_NAME}: visibility -> Invisible; taking the advertisement off the air");
@@ -621,13 +613,12 @@ impl ReceiverAdvertiser {
             // bluetoothd yet may never be enabled by the controller, and
             // nothing ever retries the enable. The sub-second gap of a clean
             // cycle is invisible next to the phone's scan interval.
+            for handle in &mut handles {
+                handle.unregister().await?;
+            }
             drop(handles);
-            tokio::select! {
-                _ = ctk.cancelled() => {
-                    info!("{RX_INNER_NAME}: tracker cancelled, returning");
-                    return Ok(());
-                }
-                _ = tokio::time::sleep(Self::CYCLE_GRACE) => {}
+            if ctk.is_cancelled() {
+                return Ok(());
             }
         }
     }
@@ -667,7 +658,7 @@ impl ReceiverAdvertiser {
             ..Default::default()
         };
 
-        match self.advertise_bounded(build(true)).await {
+        match self.advertise_acknowledged(build(true)).await {
             Ok(handle) => Ok(handle),
             Err(e) => {
                 // Min/MaxInterval are experimental in BlueZ and a daemon
@@ -676,30 +667,18 @@ impl ReceiverAdvertiser {
                 debug!(
                     "{RX_INNER_NAME}: the adapter wouldn't take a fast advertising interval ({e}); using BlueZ defaults"
                 );
-                self.advertise_bounded(build(false)).await
+                self.advertise_acknowledged(build(false)).await
             }
         }
     }
 
-    /// `Adapter::advertise` with a hard deadline: dropping the timed-out
-    /// future abandons the D-Bus call, so a wedged bluetoothd round-trip
-    /// costs one retry instead of parking the advertiser forever.
-    async fn advertise_bounded(
+    /// BlueR owns the bounded D-Bus request and cleanup even if registration
+    /// fails. Do not abandon the registration future with an outer timeout.
+    async fn advertise_acknowledged(
         &self,
         adv: Advertisement,
     ) -> Result<bluer::adv::AdvertisementHandle, anyhow::Error> {
-        match tokio::time::timeout(
-            Self::REGISTER_TIMEOUT,
-            linuxdrop_network::advertise(&self.adapter, adv),
-        )
-        .await
-        {
-            Ok(result) => Ok(result?),
-            Err(_) => Err(anyhow::anyhow!(
-                "RegisterAdvertisement didn't answer within {:?}",
-                Self::REGISTER_TIMEOUT
-            )),
-        }
+        linuxdrop_network::advertise(&self.adapter, adv).await
     }
 }
 

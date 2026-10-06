@@ -253,3 +253,9 @@ and refusal to interrupt an existing receive request. Native GTK verifies the
 transition controls. This closes admission races, not the entire lifecycle row:
 the fixed backend shutdown delay still needs explicit resource-drain completion,
 and reverse-offer active stream accounting/helper-loss simulations remain required.
+
+2026-10-07 Bluetooth lifecycle follow-up: explicit unregister acknowledgement,
+registration-cancellation cleanup, shared slot admission and dedicated D-Bus owner
+teardown are implemented and exercised by the private BlueZ mock. The broader
+controller rows remain unchecked until external Release/power-loss and every
+scanner/GATT/L2CAP path have their matching software acceptance.
