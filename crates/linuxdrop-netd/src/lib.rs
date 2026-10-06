@@ -123,11 +123,15 @@ pub struct Client {
 impl Client {
     pub async fn connect() -> std::io::Result<Self> {
         let stream = tokio::net::UnixStream::connect(SOCKET_PATH).await?;
+        Ok(Self::from_stream(stream))
+    }
+    /// Use an already connected Unix socket with the same framed helper protocol.
+    pub fn from_stream(stream: tokio::net::UnixStream) -> Self {
         let (reader, writer) = stream.into_split();
-        Ok(Self {
+        Self {
             reader: tokio::io::BufReader::new(reader),
             writer,
-        })
+        }
     }
     pub async fn request(&mut self, request: &Request) -> std::io::Result<Response> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};

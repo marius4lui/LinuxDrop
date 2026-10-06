@@ -95,6 +95,7 @@ pub fn tr(message: &str) -> String {
         "Use 4 to 12 digits. Apply the PIN before requiring it from senders." => "Verwende 4 bis 12 Ziffern. Übernimm die PIN, bevor du sie von Absendern verlangst.",
         "Sharing services are restarting; try again shortly" => "Freigabedienste werden neu gestartet. Gleich geht es weiter.",
         "Sharing could not restart. Retry in Settings after cleanup finishes." => "Die Freigabedienste konnten nicht neu starten. Versuche es nach dem Beenden erneut in den Einstellungen.",
+        "Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services." => "Der Netzwerk-Helfer ist nicht erreichbar. Der Freigabedienst wurde gestoppt; der Adapter wird möglicherweise noch freigegeben. Verbinde ihn erneut und starte die Freigabedienste in den Einstellungen neu.",
         "Applying sharing settings" => "Freigabeeinstellungen werden angewendet",
         "starting" => "Startet",
         "error" => "Fehler",

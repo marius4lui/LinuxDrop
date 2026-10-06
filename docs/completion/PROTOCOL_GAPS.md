@@ -259,3 +259,25 @@ registration-cancellation cleanup, shared slot admission and dedicated D-Bus own
 teardown are implemented and exercised by the private BlueZ mock. The broader
 controller rows remain unchecked until external Release/power-loss and every
 scanner/GATT/L2CAP path have their matching software acceptance.
+
+
+## Helper-loss recovery, 2026-10-07
+
+Daemon helper sockets now retain the exact acquired lease identity and the backend
+startup generation. Status for another lease owned by the same UID cannot keep a
+lost service ready. Helper I/O failures and timeouts quarantine that generation,
+remove its discoverable protocols, fail unfinished transfers with persisted
+history/notifications, and retain backend cleanup receipts for restart. Delayed
+ready/discovery/progress events cannot revive the failed backend. Actors finishing
+initialization after a fault are retired instead of exposed for sending. Generation
+advancement and event/fault application share the data lock; stale health results
+cannot stop the replacement service. P2P connector instances cannot reuse another
+lease. Cleanup runs outside the data lock and outside the P2P request's actor wait.
+
+Passed: nine daemon tests (four new actual Unix-socket/race/cleanup regressions),
+all-target daemon/netd Clippy, and the real daemon private D-Bus/HTTPS integration.
+The helper-loss tests cover exact versus unrelated same-user leases, pending cleanup,
+late initialization, stale results across restart and P2P socket failure. No physical
+unplug acceptance or completion of all netd journal/recovery work is inferred.
+Final daemon-exit draining remains a separate software item. Installed packages
+and the user's live demo have not been replaced by this source revision.

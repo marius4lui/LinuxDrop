@@ -156,3 +156,15 @@ cleanup. Restart/reset dialogs explain why a live link must be stopped first.
 The private GTK regression tested stop failure then successful retry. The German
 480x600 render `ui/completion/active-download-link.png` fits the text, button,
 transfer progress and navigation without overlap.
+
+
+## 2026-10-07: recoverable helper failure
+
+Lost radio-helper ownership no longer leaves nearby devices or active transfers
+shown as ready. The error explains that radio cleanup may still be running and
+points to adapter reconnection and service restart in Settings. GTK and the Shell
+bubble have the German translation; the Shell now translates terminal error text.
+The isolated GNOME 46 smoke passed with German/150% text, including replacement
+of Cancel with Details/Done after helper failure and the translated explanation.
+This is runtime behavior acceptance, not a new rendered image or physical-radio
+claim. The live demo remains unchanged.

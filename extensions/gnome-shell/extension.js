@@ -269,7 +269,7 @@ export default class LinuxDropExtension extends Extension {
             const files = current.files ?? [];
             this._body.add_child(textLabel(files.length === 1 ? files[0].name : filesStatus(files.length, active.length), 'linuxdrop-notch-subtitle', files.length === 1));
             if (TERMINAL.has(current.state)) {
-                this._body.add_child(textLabel(current.error || t(current.state), current.state === 'failed' ? 'linuxdrop-notch-error' : 'linuxdrop-notch-subtitle'));
+                this._body.add_child(textLabel(t(current.error || current.state), current.state === 'failed' ? 'linuxdrop-notch-error' : 'linuxdrop-notch-subtitle'));
                 const actions = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
                 const saved = current.saved_paths?.[0];
                 if (current.state === 'completed' && saved) {

@@ -1,3 +1,4 @@
+mod helper;
 mod history;
 mod notifications;
 mod preferences;
@@ -38,6 +39,7 @@ struct Data {
     drafts: HashMap<String, Draft>,
     commands: HashMap<String, CommandSender>,
     retiring: HashMap<String, CommandSender>,
+    failed_backends: HashSet<String>,
     visibility_since: Option<Instant>,
     decisions: HashSet<String>,
     stop_when_idle: bool,
@@ -61,8 +63,8 @@ struct Shared {
     config_path: PathBuf,
     data_dir: PathBuf,
     restart: mpsc::Sender<()>,
-    helper: Mutex<Option<linuxdrop_netd::Client>>,
-    quickshare_helper: Mutex<Option<linuxdrop_netd::Client>>,
+    helper: Mutex<Option<helper::HelperLease>>,
+    quickshare_helper: Mutex<Option<helper::HelperLease>>,
     backend_generation: std::sync::atomic::AtomicU64,
     locked: std::sync::atomic::AtomicBool,
     download_offer: Mutex<Option<linuxdrop_localsend::reverse::ReverseOffer>>,
@@ -299,20 +301,26 @@ impl HelperP2p {
             .upgrade()
             .context("LinuxDrop is shutting down")?;
         let mut slot = shared.quickshare_helper.lock().await;
-        let client = slot
+        let lease = slot
             .as_mut()
             .context("Direct Wi-Fi helper lease is unavailable")?;
-        match tokio::time::timeout(Duration::from_secs(110), client.request(&request)).await {
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(error)) => {
-                slot.take();
-                Err(error.into())
-            }
-            Err(error) => {
-                slot.take();
-                Err(error.into())
-            }
-        }
+        anyhow::ensure!(
+            lease.expected.id == self.lease_id,
+            "Direct Wi-Fi lease was replaced"
+        );
+        let generation = lease.generation;
+        let result =
+            match tokio::time::timeout(Duration::from_secs(110), lease.client.request(&request))
+                .await
+            {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error)) => Err(error.into()),
+                Err(error) => Err(error.into()),
+            };
+        slot.take();
+        drop(slot);
+        helper::failed(&shared, "quickshare", generation).await;
+        result
     }
 }
 impl linuxdrop_network::P2pConnector for HelperP2p {
@@ -1016,10 +1024,16 @@ async fn apply_autostart(enabled: bool) -> Result<()> {
 }
 
 async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendEvent)>) {
-    let generation = shared
-        .backend_generation
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-        + 1;
+    // Advance the generation under the same lock used to apply fault/events.
+    let generation = {
+        let mut data = shared.data.lock().await;
+        let generation = shared
+            .backend_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        data.failed_backends.clear();
+        generation
+    };
     let (events, mut receiver) = mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
@@ -1203,8 +1217,14 @@ async fn install_backend(shared: &Arc<Shared>, id: &str, result: Result<CommandS
     let mut data = shared.data.lock().await;
     match result {
         Ok(tx) => {
-            data.commands.insert(id.into(), tx);
+            if data.failed_backends.contains(id) {
+                data.retiring.insert(id.into(), tx.clone());
+                helper::drain(id.to_owned(), tx);
+            } else {
+                data.commands.insert(id.into(), tx);
+            }
         }
+        Err(_) if data.failed_backends.contains(id) => {}
         Err(error) => {
             data.backends.insert(
                 id.into(),
@@ -1237,16 +1257,13 @@ async fn start_airdrop(
     events: EventSender,
 ) -> Result<CommandSender> {
     let inventory = linuxdrop_hardware::inventory().await;
-    let leased = if let Some(client) = shared.quickshare_helper.lock().await.as_mut() {
-        match client.request(&linuxdrop_netd::Request::Status).await {
-            Ok(linuxdrop_netd::Response::State { leases, .. }) => {
-                leases.into_iter().map(|lease| lease.phy).collect()
-            }
-            _ => vec![],
-        }
-    } else {
-        vec![]
-    };
+    let leased = shared
+        .quickshare_helper
+        .lock()
+        .await
+        .as_ref()
+        .map(|lease| vec![lease.expected.phy.clone()])
+        .unwrap_or_default();
     let preferred = settings["hardware"]["preferred_adapter"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -1277,13 +1294,15 @@ async fn start_airdrop(
         client.request(&linuxdrop_netd::Request::AcquireAwdl { radio_id, channel }),
     )
     .await??;
-    let interface = match response {
-        linuxdrop_netd::Response::Acquired { lease } => lease
-            .awdl_interface
-            .context("Helper did not return an AWDL interface")?,
+    let lease = match response {
+        linuxdrop_netd::Response::Acquired { lease } => *lease,
         linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
         _ => anyhow::bail!("Unexpected helper response"),
     };
+    let interface = lease
+        .awdl_interface
+        .clone()
+        .context("Helper did not return an AWDL interface")?;
     let bandwidth = shared.bandwidth.lock().await.clone();
     let tx = linuxdrop_airdrop::start_with_budget(
         linuxdrop_airdrop::Config {
@@ -1300,7 +1319,7 @@ async fn start_airdrop(
         bandwidth,
     )
     .await?;
-    *shared.helper.lock().await = Some(client);
+    *shared.helper.lock().await = Some(helper::HelperLease::new(client, lease, shared));
     Ok(tx)
 }
 
@@ -1320,13 +1339,14 @@ async fn reserve_direct_wifi(
         _ => anyhow::bail!("Unexpected direct Wi-Fi helper response"),
     };
     let result = linuxdrop_quickshare::DirectWifiLease {
-        interface: lease.interface,
-        lease_id: lease.id,
+        interface: lease.interface.clone(),
+        lease_id: lease.id.clone(),
         connection_uuid: lease
             .connection_uuid
+            .clone()
             .context("Direct Wi-Fi lease missing its connection ownership marker")?,
     };
-    *shared.quickshare_helper.lock().await = Some(client);
+    *shared.quickshare_helper.lock().await = Some(helper::HelperLease::new(client, *lease, shared));
     Ok(result)
 }
 
@@ -1450,6 +1470,7 @@ async fn main() -> Result<()> {
             drafts: HashMap::new(),
             commands: HashMap::new(),
             retiring: HashMap::new(),
+            failed_backends: HashSet::new(),
             visibility_since: None,
             decisions: HashSet::new(),
             stop_when_idle: false,
@@ -1482,29 +1503,7 @@ async fn main() -> Result<()> {
                 ("airdrop", &helper.helper),
                 ("quickshare", &helper.quickshare_helper),
             ] {
-                let mut connection = socket.lock().await;
-                if let Some(client) = connection.as_mut() {
-                    if !matches!(tokio::time::timeout(Duration::from_secs(5),client.request(&linuxdrop_netd::Request::Status)).await,Ok(Ok(linuxdrop_netd::Response::State{leases,..})) if !leases.is_empty())
-                    {
-                        connection.take();
-                        drop(connection);
-                        let mut d = helper.data.lock().await;
-                        if let Some(tx) = d.commands.remove(backend) {
-                            let _ = tx.send(BackendCommand::Shutdown).await;
-                        }
-                        d.backends.insert(
-                            backend.into(),
-                            BackendState {
-                                id: backend.into(),
-                                state: "error".into(),
-                                detail: "Network helper connection lost; radio lease released"
-                                    .into(),
-                            },
-                        );
-                        drop(d);
-                        helper.changed().await;
-                    }
-                }
+                helper::poll(&helper, backend, socket).await;
             }
         }
     });
@@ -1595,8 +1594,9 @@ async fn main() -> Result<()> {
                     && shared.download_offer.lock().await.as_ref().is_none_or(|offer| offer.active_downloads() == 0) {break;}
             },
             Some((generation,event))=event_rx.recv()=>{
-                if generation != shared.backend_generation.load(std::sync::atomic::Ordering::Acquire) {continue;}
                 let mut d=shared.data.lock().await;
+                if generation != shared.backend_generation.load(std::sync::atomic::Ordering::Acquire) {continue;}
+                let Some(event) = helper::filter_event(&d, event) else {continue;};
                 let mut notification=None;
                 if let BackendEvent::Incoming(t)|BackendEvent::TransferUpdated(t)=&event {
                     if !d.transfers.contains_key(&t.id){d.transfer_order.push(t.id.clone());}
@@ -1609,7 +1609,7 @@ async fn main() -> Result<()> {
                             let full=!d.transfers.contains_key(&transfer.id) && d.transfers.values().filter(|t|!t.is_terminal()).count() >= d.settings["transfers"]["max_parallel"].as_u64().unwrap() as usize;
                             let blocked=d.peer_preferences.get(&transfer.peer_id).is_some_and(|p|p.blocked);
                             let receive_disabled=transfer.protocol=="airdrop" && d.settings["airdrop"]["receive"]!=true;
-                            if full || blocked || receive_disabled || d.restarting || d.stop_when_idle || shared.locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            if full || blocked || receive_disabled || d.failed_backends.contains(&transfer.protocol) || d.restarting || d.stop_when_idle || shared.locked.load(std::sync::atomic::Ordering::Relaxed) {
                                 if let Some(tx)=d.commands.get(&transfer.protocol) {let _=tx.try_send(BackendCommand::Reject{transfer_id:transfer.id.clone()});}
                                 transfer.state="rejected".into();
                                 transfer.error=Some("LinuxDrop is not accepting this request".into());

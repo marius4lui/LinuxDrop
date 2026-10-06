@@ -47,11 +47,17 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     check(!find(this._body, 'Cancel').reactive, 'Mutation must be disabled while pending');
                     check(find(this._body, 'Details').reactive, 'Details must remain available while pending');
                     check(global.stage.get_key_focus() === this._header, 'Status rebuild must retain focus inside the bubble');
+                    this._actionPending = false;
+                    current.state = 'failed';
+                    current.error = 'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.';
+                    this._render();
+                    check(this._body.get_children().some(child => child instanceof St.Label && child.text === t(current.error)), 'Helper failure must show its translated recovery explanation');
+                    check(!find(this._body, 'Cancel') && find(this._body, 'Details') && find(this._body, 'Done'), 'Failed transfer must replace stale cancellation with recovery navigation');
                     this._actionPending = false; this._serviceState = 'offline'; this._snapshot = null; this._render();
                     check(!find(this._body, 'Cancel') && find(this._body, 'Open LinuxDrop'), 'Offline state must replace stale transfer actions');
                     this._setExpanded(false);
                     check(!this._notch.visible && global.stage.get_key_focus() === this._panelButton, 'Close must hide and restore panel focus');
-                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, native scroll, verification, chooser, progress, busy, offline, focus');
+                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, native scroll, verification, chooser, progress, busy, helper failure, offline, focus');
                 });
             });
         });
