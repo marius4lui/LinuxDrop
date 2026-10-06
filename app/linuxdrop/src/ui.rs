@@ -1162,15 +1162,17 @@ impl Ui {
         let ui = self.clone();
         glib::MainContext::default().spawn_local(async move {
             let result = async {
-                let draft = ipc::string_result(
-                    ipc::call(&proxy, "PrepareSend", Some((paths,).to_variant())).await?,
-                )?;
-                ipc::call(
+                let draft = ipc::prepare_files(&proxy, paths).await?;
+                let result = ipc::call(
                     &proxy,
                     "StartSend",
-                    Some((draft, peer, protocol).to_variant()),
+                    Some((draft.clone(), peer, protocol).to_variant()),
                 )
-                .await
+                .await;
+                if result.is_err() {
+                    let _ = ipc::call(&proxy, "DiscardDraft", Some((draft,).to_variant())).await;
+                }
+                result
             }
             .await;
             ui.busy.set(false);
@@ -1222,13 +1224,18 @@ impl Ui {
                 .collect();
             glib::MainContext::default().spawn_local(async move {
                 let result: Result<Value, String> = async {
-                    let draft = ipc::string_result(
-                        ipc::call(&proxy, "PrepareSend", Some((paths,).to_variant())).await?,
-                    )?;
-                    let result = ipc::string_result(
-                        ipc::call(&proxy, "CreateDownloadOffer", Some((draft,).to_variant()))
-                            .await?,
-                    )?;
+                    let draft = ipc::prepare_files(&proxy, paths).await?;
+                    let reply = ipc::call(
+                        &proxy,
+                        "CreateDownloadOffer",
+                        Some((draft.clone(),).to_variant()),
+                    )
+                    .await;
+                    if reply.is_err() {
+                        let _ =
+                            ipc::call(&proxy, "DiscardDraft", Some((draft,).to_variant())).await;
+                    }
+                    let result = ipc::string_result(reply?)?;
                     serde_json::from_str(&result).map_err(|error| error.to_string())
                 }
                 .await;

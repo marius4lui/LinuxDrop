@@ -58,3 +58,60 @@ pub fn string_result(value: glib::Variant) -> Result<String, String> {
         .map(|v| v.0)
         .ok_or_else(|| "Invalid service response".into())
 }
+
+/// Pass opened sources, so the host daemon need not resolve sandbox paths.
+/// Small batches stay within ordinary session-bus descriptor limits.
+pub async fn prepare_files(proxy: &gio::DBusProxy, paths: Vec<String>) -> Result<String, String> {
+    if paths.is_empty() {
+        return Err(crate::i18n::tr("Select files first"));
+    }
+    let mut draft = String::new();
+    let result = async {
+        for paths in paths.chunks(16) {
+            let paths = paths.to_vec();
+            let files = gio::spawn_blocking(move || {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let source = linuxdrop_core::SendSource::open(path)?;
+                        Ok((source.name().to_owned(), source.reader()?))
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()
+            })
+            .await
+            .map_err(|_| "File preparation failed".to_owned())?
+            .map_err(|error| error.to_string())?;
+            let descriptors = gio::UnixFDList::new();
+            let entries = files
+                .into_iter()
+                .map(|(name, file)| {
+                    descriptors
+                        .append(file)
+                        .map(|index| (name, glib::variant::Handle(index)))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            let parameters = (draft.clone(), entries).to_variant();
+            let (reply, _) = proxy
+                .call_with_unix_fd_list_future(
+                    "PrepareSendFiles",
+                    Some(&parameters),
+                    gio::DBusCallFlags::NONE,
+                    30000,
+                    Some(&descriptors),
+                )
+                .await
+                .map_err(|mut error| {
+                    gio::DBusError::strip_remote_error(&mut error);
+                    crate::i18n::tr(error.message())
+                })?;
+            draft = string_result(reply)?;
+        }
+        Ok(draft.clone())
+    }
+    .await;
+    if result.is_err() && !draft.is_empty() {
+        let _ = call(proxy, "DiscardDraft", Some((draft,).to_variant())).await;
+    }
+    result
+}

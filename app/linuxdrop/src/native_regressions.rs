@@ -81,11 +81,15 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let sent_protocol = Rc::new(RefCell::new(String::new()));
     let accepted_options = Rc::new(RefCell::new(Value::Null));
     let fail_next_accept = Rc::new(Cell::new(false));
-    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSend'><arg type='as' direction='in'/><arg type='s' direction='out'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
+    let batches = Rc::new(RefCell::new(Vec::new()));
+    let discarded = Rc::new(Cell::new(false));
+    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
     let accepted = accepted_options.clone();
     let fail_accept = fail_next_accept.clone();
+    let sent_batches = batches.clone();
+    let was_discarded = discarded.clone();
     let registration = bus
         .register_object(ipc::PATH, &info.interfaces()[0])
         .method_call(
@@ -93,10 +97,29 @@ fn native_draft_focus_protocol_and_settings_regressions() {
                 "GetSnapshot" => {
                     invocation.return_value(Some(&(state.borrow().to_string(),).to_variant()))
                 }
-                "PrepareSend" => {
+                "PrepareSendFiles" => {
+                    use std::os::fd::FromRawFd;
+                    let (_, entries) = parameters
+                        .get::<(String, Vec<(String, glib::variant::Handle)>)>()
+                        .unwrap();
+                    let descriptors = invocation
+                        .message()
+                        .unix_fd_list()
+                        .expect("Native sends must include descriptors");
+                    assert!(!entries.is_empty());
+                    sent_batches.borrow_mut().push(entries.len());
+                    for (_, handle) in entries {
+                        let fd = descriptors.get(handle.0).unwrap();
+                        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+                        assert!(file.metadata().unwrap().is_file());
+                    }
                     glib::timeout_add_local_once(Duration::from_millis(250), move || {
                         invocation.return_value(Some(&("draft",).to_variant()))
                     });
+                }
+                "DiscardDraft" => {
+                    was_discarded.set(true);
+                    invocation.return_value(None);
                 }
                 "StartSend" => {
                     let (_, _, protocol) = parameters.get::<(String, String, String)>().unwrap();
@@ -280,6 +303,15 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert_eq!(address.text(), "http://192.168.1.20:53317");
         capture(&ui, "download-offer-review.png");
         download.force_close();
+        let proxy = ui.proxy.borrow().clone().unwrap();
+        batches.borrow_mut().clear();
+        let many = vec![first.to_str().unwrap().to_owned(); 17];
+        assert_eq!(ipc::prepare_files(&proxy, many).await.unwrap(), "draft");
+        assert_eq!(*batches.borrow(), vec![16, 1], "Native selection must split FD messages");
+        let mut broken = vec![first.to_str().unwrap().to_owned(); 16];
+        broken.push(root.join("not-present").to_str().unwrap().to_owned());
+        assert!(ipc::prepare_files(&proxy, broken).await.is_err());
+        assert!(discarded.get(), "A failed later batch releases the partial draft");
         ui.allow_close.set(true);
         ui.window.close();
     });

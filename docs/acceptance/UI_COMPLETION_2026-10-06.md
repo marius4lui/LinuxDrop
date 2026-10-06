@@ -113,3 +113,22 @@ secondary actions fit; long peer/file names use intentional ellipsis. Relative
 font sizes now respect the system text setting. The final Shell regression also
 changes each file's byte progress and verifies stable Quick Settings device
 actors, covering the two focus regressions found during root review.
+
+
+## Portal descriptor handoff ? 2026-10-07
+
+The native app now passes opened regular files with `PrepareSendFiles`, using
+batches of at most 16 Unix descriptors. Combined draft count/size rules apply to
+all batches; each append is atomic. A failed preparation or failed start/offer
+releases its partial draft. The daemon also expires abandoned descriptors on its
+maintenance tick. Host-path PrepareSend stays available for existing clients.
+
+Passed: targeted daemon tests, all-target workspace Clippy and the isolated GTK
+regression including descriptor validation, 17-file client batching and cleanup
+when the next file cannot be opened. The new
+`tests/integration/run-fd-portal.sh` uses a private network namespace and bus with
+an actual document portal. It exports and revokes a document, closes client file
+handles, replaces the original path and receives all 25 offered files byte-for-byte
+from the retained descriptors. Write-only descriptors, directories, pipes, invalid
+names and combined-count overflow are rejected without partially appending a batch.
+No installed Flatpak or physical device acceptance is inferred from this test.

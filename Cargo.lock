@@ -1984,6 +1984,7 @@ version = "0.1.0"
 dependencies = [
  "gtk4",
  "libadwaita",
+ "linuxdrop-core",
  "serde_json",
 ]
 

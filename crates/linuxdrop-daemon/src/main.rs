@@ -483,6 +483,71 @@ impl Manager {
         );
         Ok(id)
     }
+    /// Empty draft_id creates a selection; subsequent bounded batches append atomically.
+    async fn prepare_send_files(
+        &self,
+        draft_id: String,
+        entries: Vec<(String, zbus::zvariant::OwnedFd)>,
+    ) -> zbus::fdo::Result<String> {
+        if entries.is_empty() || entries.len() > 16 {
+            return Err(failed("Send between 1 and 16 file descriptors per batch"));
+        }
+        let files = entries
+            .into_iter()
+            .map(|(name, fd)| {
+                let fd: std::os::fd::OwnedFd = fd.into();
+                SendSource::from_file(name, std::fs::File::from(fd)).map_err(failed)
+            })
+            .collect::<zbus::fdo::Result<Vec<_>>>()?;
+        let mut d = self.0.data.lock().await;
+        if d.stop_when_idle {
+            return Err(failed(
+                "LinuxDrop is finishing active transfers before closing",
+            ));
+        }
+        d.drafts
+            .retain(|_, draft| draft.created.elapsed() < Duration::from_secs(1800));
+        let old = if draft_id.is_empty() {
+            if d.drafts.len() >= 64 {
+                return Err(failed("Too many prepared selections"));
+            }
+            None
+        } else {
+            Some(
+                d.drafts
+                    .get(&draft_id)
+                    .ok_or_else(|| failed("File selection expired"))?,
+            )
+        };
+        let existing = old.map(|draft| draft.files.as_slice()).unwrap_or_default();
+        if existing.len() + files.len()
+            > d.settings["receive"]["max_files"].as_u64().unwrap_or(1000) as usize
+        {
+            return Err(failed("Invalid file selection"));
+        }
+        let total = existing
+            .iter()
+            .chain(&files)
+            .try_fold(0u64, |total, source| total.checked_add(source.size()))
+            .ok_or_else(|| failed("File size overflow"))?;
+        if total > d.settings["receive"]["max_bytes"].as_u64().unwrap() {
+            return Err(failed("Selection exceeds configured size limit"));
+        }
+        let id = if draft_id.is_empty() {
+            Uuid::new_v4().to_string()
+        } else {
+            draft_id
+        };
+        d.drafts
+            .entry(id.clone())
+            .or_insert_with(|| Draft {
+                files: Vec::new(),
+                created: Instant::now(),
+            })
+            .files
+            .extend(files);
+        Ok(id)
+    }
     async fn discard_draft(&self, draft_id: String) {
         self.0.data.lock().await.drafts.remove(&draft_id);
     }
@@ -1392,7 +1457,8 @@ async fn main() -> Result<()> {
         tokio::select! {
             _=tokio::signal::ctrl_c()=>break,
             _=shutdown_tick.tick()=>{
-                let d=shared.data.lock().await;
+                let mut d=shared.data.lock().await;
+                d.drafts.retain(|_, draft| draft.created.elapsed() < Duration::from_secs(1800));
                 if d.stop_when_idle && !d.transfers.values().any(|t|!t.is_terminal()) {break;}
             },
             Some((generation,event))=event_rx.recv()=>{
