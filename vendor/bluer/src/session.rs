@@ -33,7 +33,7 @@ use tokio::{
 
 use crate::{
     adapter,
-    adv::Advertisement,
+    adv::{Advertisement, RegisteredAdvertisement},
     agent::{Agent, AgentHandle, RegisteredAgent},
     all_dbus_objects, gatt,
     monitor::RegisteredMonitor,
@@ -57,7 +57,7 @@ type SingleSessionTerm = (Weak<oneshot::Sender<()>>, oneshot::Receiver<()>);
 pub(crate) struct SessionInner {
     pub connection: Arc<SyncConnection>,
     pub crossroads: Mutex<Crossroads>,
-    pub le_advertisment_token: IfaceToken<Advertisement>,
+    pub le_advertisment_token: IfaceToken<RegisteredAdvertisement>,
     pub gatt_reg_service_token: IfaceToken<Arc<gatt::local::RegisteredService>>,
     pub gatt_reg_characteristic_token: IfaceToken<Arc<gatt::local::RegisteredCharacteristic>>,
     pub gatt_reg_characteristic_descriptor_token:

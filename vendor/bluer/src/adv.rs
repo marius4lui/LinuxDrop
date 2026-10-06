@@ -238,9 +238,28 @@ pub struct Advertisement {
     pub _non_exhaustive: (),
 }
 
+pub(crate) struct RegisteredAdvertisement {
+    advertisement: Advertisement,
+    owner: String,
+    released: tokio::sync::watch::Sender<bool>,
+}
+impl std::ops::Deref for RegisteredAdvertisement {
+    type Target = Advertisement;
+    fn deref(&self) -> &Advertisement {
+        &self.advertisement
+    }
+}
+
 impl Advertisement {
-    pub(crate) fn register_interface(cr: &mut Crossroads) -> IfaceToken<Self> {
-        cr.register(ADVERTISEMENT_INTERFACE, |ib: &mut IfaceBuilder<Self>| {
+    pub(crate) fn register_interface(cr: &mut Crossroads) -> IfaceToken<RegisteredAdvertisement> {
+        cr.register(ADVERTISEMENT_INTERFACE, |ib: &mut IfaceBuilder<RegisteredAdvertisement>| {
+            ib.method("Release", (), (), |ctx, advertisement, ()| {
+                if !ctx.message().sender().is_some_and(|sender| sender.as_ref() == advertisement.owner) {
+                    return Err(dbus::MethodErr::failed("Release is only accepted from the registering BlueZ owner"));
+                }
+                advertisement.released.send_replace(true);
+                Ok(())
+            });
             cr_property!(ib, "Type", la => {
                 Some(la.advertisement_type.to_string())
             });
@@ -308,13 +327,33 @@ impl Advertisement {
         .unwrap();
         log::trace!("Publishing advertisement at {}", &name);
 
+        let bus = Proxy::new(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            Duration::from_secs(15),
+            inner.connection.clone(),
+        );
+        let (owner,): (String,) = bus
+            .method_call("org.freedesktop.DBus", "GetNameOwner", (SERVICE_NAME,))
+            .await?;
+        let (released_tx, released) = tokio::sync::watch::channel(false);
         {
             let mut cr = inner.crossroads.lock().await;
-            cr.insert(name.clone(), &[inner.le_advertisment_token], self);
+            cr.insert(
+                name.clone(),
+                &[inner.le_advertisment_token],
+                RegisteredAdvertisement {
+                    advertisement: self,
+                    owner: owner.clone(),
+                    released: released_tx,
+                },
+            );
         }
 
+        // Bind this lifecycle to one bluetoothd instance. A restarted daemon
+        // must not receive cleanup requests for another owner's registration.
         let proxy = Proxy::new(
-            SERVICE_NAME,
+            owner,
             Adapter::dbus_path(&adapter_name)?,
             Duration::from_secs(15),
             inner.connection.clone(),
@@ -323,6 +362,7 @@ impl Advertisement {
         let (drop_tx, drop_rx) = oneshot::channel();
         let (finished, completion) = tokio::sync::watch::channel(None);
         let unreg_name = name.clone();
+        let mut released_rx = released.clone();
         // Own registration until its reply, even if the caller's future is
         // cancelled. A late successful reply must still be unregistered.
         tokio::spawn(async move {
@@ -338,11 +378,23 @@ impl Advertisement {
             let mut registered_tx = Some(registered_tx);
             if registered.is_ok() {
                 let _ = registered_tx.take().unwrap().send(Ok(()));
-                let _ = drop_rx.await;
+                tokio::select! {
+                    _ = drop_rx => {},
+                    _ = async {
+                        while !*released_rx.borrow() {
+                            if released_rx.changed().await.is_err() { break; }
+                        }
+                    } => {},
+                }
             }
             // A failed/timed-out registration may have reached bluetoothd.
             // Keep the object alive and retry cleanup until absence is confirmed.
             loop {
+                // Release itself confirms removal; BlueZ explicitly says not
+                // to unregister again after that callback.
+                if *released_rx.borrow() {
+                    break;
+                }
                 let result: std::result::Result<(), dbus::Error> = proxy
                     .method_call(
                         MANAGER_INTERFACE,
@@ -358,6 +410,7 @@ impl Advertisement {
                             Some(
                                 "org.bluez.Error.DoesNotExist"
                                     | "org.freedesktop.DBus.Error.ServiceUnknown"
+                                    | "org.freedesktop.DBus.Error.NameHasNoOwner"
                                     | "org.freedesktop.DBus.Error.UnknownObject"
                                     | "org.freedesktop.DBus.Error.UnknownMethod"
                             )
@@ -377,7 +430,7 @@ impl Advertisement {
             }
             log::trace!("Unpublishing advertisement at {}", &unreg_name);
             let mut cr = inner.crossroads.lock().await;
-            let _: Option<Self> = cr.remove(&unreg_name);
+            let _: Option<RegisteredAdvertisement> = cr.remove(&unreg_name);
             finished.send_replace(Some(Ok(())));
             if let Some(reply) = registered_tx {
                 let _ = reply.send(registered);
@@ -391,6 +444,7 @@ impl Advertisement {
             name,
             _drop_tx: Some(drop_tx),
             completion,
+            released,
         })
     }
 }
@@ -403,9 +457,21 @@ pub struct AdvertisementHandle {
     name: dbus::Path<'static>,
     _drop_tx: Option<oneshot::Sender<()>>,
     completion: tokio::sync::watch::Receiver<Option<Result<()>>>,
+    released: tokio::sync::watch::Receiver<bool>,
 }
 
 impl AdvertisementHandle {
+    /// Wait for external Release or completed local removal without initiating
+    /// removal. Safe to cancel and restart this wait.
+    pub async fn released(&self) {
+        let mut released = self.released.clone();
+        while !*released.borrow() {
+            if released.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
     /// Unregister and wait until BlueZ confirms removal and the local object
     /// is unpublished. Cancelling this wait does not cancel cleanup; it can be
     /// called again. Dropping the handle retains the original background cleanup.

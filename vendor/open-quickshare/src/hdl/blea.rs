@@ -1,18 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bluer::UuidExt;
 use bluer::adv::Advertisement;
+use bluer::UuidExt;
 use bytes::Bytes;
 use once_cell::sync::Lazy;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use tokio::sync::Notify;
 use tokio::sync::watch;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::hdl::{BleScanSuppressor, Visibility, scanning_suppressed};
+use crate::hdl::{scanning_suppressed, BleScanSuppressor, Visibility};
 
 /// Rings when a connection has consumed the receiver advertisement and the
 /// link is gone, so [`ReceiverAdvertiser`] should put a fresh one on the air.
@@ -72,10 +72,14 @@ impl BleAdvertiser {
             self.get_advertisement(service_uuid, SERVICE_DATA),
         )
         .await?;
-        ctk.cancelled().await;
-        info!("{INNER_NAME}: tracker cancelled, returning");
+        let released = tokio::select! {
+            _ = ctk.cancelled() => false,
+            _ = handle.released() => true,
+        };
         handle.unregister().await?;
-
+        if released {
+            anyhow::bail!("Bluetooth sender advertisement was removed by BlueZ");
+        }
         Ok(())
     }
 
@@ -568,6 +572,10 @@ impl ReceiverAdvertiser {
                         for handle in &mut handles { handle.unregister().await?; }
                         return Ok(());
                     }
+                    _ = async { futures::future::select_all(handles.iter().map(|handle| Box::pin(handle.released()))).await; } => {
+                        warn!("{RX_INNER_NAME}: BlueZ released our advertisement; registering again");
+                        break;
+                    }
                     _ = ADV_CYCLE.notified() => {
                         debug!("{RX_INNER_NAME}: advertisement consumed by a connection; cycling");
                         break;
@@ -583,11 +591,10 @@ impl ReceiverAdvertiser {
                         }
                     }
                     _ = tokio::time::sleep(Self::WATCH) => {
-                        // Watchdog: instances vanishing under us (a bluetoothd
-                        // restart, a Release we never saw) would otherwise go
-                        // unnoticed -- the handles we hold don't know.
+                        // Backstop for controller loss or a daemon restart that
+                        // could not deliver a Release callback.
                         let live = self.adapter.active_advertising_instances().await.unwrap_or(0);
-                        if (live as usize) < handles.len() {
+                        if !self.adapter.is_powered().await.unwrap_or(false) || (live as usize) < handles.len() {
                             warn!(
                                 "{RX_INNER_NAME}: only {live} advertising instance(s) on the adapter, expected {}; re-registering",
                                 handles.len()

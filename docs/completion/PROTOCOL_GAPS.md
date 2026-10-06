@@ -337,3 +337,28 @@ D-Bus/HTTPS daemon test sends explicitly written metadata JSON (including future
 fields) and checks exact saved nanosecond timestamps before reading the contents.
 This is software acceptance, not official mobile-client or physical-device proof.
 The installed demo/packages remain unchanged pending final builds.
+
+
+## External Bluetooth advertisement release, 2026-10-07
+
+Implemented the BlueZ `LEAdvertisement1.Release()` callback with verification of
+the registering daemon's unique D-Bus owner. Explicit cleanup is tied to that same
+owner and never targets a replacement bluetoothd process. A released registration
+is observed by its own handle rather than inferred only from controller-wide
+instance counts. Quick Share's receiver renews its advertisement; its sender exits
+with an actionable component failure. AirDrop keeps its functional AWDL receiver
+and publishes a Bluetooth-wake recovery message, translated in GTK. Registration
+rechecks controller power and never powers on or substitutes another controller.
+
+The private BlueZ tests passed release authentication, another advertisement taking
+the slot, no redundant unregister, and powered-off registration refusal. A new test
+runs the actual Quick Share receiver/sender advertisement actors against the same
+mock: receiver re-registration, sender failure, selected hci1 while hci0 is also
+powered, and acknowledged cancellation cleanup. The existing CI runner now runs
+both private-bus tests. These results do not close the broad controller rows:
+all scanner/GATT/L2CAP paths, hardware power-loss, Bluetooth daemon restarts and
+physical simultaneous-role acceptance still need their corresponding evidence.
+
+Verification for this follow-up also passed all-target workspace Clippy and the
+nine AirDrop/Quick Share library tests, including TLS/UKEY2 consent and exact-byte
+loopbacks. No physical radio or installed-demo state was changed.

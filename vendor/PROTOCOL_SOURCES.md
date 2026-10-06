@@ -73,3 +73,17 @@ Reference: [BlueZ LEAdvertisingManager1](https://bluez.readthedocs.io/en/latest/
 The BlueR snapshot also includes Nordic Semiconductor's Bluetooth Numbers
 Database under its own BSD-3-Clause license. Its original license stays in the
 source subtree and is installed beside the BlueR license in binary packages.
+
+
+BlueR external-release follow-up: advertisements now export `Release()` and
+accept it only from the unique bluetoothd owner that accepted their registration.
+Registration/unregistration stay pinned to that owner. The handle exposes a
+cancellation-safe `released()` wait, and an external Release confirms removal
+without a redundant UnregisterAdvertisement call. Quick Share receiver actors
+re-register after release; sender actors report the loss. AirDrop reports that
+Bluetooth wake disappeared while keeping AWDL reception available. Registration
+also refuses a controller that has been switched off since initial selection.
+The private-bus tests exercise forged callbacks, release while another
+advertisement occupies the slot, exact-controller Quick Share re-registration,
+and sender loss. Controller power-loss/restart recovery across all roles remains
+separate work.

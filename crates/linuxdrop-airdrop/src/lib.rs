@@ -197,6 +197,10 @@ pub async fn start_with_budget(
         loop {
             tokio::select! {
                 _=stop.cancelled()=>break,
+                _=async { if let Some(handle)=advertisement.as_ref() { handle.released().await; } else { std::future::pending::<()>().await; } }=>{
+                    if let Some(mut handle)=advertisement.take() { let _=handle.unregister().await; }
+                    events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:"AirDrop AWDL receive is ready. Bluetooth wake was removed by BlueZ. Restart sharing services to enable it again.".into()})).await.ok();
+                },
                 event=mdns_health.recv_async()=>match event {
                     Ok(mdns_sd::DaemonEvent::Error(error))=>{events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"error".into(),detail:format!("AirDrop discovery error: {error}")})).await.ok();break;},
                     Err(_)=>{events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"error".into(),detail:"AirDrop discovery stopped. Restart the backend.".into()})).await.ok();break;},

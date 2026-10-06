@@ -2130,7 +2130,9 @@ dependencies = [
  "rqs_lib",
  "tempfile",
  "tokio",
+ "tokio-util",
  "uuid",
+ "zbus",
 ]
 
 [[package]]

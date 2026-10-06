@@ -97,6 +97,7 @@ pub fn tr(message: &str) -> String {
         "Sharing could not restart. Retry in Settings after cleanup finishes." => "Die Freigabedienste konnten nicht neu starten. Versuche es nach dem Beenden erneut in den Einstellungen.",
         "Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services." => "Der Netzwerk-Helfer ist nicht erreichbar. Der Freigabedienst wurde gestoppt; der Adapter wird möglicherweise noch freigegeben. Verbinde ihn erneut und starte die Freigabedienste in den Einstellungen neu.",
         "LinuxDrop stopped before this transfer finished." => "LinuxDrop wurde beendet, bevor diese Übertragung abgeschlossen war.",
+        "AirDrop AWDL receive is ready. Bluetooth wake was removed by BlueZ. Restart sharing services to enable it again." => "AirDrop-Empfang über AWDL ist bereit. BlueZ hat die Bluetooth-Weckfunktion beendet. Starte die Freigabedienste neu, um sie wieder zu aktivieren.",
         "Applying sharing settings" => "Freigabeeinstellungen werden angewendet",
         "starting" => "Startet",
         "error" => "Fehler",

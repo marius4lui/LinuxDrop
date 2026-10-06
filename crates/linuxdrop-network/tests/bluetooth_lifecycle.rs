@@ -2,122 +2,17 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::Duration,
 };
-use tokio::sync::Notify;
-use zbus::{
-    zvariant::{OwnedObjectPath, OwnedValue},
-    Connection,
-};
+use zbus::zvariant::OwnedValue;
 
-#[derive(Default)]
-struct State {
-    active: Mutex<HashMap<String, String>>,
-    properties: Mutex<Vec<HashMap<String, OwnedValue>>>,
-    registrations: AtomicUsize,
-    removals: AtomicUsize,
-    hold_register: AtomicBool,
-    hold_unregister: AtomicBool,
-    fail_unregister: AtomicBool,
-    wake: Notify,
-}
-struct Adapter(bool);
-#[zbus::interface(name = "org.bluez.Adapter1")]
-impl Adapter {
-    #[zbus(property)]
-    fn powered(&self) -> bool {
-        self.0
-    }
-    #[zbus(property)]
-    fn address(&self) -> &str {
-        "00:11:22:33:44:55"
-    }
-}
-#[derive(Debug, zbus::DBusError)]
-#[zbus(prefix = "org.bluez.Error")]
-enum MockError {
-    DoesNotExist(String),
-    NotPermitted(String),
-    Failed(String),
-}
-struct Advertising(Arc<State>);
-#[zbus::interface(name = "org.bluez.LEAdvertisingManager1")]
-impl Advertising {
-    #[zbus(property)]
-    fn supported_instances(&self) -> u8 {
-        1
-    }
-    #[zbus(property)]
-    fn active_instances(&self) -> u8 {
-        self.0.active.lock().unwrap().len() as u8
-    }
-    async fn register_advertisement(
-        &self,
-        advertisement: OwnedObjectPath,
-        _options: HashMap<String, OwnedValue>,
-        #[zbus(header)] header: zbus::message::Header<'_>,
-        #[zbus(connection)] connection: &Connection,
-    ) -> Result<(), MockError> {
-        self.0.registrations.fetch_add(1, Ordering::SeqCst);
-        loop {
-            let wake = self.0.wake.notified();
-            if !self.0.hold_register.load(Ordering::SeqCst) {
-                break;
-            }
-            wake.await;
-        }
-        let sender = header.sender().unwrap().to_string();
-        let proxy = zbus::fdo::PropertiesProxy::builder(connection)
-            .destination(sender.clone())
-            .unwrap()
-            .path(advertisement.clone())
-            .unwrap()
-            .build()
-            .await
-            .map_err(|error| MockError::Failed(error.to_string()))?;
-        let properties = proxy
-            .get_all("org.bluez.LEAdvertisement1".try_into().unwrap())
-            .await
-            .map_err(|error| MockError::Failed(error.to_string()))?;
-        let mut active = self.0.active.lock().unwrap();
-        if !active.is_empty() {
-            return Err(MockError::NotPermitted("No advertising capacity".into()));
-        }
-        active.insert(advertisement.to_string(), sender);
-        self.0.properties.lock().unwrap().push(properties);
-        Ok(())
-    }
-    async fn unregister_advertisement(
-        &self,
-        advertisement: OwnedObjectPath,
-    ) -> Result<(), MockError> {
-        self.0.removals.fetch_add(1, Ordering::SeqCst);
-        loop {
-            let wake = self.0.wake.notified();
-            if !self.0.hold_unregister.load(Ordering::SeqCst) {
-                break;
-            }
-            wake.await;
-        }
-        if self.0.fail_unregister.swap(false, Ordering::SeqCst) {
-            return Err(MockError::Failed("Controller busy".into()));
-        }
-        if self
-            .0
-            .active
-            .lock()
-            .unwrap()
-            .remove(advertisement.as_str())
-            .is_none()
-        {
-            return Err(MockError::DoesNotExist("Already removed".into()));
-        }
-        Ok(())
-    }
-}
+#[path = "support/bluez.rs"]
+mod bluez;
+use bluez::{Adapter, Advertising, State};
+
 async fn wait_for(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !predicate() {
@@ -162,17 +57,18 @@ async fn advertisements_use_selected_controller_and_confirm_cleanup() {
     );
     let first = Arc::new(State::default());
     let second = Arc::new(State::default());
+    let second_power = Arc::new(AtomicBool::new(true));
     let bus = zbus::connection::Builder::session()
         .unwrap()
         .name("org.bluez")
         .unwrap()
         .serve_at("/", zbus::fdo::ObjectManager)
         .unwrap()
-        .serve_at("/org/bluez/hci0", Adapter(false))
+        .serve_at("/org/bluez/hci0", Adapter(Arc::new(AtomicBool::new(false))))
         .unwrap()
         .serve_at("/org/bluez/hci0", Advertising(first.clone()))
         .unwrap()
-        .serve_at("/org/bluez/hci1", Adapter(true))
+        .serve_at("/org/bluez/hci1", Adapter(second_power.clone()))
         .unwrap()
         .serve_at("/org/bluez/hci1", Advertising(second.clone()))
         .unwrap()
@@ -308,4 +204,75 @@ async fn advertisements_use_selected_controller_and_confirm_cleanup() {
         second.removals.load(Ordering::SeqCst) >= 5 && second.active.lock().unwrap().is_empty()
     })
     .await;
+    // Only the exact bluetoothd owner may release this registration. Another
+    // advertisement taking its slot must not disguise loss of our own handle.
+    let mut external = linuxdrop_network::advertise(&adapter, apple())
+        .await
+        .unwrap();
+    let (path, owner) = second
+        .active
+        .lock()
+        .unwrap()
+        .iter()
+        .next()
+        .map(|(path, owner)| (path.clone(), owner.clone()))
+        .unwrap();
+    let outsider = zbus::connection::Builder::session()
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let foreign_proxy = zbus::Proxy::new(
+        &outsider,
+        owner.as_str(),
+        path.as_str(),
+        "org.bluez.LEAdvertisement1",
+    )
+    .await
+    .unwrap();
+    assert!(foreign_proxy
+        .call::<_, _, ()>("Release", &())
+        .await
+        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), external.released())
+            .await
+            .is_err()
+    );
+    let removals = second.removals.load(Ordering::SeqCst);
+    {
+        let mut active = second.active.lock().unwrap();
+        active.remove(&path);
+        active.insert("/foreign/advertisement".into(), ":foreign".into());
+    }
+    let proxy = zbus::Proxy::new(
+        &bus,
+        owner.as_str(),
+        path.as_str(),
+        "org.bluez.LEAdvertisement1",
+    )
+    .await
+    .unwrap();
+    proxy.call::<_, _, ()>("Release", &()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), external.released())
+        .await
+        .unwrap();
+    external.unregister().await.unwrap();
+    assert_eq!(
+        second.removals.load(Ordering::SeqCst),
+        removals,
+        "Release already confirms removal; do not unregister again"
+    );
+    assert_eq!(
+        second.active.lock().unwrap().len(),
+        1,
+        "Another owner's advertisement must remain intact"
+    );
+    second.active.lock().unwrap().clear();
+    second_power.store(false, Ordering::SeqCst);
+    let registrations = second.registrations.load(Ordering::SeqCst);
+    assert!(linuxdrop_network::advertise(&adapter, apple())
+        .await
+        .is_err());
+    assert_eq!(second.registrations.load(Ordering::SeqCst), registrations);
 }

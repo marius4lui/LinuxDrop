@@ -60,6 +60,9 @@ pub async fn advertise(
     advertisement: bluer::adv::Advertisement,
 ) -> Result<bluer::adv::AdvertisementHandle> {
     let _guard = ADVERTISEMENT_REGISTRATION.lock().await;
+    if !adapter.is_powered().await? {
+        bail!("Bluetooth controller {} is switched off", adapter.name());
+    }
     let supported = adapter.supported_advertising_instances().await?;
     let active = adapter.active_advertising_instances().await?;
     if supported == 0 || active >= supported {
