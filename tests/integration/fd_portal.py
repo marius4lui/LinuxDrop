@@ -56,8 +56,9 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-fd-sources-") as directory:
             if daemon.poll() is not None:
                 raise AssertionError(daemon.stderr.read().decode())
             try:
-                call("GetSnapshot")
-                break
+                if not json.loads(call("GetSnapshot")[0])["restarting"]:
+                    break
+                time.sleep(.05)
             except GLib.Error:
                 time.sleep(.05)
         else:

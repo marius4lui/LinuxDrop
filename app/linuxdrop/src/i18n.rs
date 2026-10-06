@@ -86,6 +86,7 @@ pub fn tr(message: &str) -> String {
         "Require a receiving PIN" => "Empfangs-PIN verlangen",
         "LocalSend senders must enter your PIN before transferring" => "LocalSend-Absender müssen vor dem Übertragen deine PIN eingeben",
         "Use 4 to 12 digits. Apply the PIN before requiring it from senders." => "Verwende 4 bis 12 Ziffern. ?bernimm die PIN, bevor du sie von Absendern verlangst.",
+        "Sharing services are restarting; try again shortly" => "Freigabedienste werden neu gestartet. Gleich geht es weiter.",
         "Destination is not writable" => "Im Zielordner k?nnen keine Dateien gespeichert werden",
         "Set and apply a receiving PIN first" => "Lege zuerst eine Empfangs-PIN fest und ?bernimm sie",
         "Receiving PIN" => "Empfangs-PIN",

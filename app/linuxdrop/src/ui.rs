@@ -942,6 +942,7 @@ impl Ui {
             .borrow()
             .as_ref()
             .is_some_and(|proxy| proxy.g_name_owner().is_some());
+        let restarting = self.snapshot.borrow()["restarting"] == true;
         let selected = self.selected.borrow().clone();
         let peers = array(&self.snapshot.borrow(), "peers");
         let peer = peers.iter().find(|p| {
@@ -962,16 +963,18 @@ impl Ui {
                 && peer.is_some()
                 && protocol_available
                 && connected
+                && !restarting
                 && !self.busy.get(),
         );
         self.share_link
-            .set_sensitive(count > 0 && ready && connected && !self.busy.get());
+            .set_sensitive(count > 0 && ready && connected && !restarting && !self.busy.get());
         self.send.set_label(&tr(if self.busy.get() {
             "Preparing…"
         } else {
             "Send files"
         }));
         self.send_caption.set_label(&match (count, peer) {
+            _ if restarting => tr("Sharing services are restarting; try again shortly"),
             (count, _) if count > 0 && !ready => tr("Check the marked files before sending"),
             (_, Some(_)) if !protocol_available => {
                 tr("The selected protocol is unavailable; choose another protocol")

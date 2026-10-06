@@ -40,6 +40,18 @@ struct Data {
     visibility_since: Option<Instant>,
     decisions: HashSet<String>,
     stop_when_idle: bool,
+    restarting: bool,
+}
+impl Data {
+    fn accepting_transfers(&self) -> zbus::fdo::Result<()> {
+        if self.stop_when_idle {
+            return Err(failed("LinuxDrop is stopping"));
+        }
+        if self.restarting {
+            return Err(failed("Sharing services are restarting; try again shortly"));
+        }
+        Ok(())
+    }
 }
 struct Shared {
     bandwidth: Mutex<linuxdrop_network::BandwidthLimiter>,
@@ -126,7 +138,7 @@ impl Shared {
                 value
             })
             .collect();
-        json!({"epoch":d.epoch,"revision":d.revision,"peers":peers,"known_peers":known_peers,"transfers":transfers,"backends":d.backends.values().collect::<Vec<_>>(),"hardware":d.hardware,"settings":d.settings}).to_string()
+        json!({"restarting":d.restarting,"epoch":d.epoch,"revision":d.revision,"peers":peers,"known_peers":known_peers,"transfers":transfers,"backends":d.backends.values().collect::<Vec<_>>(),"hardware":d.hardware,"settings":d.settings}).to_string()
     }
     async fn action(&self, id: &str, action: &str) -> zbus::fdo::Result<()> {
         if action == "accept" {
@@ -407,20 +419,19 @@ impl Manager {
         json!({"version":env!("CARGO_PKG_VERSION"),"platform":"linux","backends":backends,"radios":radios,"active_transfers":d.transfers.values().filter(|t|!t.is_terminal()).count(),"redacted":true,"omitted":["names","addresses","serials","paths","keys","PINs","file names","error details"]}).to_string()
     }
     async fn restart_backends(&self) -> zbus::fdo::Result<()> {
-        if self
-            .0
-            .data
-            .lock()
-            .await
-            .transfers
-            .values()
-            .any(|t| !t.is_terminal())
-        {
+        let mut d = self.0.data.lock().await;
+        d.accepting_transfers()?;
+        if d.transfers.values().any(|t| !t.is_terminal()) {
             return Err(failed(
                 "Finish or cancel active transfers before restarting",
             ));
         }
-        self.0.restart.send(()).await.map_err(failed)
+        let permit = self.0.restart.try_reserve().map_err(failed)?;
+        d.restarting = true;
+        permit.send(());
+        drop(d);
+        self.0.changed().await;
+        Ok(())
     }
     async fn stop_when_idle(&self) -> zbus::fdo::Result<()> {
         self.set_visibility("hidden".into()).await?;
@@ -553,6 +564,7 @@ impl Manager {
     }
     async fn create_download_offer(&self, draft_id: String) -> zbus::fdo::Result<String> {
         let mut d = self.0.data.lock().await;
+        d.accepting_transfers()?;
         let local = linuxdrop_network::interfaces(&transfer_policy(&d.settings), false)
             .map_err(failed)?
             .into_iter()
@@ -574,7 +586,6 @@ impl Manager {
             max_files: d.settings["receive"]["max_files"].as_u64().unwrap() as usize,
             max_bytes: d.settings["receive"]["max_bytes"].as_u64().unwrap(),
         };
-        drop(d);
         let mut current = self.0.download_offer.lock().await;
         current.take();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -585,6 +596,7 @@ impl Manager {
                 .map_err(failed)?;
         let result=json!({"url":format!("http://{}",offer.address),"pin":offer.pin,"expires_in":600,"encrypted":false}).to_string();
         *current = Some(offer);
+        drop(d); // Offer publication is serialized with restart admission.
         Ok(result)
     }
     async fn stop_download_offer(&self) {
@@ -595,9 +607,7 @@ impl Manager {
             return Err(failed("Unlock the session to receive files"));
         }
         let mut d = self.0.data.lock().await;
-        if d.stop_when_idle {
-            return Err(failed("LinuxDrop is stopping"));
-        }
+        d.accepting_transfers()?;
         if d.transfers
             .values()
             .filter(|transfer| !transfer.is_terminal())
@@ -639,6 +649,7 @@ impl Manager {
         protocol: String,
     ) -> zbus::fdo::Result<String> {
         let mut d = self.0.data.lock().await;
+        d.accepting_transfers()?;
         if d.transfers.values().filter(|t| !t.is_terminal()).count()
             >= d.settings["transfers"]["max_parallel"].as_u64().unwrap() as usize
         {
@@ -857,6 +868,14 @@ impl Manager {
         settings::merge(&mut next, &patch).map_err(failed)?;
         settings::validate(&next).map_err(failed)?;
         let restart = settings::needs_backend_restart(&d.settings, &next);
+        if restart {
+            d.accepting_transfers()?;
+        }
+        let restart_permit = if restart {
+            Some(self.0.restart.try_reserve().map_err(failed)?)
+        } else {
+            None
+        };
         if restart && d.transfers.values().any(|t| !t.is_terminal()) {
             return Err(failed(
                 "Finish or cancel active transfers before changing network settings",
@@ -890,10 +909,12 @@ impl Manager {
         }
         let mode = next["visibility"]["mode"].as_str().unwrap().to_owned();
         d.settings = next;
+        if let Some(permit) = restart_permit {
+            d.restarting = true;
+            permit.send(());
+        }
         drop(d);
-        if restart {
-            self.0.restart.send(()).await.map_err(failed)?;
-        } else if visibility_changed {
+        if !restart && visibility_changed {
             self.set_visibility(mode).await?;
         }
         self.0.changed().await;
@@ -984,7 +1005,9 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
         .unwrap()
         .to_string();
     let directory = PathBuf::from(settings["receive"]["directory"].as_str().unwrap());
-    let visible = settings["visibility"]["mode"] == "everyone";
+    // Do not accept offers on a partially installed generation. Apply the latest
+    // visibility only after every command channel is registered below.
+    let visible = false;
     if settings["localsend"]["enabled"] == true {
         let result = linuxdrop_localsend::start_with_budget(
             linuxdrop_localsend::Config {
@@ -1066,6 +1089,18 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
         install_backend(shared, "airdrop", result).await;
     } else {
         disabled(shared, "airdrop").await;
+    }
+    {
+        let mut d = shared.data.lock().await;
+        let visible = d.settings["visibility"]["mode"] == "everyone"
+            && !shared.locked.load(std::sync::atomic::Ordering::Relaxed)
+            && !d.stop_when_idle;
+        for (id, tx) in &d.commands {
+            let _ = tx.try_send(BackendCommand::SetVisibility {
+                visible: visible && (id != "airdrop" || d.settings["airdrop"]["receive"] == true),
+            });
+        }
+        d.restarting = false;
     }
     shared.changed().await;
 }
@@ -1322,6 +1357,7 @@ async fn main() -> Result<()> {
             visibility_since: None,
             decisions: HashSet::new(),
             stop_when_idle: false,
+            restarting: true,
         }),
         connection: std::sync::OnceLock::new(),
         config_path,
@@ -1421,7 +1457,7 @@ async fn main() -> Result<()> {
             initialized = true;
             drop(d);
             if retry {
-                let _ = hardware.restart.try_send(());
+                let _ = Manager(hardware.clone()).restart_backends().await;
             }
             if changed {
                 hardware.changed().await;
@@ -1471,13 +1507,16 @@ async fn main() -> Result<()> {
                 match event {
                     BackendEvent::PeerUpsert(peer)=>{d.peers.insert(peer.id.clone(),peer);},
                     BackendEvent::PeerRemoved{peer_id}=>{d.peers.remove(&peer_id);},
-                    BackendEvent::Incoming(transfer)=>{
+                    BackendEvent::Incoming(mut transfer)=>{
                         if !d.transfers.get(&transfer.id).is_some_and(Transfer::is_terminal) {
                             let full=!d.transfers.contains_key(&transfer.id) && d.transfers.values().filter(|t|!t.is_terminal()).count() >= d.settings["transfers"]["max_parallel"].as_u64().unwrap() as usize;
                             let blocked=d.peer_preferences.get(&transfer.peer_id).is_some_and(|p|p.blocked);
                             let receive_disabled=transfer.protocol=="airdrop" && d.settings["airdrop"]["receive"]!=true;
-                            if full || blocked || receive_disabled || d.stop_when_idle || shared.locked.load(std::sync::atomic::Ordering::Relaxed) {
+                            if full || blocked || receive_disabled || d.restarting || d.stop_when_idle || shared.locked.load(std::sync::atomic::Ordering::Relaxed) {
                                 if let Some(tx)=d.commands.get(&transfer.protocol) {let _=tx.try_send(BackendCommand::Reject{transfer_id:transfer.id.clone()});}
+                                transfer.state="rejected".into();
+                                transfer.error=Some("LinuxDrop is not accepting this request".into());
+                                d.completed_at.insert(transfer.id.clone(), history::now());
                             } else {notification=Some(transfer.clone());}
                             d.transfers.insert(transfer.id.clone(),transfer);
                         }

@@ -66,6 +66,7 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
 
         wait(lambda: any(b["id"] == "localsend" and b["state"] == "ready"
                          for b in snapshot()["backends"]))
+        wait(lambda: not snapshot()["restarting"])
         first = snapshot()
         assert first["settings"]["visibility"]["mode"] == "hidden"
         # The test client deliberately accepts the generated certificate. Product
@@ -85,6 +86,34 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             raise AssertionError("Hidden receiver disclosed info")
         except urllib.error.HTTPError as error:
             assert error.code == 403
+        # Reserving a restart closes admission before the supervisor begins teardown.
+        selected = root / "restart-selection.txt"
+        selected.write_bytes(b"retain across restart")
+        draft = call("PrepareSend", "(as)", ([str(selected)],))
+        call("RestartBackends")
+        assert snapshot()["restarting"]
+        for method, signature, args in [
+            ("StartSend", "(sss)", (draft, "absent-peer", "localsend")),
+            ("CreateDownloadOffer", "(s)", (draft,)),
+            ("ReceiveDownloadOffer", "(s)", ("http://127.0.0.1:53318",)),
+            ("RestartBackends", None, ()),
+            ("UpdateSettings", "(s)", (json.dumps({"general": {"device_name": "must-not-apply"}}),)),
+        ]:
+            try:
+                call(method, signature, args)
+                raise AssertionError(f"{method} bypassed restart admission")
+            except GLib.Error as error:
+                assert "restarting" in str(error), str(error)
+        wait(lambda: not snapshot()["restarting"])
+        assert snapshot()["settings"]["general"]["device_name"] == "Session test"
+        # The selected descriptor is still owned after every rejected admission.
+        assert any(os.readlink(fd) == str(selected) for fd in Path(f"/proc/{daemon.pid}/fd").iterdir())
+        # Once ready, ordinary peer validation resumes.
+        try:
+            call("StartSend", "(sss)", (draft, "absent-peer", "localsend"))
+        except GLib.Error as error:
+            assert "Device is no longer available" in str(error), str(error)
+        call("DiscardDraft", "(s)", (draft,))
         call("SetVisibility", "(s)", ("everyone",))
         payload = b"D-Bus consent to HTTPS transfer\n"
         offer = {
@@ -96,6 +125,12 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             pending = executor.submit(request, "/prepare-upload", offer)
             transfer = wait(lambda: next((t for t in snapshot()["transfers"] if t["state"] == "waiting"), None))
             assert list((root / "received").iterdir()) == []
+            try:
+                call("RestartBackends")
+                raise AssertionError("Restart interrupted an active receive request")
+            except GLib.Error as error:
+                assert "Finish or cancel active transfers" in str(error), str(error)
+            assert not snapshot()["restarting"]
             call("UpdateSettings", "(s)", (json.dumps({"general": {"appearance": "dark"}}),))
             assert snapshot()["settings"]["general"]["appearance"] == "dark"
             assert not pending.done(), "Presentation settings interrupted incoming consent"
@@ -148,6 +183,7 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         daemon = subprocess.Popen([sys.argv[1]], env=env, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, text=True)
         restored = wait(lambda: snapshot() if snapshot()["epoch"] != first["epoch"] else None)
+        wait(lambda: not snapshot()["restarting"])
         assert restored["settings"]["visibility"]["mode"] == "hidden"
         assert restored["transfers"][0]["id"] == done["id"]
         assert restored["transfers"][0]["state"] == "completed"
@@ -159,6 +195,7 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         # An explicit download link must obey the same network allowlist as
         # discovery; refusing it must preserve the user's prepared file draft.
         call("UpdateSettings", "(s)", (json.dumps({"network": {"allowed_interfaces": ["not-present0"]}}),))
+        wait(lambda: not snapshot()["restarting"])
         draft = call("PrepareSend", "(as)", ([str(root / "received/integration.txt")],))
         for _ in range(2):
             try:
@@ -167,7 +204,7 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             except GLib.Error as error:
                 assert "No enabled IPv4 LAN interface" in str(error), str(error)
         call("DiscardDraft", "(s)", (draft,))
-        wait(lambda: any(b["id"] == "localsend" and b["state"] == "unavailable" for b in snapshot()["backends"]))
+        wait(lambda: not snapshot()["restarting"] and any(b["id"] == "localsend" and b["state"] == "unavailable" for b in snapshot()["backends"]))
         # Explicit reverse reception remains available while hidden, but the
         # daemon must require the PIN and actual receive consent before payload.
         downloads = []
@@ -218,7 +255,7 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             thread.join(timeout=2)
         call("StopWhenIdle")
         assert daemon.wait(timeout=5) == 0
-        print("PASS actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, reverse-download PIN and consent while hidden, idle shutdown")
+        print("PASS restart admission/quiescing and active-request protection, actual D-Bus/HTTPS consent, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, reverse-download PIN and consent while hidden, idle shutdown")
     finally:
         daemon.terminate()
         try:

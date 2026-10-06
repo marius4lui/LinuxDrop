@@ -233,3 +233,23 @@ The native GTK regression passed separately; the final rendered 480x600 German
 dialog was inspected at `docs/acceptance/ui/completion/download-offer-review.png`.
 This pass does not establish official-client or physical-device acceptance, and
 the final installation packages still need rebuilding.
+
+
+## Restart admission follow-up, 2026-10-07
+
+Manual restarts, network-setting updates and USB-triggered retries now reserve a
+shared `restarting` state under the same data mutex used to admit transfers.
+Startup has that state too. Outgoing sends, incoming download offers and new
+reverse offers reject during the transition; draft descriptors remain owned.
+Conflicting setting changes cannot queue another restart or persist a new network
+configuration midway through startup. New inbound requests rejected by daemon
+policy are recorded terminal immediately. The latest visibility/lock state is
+reapplied before admission reopens, and GTK disables send/link actions with an
+explicit restart explanation.
+
+The actual D-Bus integration covers transition-time rejection of all three entry
+points, duplicate restart/network mutation rejection, retained source descriptors,
+and refusal to interrupt an existing receive request. Native GTK verifies the
+transition controls. This closes admission races, not the entire lifecycle row:
+the fixed backend shutdown delay still needs explicit resource-drain completion,
+and reverse-offer active stream accounting/helper-loss simulations remain required.

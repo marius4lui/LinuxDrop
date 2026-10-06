@@ -24,7 +24,7 @@ flowchart TD
 
 `linuxdrop-core` contains peers, transfers and backend commands/events. Backends are actors with bounded channels and no GTK objects. `linuxdrop-storage` owns directory-descriptor publication. `linuxdrop-daemon` owns settings, drafts, history, notifications, visibility and backend lifetime. `linuxdrop-hardware` inventories devices and selects eligible radios. `linuxdrop-netd` authorizes radio leases and launches the AWDL helper.
 
-The app ID is `io.github.marius4lui.LinuxDrop.App`; the daemon exclusively owns `io.github.marius4lui.LinuxDrop`. Clients reconnect using a snapshot epoch/revision. GNOME owns a top-panel button, the explicitly opened bubble and Quick Settings; an undecorated, shell-positioned GTK surface receives actual external Wayland file payloads and passes the selection to the ordinary app. Incoming requests and progress update state without automatically opening a closed bubble. The panel button, Escape and outside clicks control its lifetime.
+The app ID is `io.github.marius4lui.LinuxDrop.App`; the daemon exclusively owns `io.github.marius4lui.LinuxDrop`. Clients reconnect using a snapshot epoch/revision; `restarting` closes transfer admission during backend transitions. GNOME owns a top-panel button, the explicitly opened bubble and Quick Settings; an undecorated, shell-positioned GTK surface receives actual external Wayland file payloads and passes the selection to the ordinary app. Incoming requests and progress update state without automatically opening a closed bubble. The panel button, Escape and outside clicks control its lifetime.
 
 ## Session IPC
 

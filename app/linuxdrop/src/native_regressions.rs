@@ -304,6 +304,12 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         capture(&ui, "download-offer-review.png");
         download.force_close();
         let proxy = ui.proxy.borrow().clone().unwrap();
+        ui.snapshot.borrow_mut()["restarting"] = json!(true);
+        ui.update_send();
+        assert!(!ui.send.is_sensitive() && !ui.share_link.is_sensitive());
+        assert_eq!(ui.send_caption.text(), tr("Sharing services are restarting; try again shortly"));
+        ui.snapshot.borrow_mut()["restarting"] = json!(false);
+        ui.update_send();
         batches.borrow_mut().clear();
         let many = vec![first.to_str().unwrap().to_owned(); 17];
         assert_eq!(ipc::prepare_files(&proxy, many).await.unwrap(), "draft");
