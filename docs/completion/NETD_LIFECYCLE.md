@@ -12,11 +12,12 @@ Remaining code/evidence requirements:
 - The network group's Drop cleanup now provides a settlement receipt, and
   client/host creation errors after guard creation await it. See
   [network acknowledgement evidence](../acceptance/P2P_GROUP_SETTLEMENT_2026-10-07.md).
-  `join_p2p` failure cleanup and producer cancellation still need to integrate
-  this receipt through full helper retirement. A full release must not admit radio reuse while an old group producer
-  or cleanup can still act. The current cleanup-running check prevents a known
-  already-started full cleanup from being duplicated, but is not a complete
-  race-free group-operation protocol.
+  Full helper retirement now waits for its persistent group/address producer;
+  socket abandonment requests cancellation and DHCP is reaped before settlement.
+  See [producer retirement evidence](../acceptance/NETD_PRODUCER_SETTLEMENT_2026-10-07.md).
+  Unidentified late GroupStarted events and ambiguous Cancel results still need
+  explicit recovery semantics; known unmarked groups must retain strict ownership
+  checks during recovery.
 - Failed Acquire/AcquireAwdl rollback still waits under State, and creation before
   durable journal publication needs a crash-recovery audit/fix.
 - Startup now listens while journaled leases recover through receipts. A real

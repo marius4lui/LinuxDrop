@@ -612,5 +612,8 @@ async fn failed_group_creation_and_drop_wait_for_cleanup_receipts() {
     .unwrap_err();
     assert!(format!("{error:#}").contains("fixture disconnect rejected"));
     assert!(error.to_string().contains("cleanup failed"));
+    let recovery = error.downcast_ref::<GroupCleanupFailure>().unwrap();
+    assert_eq!(recovery.identity.parent_interface, "testwifi0");
+    assert!(!recovery.identity.interface_object.is_empty());
     assert_eq!(state.lock().unwrap().disconnected, 2);
 }

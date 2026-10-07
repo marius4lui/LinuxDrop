@@ -36,3 +36,15 @@ consent, rejected transfers and draining connections before port reuse.
 all-target Clippy passed. The network receipt tests are recorded separately.
 Remote green status is not inferred from these local checks, and existing DEB
 revision 31 is not described as containing these subsequently changed binaries.
+
+## Remote confirmation
+
+At `a008a3088a0b6aed12c3789bc80dbfca8655e351`, both follow-up workflows
+completed successfully:
+
+- [Native desktop: Ubuntu/GNOME 46 and Fedora/GNOME 50](https://github.com/marius4lui/LinuxDrop/actions/runs/37622935362).
+- [Linux: dependency policy, parser fuzz, workspace checks, isolated lifecycles,
+  DEB build/install/remove and packaged daemon integration](https://github.com/marius4lui/LinuxDrop/actions/runs/37622935366).
+
+These results apply to that exact pushed commit. Subsequent producer-lifetime
+changes have separate local acceptance and must not inherit an unrun CI result.

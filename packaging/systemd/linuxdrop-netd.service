@@ -33,7 +33,7 @@ RestrictRealtime=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 SystemCallArchitectures=native
 KillMode=control-group
-TimeoutStopSec=30
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target

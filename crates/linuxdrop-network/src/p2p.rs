@@ -13,6 +13,8 @@ use zbus::{
 #[path = "p2p_owner.rs"]
 mod owner;
 
+pub type FormationError = anyhow::Error;
+
 const SERVICE: &str = "fi.w1.wpa_supplicant1";
 const DEVICE: &str = "fi.w1.wpa_supplicant1.Interface.P2PDevice";
 
@@ -42,18 +44,42 @@ pub struct Group {
 /// to netd's durable journal. Dropping a waiter never cancels the cleanup task.
 #[derive(Clone)]
 pub struct GroupSettlement {
+    identity: GroupIdentity,
     receiver: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
 }
+/// A known group still requiring recovery after guard cleanup failed. The
+/// identity carries no credentials and lets netd retain the precise resource.
+#[derive(Debug)]
+pub struct GroupCleanupFailure {
+    pub identity: GroupIdentity,
+    reason: String,
+}
+impl std::fmt::Display for GroupCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "P2P group cleanup failed: {}", self.reason)
+    }
+}
+impl std::error::Error for GroupCleanupFailure {}
+
 impl GroupSettlement {
     pub async fn wait(mut self) -> Result<()> {
         loop {
             if let Some(result) = self.receiver.borrow().clone() {
-                return result.map_err(anyhow::Error::msg);
+                return result.map_err(|reason| {
+                    GroupCleanupFailure {
+                        identity: self.identity.clone(),
+                        reason,
+                    }
+                    .into()
+                });
             }
             self.receiver
                 .changed()
                 .await
-                .context("P2P group cleanup stopped without acknowledgement")?;
+                .map_err(|_| GroupCleanupFailure {
+                    identity: self.identity.clone(),
+                    reason: "worker stopped without acknowledgement".into(),
+                })?;
         }
     }
 }
@@ -75,6 +101,7 @@ impl Group {
     }
     pub fn settlement(&self) -> GroupSettlement {
         GroupSettlement {
+            identity: self.identity.clone(),
             receiver: self.settled.subscribe(),
         }
     }
@@ -321,6 +348,7 @@ async fn connect_on(
         device.call::<_, _, ()>("StopFind", &()),
     )
     .await;
+    let mut late_cleanup = Ok(());
     if result.is_err() {
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
@@ -347,11 +375,7 @@ async fn connect_on(
                 )
                 .await
                 {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        disconnect_checked(&connection, &identity, verify),
-                    )
-                    .await;
+                    late_cleanup = disconnect_acknowledged(&connection, &identity, verify).await;
                 }
             }
         }
@@ -364,6 +388,7 @@ async fn connect_on(
                 .context("P2P client cleanup failed")?;
         }
     }
+    late_cleanup?;
     result
 }
 
@@ -576,6 +601,7 @@ async fn create_group_authenticated(
         _ = cancel.cancelled() => Err(anyhow::anyhow!("P2P group creation cancelled")),
         result = tokio::time::timeout(Duration::from_secs(45), operation) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("P2P group creation timed out"))),
     };
+    let mut late_cleanup = Ok(());
     if result.is_err() {
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
@@ -604,13 +630,7 @@ async fn create_group_authenticated(
                 )
                 .await
                 {
-                    if verify(&identity).is_ok() {
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(10),
-                            disconnect_checked(&connection, &identity, verify),
-                        )
-                        .await;
-                    }
+                    late_cleanup = disconnect_acknowledged(&connection, &identity, verify).await;
                 }
             }
         }
@@ -623,6 +643,7 @@ async fn create_group_authenticated(
                 .context("P2P group-owner cleanup failed")?;
         }
     }
+    late_cleanup?;
     result
 }
 
@@ -701,6 +722,27 @@ pub async fn service_matches(connection: &Connection, identity: &GroupIdentity) 
 pub async fn disconnect(connection: &Connection, identity: &GroupIdentity) -> Result<()> {
     disconnect_checked(connection, identity, verify_phy).await
 }
+async fn disconnect_acknowledged(
+    connection: &Connection,
+    identity: &GroupIdentity,
+    verify: fn(&GroupIdentity) -> Result<()>,
+) -> Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        disconnect_checked(connection, identity, verify),
+    )
+    .await
+    .context("P2P group cleanup timed out")
+    .and_then(|result| result)
+    .map_err(|error| {
+        GroupCleanupFailure {
+            identity: identity.clone(),
+            reason: format!("{error:#}"),
+        }
+        .into()
+    })
+}
+
 async fn disconnect_checked(
     connection: &Connection,
     identity: &GroupIdentity,

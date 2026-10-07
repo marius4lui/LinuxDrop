@@ -121,13 +121,19 @@ where
     };
     state.attached.remove(id);
     state.cancelled_p2p.remove(id);
-    if let Some(pending) = state.pending_p2p.remove(id) {
+    let producer = state.pending_p2p.get(id).map(|pending| {
         pending.cancel.cancel();
-    }
+        pending.settled.clone()
+    });
     let group_cleanup = state.group_cleanups.get(id).cloned();
     state.cleanups.insert(id.to_owned(), receipt.clone());
     let shared = shared.clone();
     tokio::spawn(async move {
+        let producer_result = if let Some(receipt) = producer {
+            wait_cleanup(receipt).await
+        } else {
+            Ok(())
+        };
         // A group leave already owns teardown and its child. Full retirement
         // first waits for that operation to settle, then reads its final journal
         // identity. A failed leave retains that identity for this retry.
@@ -138,15 +144,22 @@ where
             let mut state = shared.lock().await;
             state.radio_changed();
             let current = state.leases.get(&lease.id).cloned().unwrap_or(lease);
-            let child = state.children.remove(&current.id);
+            let child = if producer_result.is_ok() {
+                state.children.remove(&current.id)
+            } else {
+                None
+            };
             (current, child)
         };
         let original = lease.clone();
         // Observe panics/cancellation of the I/O task too: the supervisor retains
         // the lease and publishes a failed receipt, allowing explicit recovery.
-        let mut result = tokio::spawn(async move { operation(lease, child).await })
-            .await
-            .unwrap_or_else(|error| Err(format!("Cleanup operation stopped: {error}")));
+        let mut result = match producer_result {
+            Ok(()) => tokio::spawn(async move { operation(lease, child).await })
+                .await
+                .unwrap_or_else(|error| Err(format!("Cleanup operation stopped: {error}"))),
+            Err(error) => Err(format!("P2P producer did not settle: {error}")),
+        };
         let mut state = shared.lock().await;
         state.radio_changed();
         if result.is_ok() {
@@ -284,31 +297,57 @@ async fn cleanup_all(shared: &Shared, ids: Vec<String>) -> Vec<(String, Result<(
 struct PendingP2p {
     cancel: tokio_util::sync::CancellationToken,
     interfaces: std::collections::HashSet<String>,
+    settled: CleanupReceipt,
 }
 
-/// Cancellation and bookkeeping survive an abruptly disconnected helper client.
-struct P2pOperation {
-    shared: Shared,
+// The producer outlives its requesting socket. Its cancellation token requests
+// a stop; only its settlement receipt authorizes a subsequent radio retirement.
+fn spawn_p2p_with<F, Fut>(
+    state: &mut State,
+    shared: &Shared,
     lease_id: String,
     cancel: tokio_util::sync::CancellationToken,
-}
-impl Drop for P2pOperation {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        let shared = self.shared.clone();
-        let lease_id = self.lease_id.clone();
-        tokio::spawn(async move {
-            let mut state = shared.lock().await;
-            state.radio_changed();
-            if state
-                .pending_p2p
-                .get(&lease_id)
-                .is_some_and(|p| p.cancel.is_cancelled())
-            {
-                state.pending_p2p.remove(&lease_id);
+    interfaces: std::collections::HashSet<String>,
+    operation: F,
+) -> tokio::sync::oneshot::Receiver<Result<Response, String>>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<Response, String>> + Send + 'static,
+{
+    let (settled, receipt) = tokio::sync::watch::channel(None);
+    let (reply, receiver) = tokio::sync::oneshot::channel();
+    state.pending_p2p.insert(
+        lease_id.clone(),
+        PendingP2p {
+            cancel,
+            interfaces,
+            settled: receipt,
+        },
+    );
+    state.radio_changed();
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let (result, settlement) = match tokio::spawn(async move { operation().await }).await {
+            Ok(result) => (result, Ok(())),
+            Err(error) => {
+                let error = format!("P2P producer stopped unexpectedly: {error}");
+                (Err(error.clone()), Err(error))
             }
-        });
-    }
+        };
+        let mut state = shared.lock().await;
+        state.radio_changed();
+        if let Err(error) = &settlement {
+            // An unexpected stop has no proven cleanup outcome. Preserve the
+            // failed receipt and reservation instead of admitting another actor.
+            state.attached.remove(&lease_id);
+            state.record_recovery_error(format!("{lease_id}: {error}"));
+        } else {
+            state.pending_p2p.remove(&lease_id);
+        }
+        settled.send_replace(Some(settlement));
+        let _ = reply.send(result);
+    });
+    receiver
 }
 
 fn competing_use(
@@ -677,7 +716,7 @@ async fn join_p2p(
     let inv = inventory().await;
     let mut state = shared.lock().await;
     state.radio_changed();
-    let mut lease = state
+    let lease = state
         .leases
         .get(&lease_id)
         .ok_or("lease not found")?
@@ -730,84 +769,153 @@ async fn join_p2p(
         return Err("P2P frequency is not permitted by the radio regulatory policy".into());
     }
     let cancel = tokio_util::sync::CancellationToken::new();
-    state.pending_p2p.insert(
-        lease_id.clone(),
-        PendingP2p {
-            cancel: cancel.clone(),
-            interfaces: inv
-                .interfaces
-                .iter()
-                .filter(|i| i.phy.as_deref() == Some(&lease.phy))
-                .map(|i| i.name.clone())
-                .collect(),
-        },
-    );
-    let operation = P2pOperation {
-        shared: shared.clone(),
-        lease_id: lease_id.clone(),
-        cancel: cancel.clone(),
+    let stop_on_drop = cancel.clone().drop_guard();
+    let worker_cancel = cancel.clone();
+    let worker_shared = shared.clone();
+    let interfaces = inv
+        .interfaces
+        .iter()
+        .filter(|interface| interface.phy.as_deref() == Some(&lease.phy))
+        .map(|interface| interface.name.clone())
+        .collect();
+    let setup = P2pSetup {
+        peer_name,
+        pin,
+        frequency,
+        host_auth,
     };
+    let reply = spawn_p2p_with(
+        &mut state,
+        shared,
+        lease_id,
+        cancel,
+        interfaces,
+        move || async move { perform_p2p(&worker_shared, lease, setup, worker_cancel).await },
+    );
     drop(state);
-    let (group, credentials) = if let Some(auth) = host_auth {
-        let hosted = linuxdrop_network::p2p::create_group_with_auth(
-            &lease.interface,
-            frequency,
-            auth,
-            cancel.clone(),
-        )
+    let result = reply
         .await
-        .map_err(|e| e.to_string())?;
-        (
-            hosted.group,
-            Some((
-                hosted.ssid,
-                hosted.password,
-                hosted.frequency,
-                hosted.device_name,
-            )),
-        )
-    } else {
-        let group = linuxdrop_network::p2p::connect_wps(
-            &lease.interface,
-            &peer_name,
-            &pin,
-            frequency,
-            cancel.clone(),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        (group, None)
+        .map_err(|_| "P2P supervisor stopped without a reply".to_owned())?;
+    stop_on_drop.disarm();
+    result
+}
+
+struct P2pSetup {
+    peer_name: String,
+    pin: String,
+    frequency: u32,
+    host_auth: Option<linuxdrop_network::P2pHostAuth>,
+}
+
+async fn perform_p2p(
+    shared: &Shared,
+    mut lease: Lease,
+    setup: P2pSetup,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<Response, String> {
+    let P2pSetup {
+        peer_name,
+        pin,
+        frequency,
+        host_auth,
+    } = setup;
+    let host = host_auth.is_some();
+    let lease_id = lease.id.clone();
+    let formed = async {
+        if let Some(auth) = host_auth {
+            let hosted = linuxdrop_network::p2p::create_group_with_auth(
+                &lease.interface,
+                frequency,
+                auth,
+                cancel.clone(),
+            )
+            .await?;
+            Ok((
+                hosted.group,
+                Some((
+                    hosted.ssid,
+                    hosted.password,
+                    hosted.frequency,
+                    hosted.device_name,
+                )),
+            ))
+        } else {
+            let group = linuxdrop_network::p2p::connect_wps(
+                &lease.interface,
+                &peer_name,
+                &pin,
+                frequency,
+                cancel.clone(),
+            )
+            .await?;
+            Ok((group, None))
+        }
+    }
+    .await;
+    let (group, credentials) = match formed {
+        Ok(group) => group,
+        Err(error) => {
+            let error: linuxdrop_network::p2p::FormationError = error;
+            if let Some(failed) =
+                error.downcast_ref::<linuxdrop_network::p2p::GroupCleanupFailure>()
+            {
+                lease.p2p_group = Some(failed.identity.clone());
+                let mut state = shared.lock().await;
+                state.radio_changed();
+                state.attached.remove(&lease_id);
+                state.leases.insert(lease_id.clone(), lease.clone());
+                persist(&state).map_err(|e| e.to_string())?;
+            }
+            return Err(error.to_string());
+        }
     };
     let interface = group.identity.interface.clone();
-    run_command(
-        "/usr/sbin/ip",
-        &[
-            "link",
-            "set",
-            "dev",
-            &interface,
-            "alias",
-            &format!("linuxdrop:p2p:{}", lease.id),
-        ],
-        5,
-    )
-    .await?;
-    let mut state = shared.lock().await;
-    state.radio_changed();
-    if cancel.is_cancelled() || !state.leases.contains_key(&lease_id) {
-        return Err("P2P radio lease ended during group formation".into());
+    let formed_identity = group.identity.clone();
+    let settlement = group.settlement();
+    let published = async {
+        run_command(
+            "/usr/sbin/ip",
+            &[
+                "link",
+                "set",
+                "dev",
+                &interface,
+                "alias",
+                &format!("linuxdrop:p2p:{}", lease.id),
+            ],
+            5,
+        )
+        .await?;
+        let mut state = shared.lock().await;
+        state.radio_changed();
+        if cancel.is_cancelled() || !state.leases.contains_key(&lease_id) {
+            return Err("P2P radio lease ended during group formation".into());
+        }
+        lease.p2p_group = Some(group.identity.clone());
+        state.leases.insert(lease_id.clone(), lease.clone());
+        persist(&state).map_err(|e| e.to_string())?;
+        group.into_journaled();
+        drop(state);
+        Ok::<(), String>(())
     }
-    lease.p2p_group = Some(group.identity.clone());
-    state.leases.insert(lease_id.clone(), lease.clone());
-    persist(&state).map_err(|e| e.to_string())?;
-    group.into_journaled();
-    drop(state);
-    let network = tokio::select! {
-        result = async {
-            if host { start_p2p_host_network(&lease).await }
-            else { start_p2p_network(&lease).await }
-        } => result,
-        _ = cancel.cancelled() => Err("P2P radio lease ended during address acquisition".into()),
+    .await;
+    let settled = settlement.wait().await.map_err(|error| error.to_string());
+    if published.is_err() || settled.is_err() {
+        let mut state = shared.lock().await;
+        state.radio_changed();
+        state.attached.remove(&lease_id);
+        if settled.is_err() {
+            lease.p2p_group = Some(formed_identity);
+            state.leases.insert(lease_id.clone(), lease.clone());
+            persist(&state).map_err(|error| error.to_string())?;
+        }
+    }
+    published?;
+    settled?;
+    let network = if host {
+        start_p2p_host_network(&lease, &cancel).await
+    } else {
+        start_p2p_network(&lease, &cancel).await
     };
     let mut state = shared.lock().await;
     state.radio_changed();
@@ -819,9 +927,7 @@ async fn join_p2p(
             if let Some(child) = child {
                 state.children.insert(lease_id.clone(), child);
             }
-            state.pending_p2p.remove(&lease_id);
             drop(state);
-            drop(operation);
             if let Some((ssid, password, frequency, device_name)) = credentials {
                 Ok(Response::P2pHosted {
                     device_name,
@@ -843,19 +949,32 @@ async fn join_p2p(
             }
         }
         result => {
-            // A successful DHCP child is kill-on-drop if the radio lease ended.
-            let error = result
-                .err()
-                .unwrap_or_else(|| "P2P radio lease ended during address acquisition".into());
-            state.pending_p2p.remove(&lease_id);
+            // Reap a returned DHCP child before acknowledging an ended lease.
             drop(state);
-            if lease_exists && !cleanup_running && restore_p2p(&lease).await.is_ok() {
+            let error = match result {
+                Err(error) => error,
+                Ok((child, _)) => {
+                    reap_child(child).await?;
+                    "P2P radio lease ended during address acquisition".into()
+                }
+            };
+            if lease_exists && !cleanup_running {
+                let restored = restore_p2p(&lease).await;
                 let mut state = shared.lock().await;
                 state.radio_changed();
+                if let Err(cleanup_error) = restored {
+                    state.attached.remove(&lease_id);
+                    state.record_recovery_error(format!("{lease_id}: {cleanup_error}"));
+                    return Err(format!("{error}; cleanup failed: {cleanup_error}"));
+                }
                 if let Some(current) = state.leases.get_mut(&lease_id) {
                     current.p2p_group = None;
                 }
-                persist(&state).map_err(|e| e.to_string())?;
+                if let Err(journal_error) = persist(&state) {
+                    state.leases.insert(lease_id.clone(), lease.clone());
+                    state.attached.remove(&lease_id);
+                    return Err(format!("{error}; cleanup journal failed: {journal_error}"));
+                }
             }
             Err(error)
         }
@@ -1503,10 +1622,14 @@ async fn p2p_addresses(lease: &Lease) -> Result<P2pAddresses, String> {
 
 async fn start_p2p_network(
     lease: &Lease,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(Option<tokio::process::Child>, P2pAddresses), String> {
     let group = lease.p2p_group.as_ref().ok_or("P2P group missing")?;
     // Verify ownership before starting any DHCP traffic on this interface.
     let mut addresses = p2p_addresses(lease).await?;
+    if cancel.is_cancelled() {
+        return Err("P2P address setup cancelled".into());
+    }
     let result_path = format!("/run/linuxdrop/{}.ipv4.json", lease.id);
     let _ = std::fs::remove_file(&result_path);
     let mut child = Command::new("/usr/bin/busybox")
@@ -1536,21 +1659,40 @@ async fn start_p2p_network(
     // Keep renewing/acquiring IPv4 while the lease is owned, but never require
     // DHCP when the newly created, ownership-marked group already has IPv6.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if child
-            .as_mut()
-            .is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
-        {
-            child = None;
+    let ready = async {
+        loop {
+            if cancel.is_cancelled() {
+                return Err("P2P address setup cancelled".to_owned());
+            }
+            if let Some(process) = child.as_mut() {
+                if process
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+                {
+                    child = None;
+                }
+            }
+            if addresses.ipv6.is_some() || (addresses.ipv4.is_some() && child.is_some()) {
+                return Ok(addresses);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("P2P group received neither usable IPv4 nor IPv6".into());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("P2P address setup cancelled".into()),
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {},
+            }
+            addresses = p2p_addresses(lease).await?;
         }
-        if addresses.ipv6.is_some() || (addresses.ipv4.is_some() && child.is_some()) {
-            return Ok((child, addresses));
+    }
+    .await;
+    match ready {
+        Ok(addresses) => Ok((child, addresses)),
+        Err(error) => {
+            reap_child(child).await?;
+            Err(error)
         }
-        if tokio::time::Instant::now() >= deadline {
-            return Err("P2P group received neither usable IPv4 nor IPv6".into());
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        addresses = p2p_addresses(lease).await?;
     }
 }
 
@@ -1597,8 +1739,12 @@ fn p2p_dhcp_config(interface: &str, lease: &str, gateway: std::net::Ipv4Addr) ->
 
 async fn start_p2p_host_network(
     lease: &Lease,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(Option<tokio::process::Child>, P2pAddresses), String> {
     use std::io::Write;
+    if cancel.is_cancelled() {
+        return Err("P2P host setup cancelled".into());
+    }
     let group = lease.p2p_group.as_ref().ok_or("P2P group missing")?;
     p2p_addresses(lease).await?; // Verify the exact newly marked group first.
     let output = timeout(
@@ -1651,6 +1797,9 @@ async fn start_p2p_host_network(
         .map_err(|e| e.to_string())?;
     config.sync_all().map_err(|e| e.to_string())?;
     drop(config);
+    if cancel.is_cancelled() {
+        return Err("P2P host setup cancelled".into());
+    }
     let mut child = Command::new("/usr/bin/busybox")
         .args(["udhcpd", "-f", "-I", &gateway.to_string(), &config_path])
         .env_clear()
@@ -1660,26 +1809,39 @@ async fn start_p2p_host_network(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| e.to_string())?;
-    // Catch bind/configuration errors before publishing any credentials.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    if !matches!(child.try_wait(), Ok(None)) {
-        return Err("P2P DHCP server could not start".into());
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let addresses = loop {
-        let addresses = p2p_addresses(lease).await?;
-        if addresses.ipv6.is_some() || tokio::time::Instant::now() >= deadline {
-            break addresses;
-        }
+    let ready = async {
+        // Catch bind/configuration errors before publishing any credentials.
+        tokio::time::sleep(Duration::from_millis(250)).await;
         if !matches!(child.try_wait(), Ok(None)) {
-            return Err("P2P DHCP server stopped during address setup".into());
+            return Err("P2P DHCP server could not start".into());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-    if addresses.ipv4 != Some(gateway) {
-        return Err("P2P group owner address changed".into());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let addresses = loop {
+            if cancel.is_cancelled() {
+                return Err("P2P host setup cancelled".to_owned());
+            }
+            let addresses = p2p_addresses(lease).await?;
+            if addresses.ipv6.is_some() || tokio::time::Instant::now() >= deadline {
+                break addresses;
+            }
+            if !matches!(child.try_wait(), Ok(None)) {
+                return Err("P2P DHCP server stopped during address setup".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        if addresses.ipv4 != Some(gateway) {
+            return Err("P2P group owner address changed".into());
+        }
+        Ok(addresses)
     }
-    Ok((Some(child), addresses))
+    .await;
+    match ready {
+        Ok(addresses) => Ok((Some(child), addresses)),
+        Err(error) => {
+            reap_child(Some(child)).await?;
+            Err(error)
+        }
+    }
 }
 
 fn persist(state: &State) -> io::Result<()> {
@@ -2292,6 +2454,7 @@ mod tests {
     fn watchdog_distinguishes_owned_p2p_from_competing_networks() {
         let mut lease = direct_lease();
         let pending = PendingP2p {
+            settled: tokio::sync::watch::channel(Some(Ok(()))).1,
             cancel: tokio_util::sync::CancellationToken::new(),
             interfaces: ["wlan2".into(), "sibling0".into()].into_iter().collect(),
         };
@@ -2328,28 +2491,120 @@ mod tests {
         assert!(!competing_use(&lease, &parent, None));
     }
     #[tokio::test]
-    async fn abandoned_p2p_operation_cancels_without_removing_a_new_operation() {
+    async fn abandoned_producer_settles_before_full_retirement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lease = direct_lease();
+        let id = lease.id.clone();
         let shared = Arc::new(Mutex::new(State::default()));
         let cancel = tokio_util::sync::CancellationToken::new();
-        let old = P2pOperation {
-            shared: shared.clone(),
-            lease_id: "lease".into(),
-            cancel: cancel.clone(),
-        };
-        let fresh = tokio_util::sync::CancellationToken::new();
-        shared.lock().await.pending_p2p.insert(
-            "lease".into(),
-            PendingP2p {
-                cancel: fresh.clone(),
-                interfaces: Default::default(),
+        let stopped = cancel.clone().drop_guard();
+        let worker_cancel = cancel.clone();
+        let worker_shared = shared.clone();
+        let worker_id = id.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let mut state = shared.lock().await;
+        state.leases.insert(id.clone(), lease);
+        state.attached.insert(id.clone());
+        let reply = spawn_p2p_with(
+            &mut state,
+            &shared,
+            id.clone(),
+            cancel,
+            Default::default(),
+            move || async move {
+                worker_cancel.cancelled().await;
+                let _ = started.send(());
+                finishing.await.unwrap();
+                // Model a producer reporting its final group after stop was requested.
+                worker_shared
+                    .lock()
+                    .await
+                    .leases
+                    .get_mut(&worker_id)
+                    .unwrap()
+                    .p2p_group = lease_with_group().p2p_group;
+                Err("cancelled after settlement".into())
             },
         );
-        drop(old);
+        drop(state);
+        drop(reply);
+        drop(stopped);
+        timeout(Duration::from_secs(1), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let restored = Arc::new(AtomicBool::new(false));
+        let observed = restored.clone();
+        let cleanup = begin_cleanup_with(
+            &shared,
+            &id,
+            move |lease, _| async move {
+                assert!(
+                    lease.p2p_group.is_some(),
+                    "Retirement must use the settled identity"
+                );
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await;
         tokio::task::yield_now().await;
-        assert!(cancel.is_cancelled());
-        assert!(!fresh.is_cancelled());
-        assert!(shared.lock().await.pending_p2p.contains_key("lease"));
+        assert!(!restored.load(Ordering::SeqCst));
+        assert!(shared.lock().await.leases.contains_key(&id));
+        timeout(
+            Duration::from_millis(250),
+            apply(Request::Status, 1000, &mut vec![], &shared),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        finish.send(()).unwrap();
+        wait_cleanup(cleanup).await.unwrap();
+        assert!(restored.load(Ordering::SeqCst));
+        let state = shared.lock().await;
+        assert!(state.pending_p2p.is_empty() && state.leases.is_empty());
     }
+
+    #[tokio::test]
+    async fn panicked_producer_cannot_publish_a_retired_radio() {
+        let lease = direct_lease();
+        let id = lease.id.clone();
+        let shared = Arc::new(Mutex::new(State::default()));
+        let mut state = shared.lock().await;
+        state.leases.insert(id.clone(), lease);
+        state.attached.insert(id.clone());
+        let reply = spawn_p2p_with(
+            &mut state,
+            &shared,
+            id.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Default::default(),
+            || async {
+                panic!("synthetic producer fault");
+            },
+        );
+        drop(state);
+        assert!(reply.await.unwrap().is_err());
+        let cleanup = begin_cleanup_with(
+            &shared,
+            &id,
+            |_, _| async {
+                panic!("Unacknowledged producer must block reuse");
+            },
+            |_| Ok(()),
+        )
+        .await;
+        assert!(wait_cleanup(cleanup)
+            .await
+            .unwrap_err()
+            .contains("producer"));
+        let state = shared.lock().await;
+        assert!(state.leases.contains_key(&id));
+        assert!(!state.attached.contains(&id));
+    }
+
     #[tokio::test]
     async fn pending_p2p_can_be_cancelled_only_by_its_authorized_user() {
         let lease = direct_lease();
@@ -2362,6 +2617,7 @@ mod tests {
             state.pending_p2p.insert(
                 lease.id.clone(),
                 PendingP2p {
+                    settled: tokio::sync::watch::channel(Some(Ok(()))).1,
                     cancel: cancel.clone(),
                     interfaces: Default::default(),
                 },
@@ -2492,16 +2748,65 @@ mod tests {
         )
         .await
         .unwrap();
-        let (child, addresses) = timeout(Duration::from_secs(3), start_p2p_network(&lease))
-            .await
-            .unwrap()
-            .unwrap();
+        let (child, addresses) = timeout(
+            Duration::from_secs(3),
+            start_p2p_network(&lease, &tokio_util::sync::CancellationToken::new()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(addresses.ipv4.is_none());
         assert!(addresses.ipv6.is_some());
         if let Some(mut child) = child {
             child.kill().await.unwrap();
             child.wait().await.unwrap();
         }
+        // No usable addresses: cancellation must reap the real DHCP process
+        // before acknowledging failure to the producer/retirement supervisor.
+        run_command(
+            "/usr/sbin/ip",
+            &["-6", "address", "flush", "dev", interface],
+            3,
+        )
+        .await
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let worker_lease = lease.clone();
+        let worker =
+            tokio::spawn(async move { start_p2p_network(&worker_lease, &worker_cancel).await });
+        let child_path = timeout(Duration::from_secs(3), async {
+            'found: loop {
+                for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+                    let path = entry.path();
+                    let Ok(status) = std::fs::read_to_string(path.join("status")) else {
+                        continue;
+                    };
+                    let parent = format!("PPid:\t{}", std::process::id());
+                    if !status.lines().any(|line| line == parent) {
+                        continue;
+                    }
+                    let command = std::fs::read(path.join("cmdline")).unwrap_or_default();
+                    let args: Vec<_> = command.split(|byte| *byte == 0).collect();
+                    if args.contains(&b"udhcpc".as_slice()) && args.contains(&interface.as_bytes())
+                    {
+                        break 'found path;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let child_path = child_path.await.unwrap();
+        cancel.cancel();
+        let result = timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(ref error) if error.contains("cancelled")));
+        assert!(
+            !child_path.exists(),
+            "DHCP must be reaped before cancellation settles"
+        );
         run_command(
             "/usr/sbin/ip",
             &["link", "set", "dev", interface, "alias", "foreign"],
@@ -2510,7 +2815,11 @@ mod tests {
         .await
         .unwrap();
         assert!(p2p_addresses(&lease).await.is_err());
-        assert!(start_p2p_network(&lease).await.is_err());
+        assert!(
+            start_p2p_network(&lease, &tokio_util::sync::CancellationToken::new())
+                .await
+                .is_err()
+        );
         run_command("/usr/sbin/ip", &["link", "del", interface], 3)
             .await
             .unwrap();
@@ -2572,7 +2881,10 @@ mod tests {
         .await
         .unwrap();
         std::fs::create_dir_all("/run/linuxdrop").unwrap();
-        let (server, addresses) = start_p2p_host_network(&lease).await.unwrap();
+        let (server, addresses) =
+            start_p2p_host_network(&lease, &tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
         assert_eq!(addresses.ipv4, Some("192.168.200.1".parse().unwrap()));
         assert!(
             addresses.ipv6.is_some(),
