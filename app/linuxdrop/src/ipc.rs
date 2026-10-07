@@ -2,16 +2,17 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 use serde_json::Value;
 
-pub const APP_ID: &str = "io.github.marius4lui.LinuxDrop.App";
-pub const BUS: &str = "io.github.marius4lui.LinuxDrop";
-pub const PATH: &str = "/io/github/marius4lui/LinuxDrop";
-pub const INTERFACE: &str = "io.github.marius4lui.LinuxDrop.Manager1";
+pub use linuxdrop_ipc::{APP_ID, BUS, INTERFACE, PATH};
 
 pub async fn connect() -> Result<gio::DBusProxy, String> {
+    let node = gio::DBusNodeInfo::for_xml(linuxdrop_ipc::MANAGER_XML).map_err(|e| e.to_string())?;
+    let info = node
+        .lookup_interface(INTERFACE)
+        .ok_or("Invalid service contract")?;
     gio::DBusProxy::for_bus_future(
         gio::BusType::Session,
         gio::DBusProxyFlags::NONE,
-        None,
+        Some(&info),
         BUS,
         PATH,
         INTERFACE,
@@ -25,7 +26,22 @@ pub async fn call(
     method: &str,
     parameters: Option<glib::Variant>,
 ) -> Result<glib::Variant, String> {
-    proxy
+    let signatures = if proxy.interface_name() == INTERFACE {
+        let method = linuxdrop_ipc::ManagerMethod::from_name(method)
+            .ok_or_else(|| crate::i18n::tr("Sharing service contract mismatch"))?;
+        let signatures = method.signatures();
+        if parameters
+            .as_ref()
+            .map_or("()", |value| value.type_().as_str())
+            != signatures.0
+        {
+            return Err(crate::i18n::tr("Sharing service contract mismatch"));
+        }
+        Some(signatures)
+    } else {
+        None
+    };
+    let result = proxy
         .call_future(
             method,
             parameters.as_ref(),
@@ -41,7 +57,11 @@ pub async fn call(
             // The transport namespace is diagnostic metadata, not user guidance.
             gio::DBusError::strip_remote_error(&mut error);
             crate::i18n::tr(error.message())
-        })
+        })?;
+    if signatures.is_some_and(|(_, output)| result.type_().as_str() != output) {
+        return Err(crate::i18n::tr("Sharing service contract mismatch"));
+    }
+    Ok(result)
 }
 
 pub async fn json(proxy: &gio::DBusProxy, method: &str) -> Result<Value, String> {

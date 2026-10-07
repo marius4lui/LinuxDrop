@@ -13,9 +13,8 @@ import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js'
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 
-const BUS = 'io.github.marius4lui.LinuxDrop';
-const PATH = '/io/github/marius4lui/LinuxDrop';
-const IFACE = 'io.github.marius4lui.LinuxDrop.Manager1';
+import {BUS, PATH, INTERFACE as IFACE, MANAGER_XML, METHODS} from './contract.js';
+const INTERFACE_INFO = Gio.DBusNodeInfo.new_for_xml(MANAGER_XML).lookup_interface(IFACE);
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'rejected']);
 
 const SharingToggle = GObject.registerClass(class SharingToggle extends QuickSettings.QuickMenuToggle {
@@ -139,7 +138,7 @@ export default class LinuxDropExtension extends Extension {
         this._connect(this._settings, 'changed::auto-collapse', () => this._scheduleCollapse());
         this._position(); this._render(); this._visibility();
         const session = this._cancellable;
-        Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, null, BUS, PATH, IFACE, session, (source, result) => {
+        Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, INTERFACE_INFO, BUS, PATH, IFACE, session, (source, result) => {
             if (!this._alive || this._cancellable !== session) return;
             try {
                 this._proxy = Gio.DBusProxy.new_for_bus_finish(result);
@@ -163,6 +162,9 @@ export default class LinuxDropExtension extends Extension {
 
     call(method, parameters = null, callback = null) {
         if (!this._proxy || !this._alive || this._actionPending || this._serviceState !== 'ready' || !this._proxy.get_name_owner()) return;
+        if (!Object.hasOwn(METHODS, method) || (parameters?.get_type_string() ?? '()') !== METHODS[method][0]) {
+            this._error(t('Sharing service contract mismatch')); this._render(); return;
+        }
         const session = this._cancellable;
         const generation = this._ownerGeneration;
         this._actionPending = true; this._actionError = null; this._render();

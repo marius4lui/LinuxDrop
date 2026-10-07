@@ -131,6 +131,12 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         this._ownerChanged();
                         check(this._serviceState === 'connecting' && !find(this._body, 'Codes match'), 'Connecting must not expose stale consent');
                         const firstRead = requests.shift();
+                        this._serviceState = 'ready';
+                        this.call('SetVisibility', new GLib.Variant('(u)', [1]));
+                        this.call('NonexistentManagerMethod');
+                        check(requests.length === 0 && !this._actionPending, 'Invalid wire types and unknown methods must not reach the service');
+                        this._serviceState = 'connecting'; this._actionError = null;
+
                         this._refresh(); this._refresh();
                         check(requests.length === 0, 'Concurrent changes must coalesce behind the pending snapshot');
                         reply(firstRead, snapshot(1));

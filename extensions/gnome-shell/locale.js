@@ -5,6 +5,7 @@ const deErrors = {
     'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.': 'Der Netzwerk-Helfer ist nicht erreichbar. Der Freigabedienst wurde gestoppt; der Adapter wird möglicherweise noch freigegeben. Verbinde ihn erneut und starte die Freigabedienste in den Einstellungen neu.',
 };
 const de = {
+    'Sharing service contract mismatch': 'App und Freigabedienst sind nicht kompatibel. Aktualisiere beide.',
     'Previous': 'Zurück', 'Next': 'Weiter', 'Active transfers': 'Aktive Übertragungen',
     'Previous transfer': 'Vorherige Übertragung', 'Next transfer': 'Nächste Übertragung',
     'completed': 'Abgeschlossen', 'failed': 'Fehlgeschlagen', 'cancelled': 'Abgebrochen', 'rejected': 'Abgelehnt',

@@ -69,6 +69,7 @@ install -Dm644 packaging/linuxdrop.sysusers %{buildroot}%{_sysusersdir}/linuxdro
 %{_datadir}/applications/io.github.marius4lui.LinuxDrop.desktop
 %{_datadir}/metainfo/io.github.marius4lui.LinuxDrop.metainfo.xml
 %{_datadir}/dbus-1/services/io.github.marius4lui.LinuxDrop.service
+%{_datadir}/dbus-1/interfaces/io.github.marius4lui.LinuxDrop.Manager1.xml
 %{_datadir}/dbus-1/system.d/io.github.marius4lui.LinuxDrop.Netd.conf
 %{_datadir}/polkit-1/actions/io.github.marius4lui.LinuxDrop.policy
 %{_datadir}/polkit-1/rules.d/50-linuxdrop-netd.rules

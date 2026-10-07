@@ -209,6 +209,7 @@ pub fn tr(message: &str) -> String {
         "Share with nearby devices." => "Mit Geräten in deiner Nähe teilen.",
         "Transfers" => "Übertragungen",
         "Hardware" => "Hardware",
+        "Sharing service contract mismatch" => "App und Freigabedienst sind nicht kompatibel. Aktualisiere beide.",
         "Settings" => "Einstellungen",
         "Connecting…" => "Verbinden …",
         "Connecting to the sharing service…" => "Verbindung zum Freigabedienst wird hergestellt …",

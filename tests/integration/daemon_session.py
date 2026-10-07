@@ -16,6 +16,7 @@ import time
 import threading
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from gi.repository import Gio, GLib
 
 
@@ -67,6 +68,41 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         wait(lambda: any(b["id"] == "localsend" and b["state"] == "ready"
                          for b in snapshot()["backends"]))
         wait(lambda: not snapshot()["restarting"])
+        # Compare every public method, signal and wire argument with the shared
+        # contract. Argument names/order of members are not part of wire identity.
+        canonical = ET.parse(Path(__file__).resolve().parents[2] / "crates/linuxdrop-ipc/manager1.xml").getroot()
+        introspection = bus.call_sync("io.github.marius4lui.LinuxDrop",
+            "/io/github/marius4lui/LinuxDrop", "org.freedesktop.DBus.Introspectable",
+            "Introspect", None, None, Gio.DBusCallFlags.NO_AUTO_START, 5000, None).unpack()[0]
+        def wire_members(node):
+            interface = node.find("interface[@name='io.github.marius4lui.LinuxDrop.Manager1']")
+            assert interface is not None
+            return {(member.tag, member.attrib["name"]): tuple(
+                (arg.get("direction", "out" if member.tag == "signal" else "in"), arg.attrib["type"])
+                for arg in member.findall("arg"))
+                for member in interface if member.tag in ("method", "signal", "property")}
+        assert wire_members(canonical) == wire_members(ET.fromstring(introspection)), "Manager1 contract drift"
+        changed = []
+        subscription = bus.signal_subscribe("io.github.marius4lui.LinuxDrop",
+            "io.github.marius4lui.LinuxDrop.Manager1", "Changed",
+            "/io/github/marius4lui/LinuxDrop", None, Gio.DBusSignalFlags.NONE,
+            lambda _bus, _sender, _path, _iface, _name, args: changed.append(args))
+        before = snapshot()["revision"]
+        call("SetVisibility", "(s)", ("hidden",))
+        def received_change():
+            context = GLib.MainContext.default()
+            while context.pending(): context.iteration(False)
+            return any(item.get_type_string() == "(t)" and item.unpack()[0] > before for item in changed)
+        wait(received_change)
+        bus.signal_unsubscribe(subscription)
+        try:
+            call("SetVisibility", "(u)", (1,))
+            raise AssertionError("Wrong wire type was accepted")
+        except GLib.Error:
+            pass
+        assert snapshot()["settings"]["visibility"]["mode"] == "hidden"
+        if probe := os.environ.get("LINUXDROP_CONTRACT_PROBE"):
+            subprocess.run([probe], check=True, timeout=15)
         first = snapshot()
         assert first["settings"]["visibility"]["mode"] == "hidden"
         # The test client deliberately accepts the generated certificate. Product

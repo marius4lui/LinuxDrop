@@ -17,12 +17,15 @@ jobs:
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Formatting
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --all --check
+          python3 tools/sync-ipc-contract.py --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
       - name: Unit and integration tests
         run: |
           cargo test --workspace --locked
+          cargo build -p linuxdrop-ipc --features client --example check_contract --locked
           sh crates/linuxdrop-network/tests/run-nm-lifecycle.sh
           sh crates/linuxdrop-network/tests/run-p2p-host.sh
           sh crates/linuxdrop-network/tests/run-bluetooth-lifecycle.sh
@@ -43,7 +46,7 @@ jobs:
         run: sh packaging/build-deb.sh
       - name: Daemon session and HTTPS integration
         run: |
-          dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
+          LINUXDROP_TEST_CONTRACT=1 LINUXDROP_CONTRACT_PROBE="$PWD/target/debug/examples/check_contract" dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
           dbus-run-session -- python3 tests/integration/daemon_shutdown.py target/release/linuxdropd
       - name: Package smoke test
         run: |

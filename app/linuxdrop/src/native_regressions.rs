@@ -128,7 +128,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         gio::DBusMethodInvocation,
         glib::Variant,
     )>::new()));
-    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='RunHardwareDiagnostic'><arg type='s' direction='in'/><arg type='q' direction='in'/><arg type='s' direction='out'/></method><method name='StopDownloadOffer'/><method name='ResetSettings'/><method name='UpdateSettings'><arg type='s' direction='in'/></method><method name='UpdatePeerPreferences'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
+    let info = gio::DBusNodeInfo::for_xml(linuxdrop_ipc::MANAGER_XML).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
     let accepted = accepted_options.clone();
@@ -679,6 +679,11 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         capture(&ui, "download-offer-review.png");
         download.force_close();
         let proxy = ui.proxy.borrow().clone().unwrap();
+        let count = setting_calls.get();
+        assert!(ipc::call(&proxy, "UpdateSettings", Some((7_u32,).to_variant())).await.is_err());
+        assert!(ipc::call(&proxy, "NonexistentManagerMethod", None).await.is_err());
+        assert_eq!(setting_calls.get(), count, "Invalid contract calls must never reach the daemon");
+
         ui.snapshot.borrow_mut()["restarting"] = json!(true);
         ui.update_send();
         assert!(!ui.send.is_sensitive() && !ui.share_link.is_sensitive());

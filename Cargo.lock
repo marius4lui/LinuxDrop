@@ -1982,6 +1982,7 @@ dependencies = [
  "libadwaita",
  "libc",
  "linuxdrop-core",
+ "linuxdrop-ipc",
  "serde_json",
 ]
 
@@ -2033,6 +2034,7 @@ dependencies = [
  "linuxdrop-airdrop",
  "linuxdrop-core",
  "linuxdrop-hardware",
+ "linuxdrop-ipc",
  "linuxdrop-localsend",
  "linuxdrop-netd",
  "linuxdrop-network",
@@ -2053,6 +2055,16 @@ name = "linuxdrop-hardware"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
+ "tokio",
+ "zbus",
+]
+
+[[package]]
+name = "linuxdrop-ipc"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
  "serde_json",
  "tokio",
  "zbus",

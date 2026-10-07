@@ -19,9 +19,7 @@ use tokio::sync::{mpsc, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
-const SERVICE: &str = "io.github.marius4lui.LinuxDrop";
-const OBJECT: &str = "/io/github/marius4lui/LinuxDrop";
-const INTERFACE: &str = "io.github.marius4lui.LinuxDrop.Manager1";
+use linuxdrop_ipc::{BUS as SERVICE, PATH as OBJECT};
 
 struct Draft {
     files: Vec<SendSource>,
@@ -105,9 +103,9 @@ impl Shared {
             d.revision
         };
         if let Some(connection) = self.connection.get() {
-            let _ = connection
-                .emit_signal(None::<&str>, OBJECT, INTERFACE, "Changed", &(revision,))
-                .await;
+            if let Ok(emitter) = zbus::object_server::SignalEmitter::new(connection, OBJECT) {
+                let _ = Manager::changed(&emitter, revision).await;
+            }
         }
     }
     async fn snapshot(&self) -> String {
@@ -414,6 +412,12 @@ impl linuxdrop_network::P2pConnector for HelperP2p {
 }
 #[zbus::interface(name = "io.github.marius4lui.LinuxDrop.Manager1")]
 impl Manager {
+    #[zbus(signal)]
+    async fn changed(
+        emitter: &zbus::object_server::SignalEmitter<'_>,
+        revision: u64,
+    ) -> zbus::Result<()>;
+
     async fn get_snapshot(&self) -> String {
         self.0.snapshot().await
     }

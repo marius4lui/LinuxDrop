@@ -9,6 +9,7 @@ name = "linuxdropd"
 path = "src/main.rs"
 
 [dependencies]
+linuxdrop-ipc = { path = "../linuxdrop-ipc" }
 linuxdrop-core = { path = "../linuxdrop-core" }
 linuxdrop-storage = { path = "../linuxdrop-storage" }
 linuxdrop-network = { path = "../linuxdrop-network" }

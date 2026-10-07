@@ -28,6 +28,17 @@ The app ID is `io.github.marius4lui.LinuxDrop.App`; the daemon exclusively owns 
 
 ## Session IPC
 
+`crates/linuxdrop-ipc/manager1.xml` is the canonical wire contract for all 31
+methods and `Changed(t)`. `tools/sync-ipc-contract.py` generates shared Rust method
+metadata, an optional typed zbus client, and the GNOME interface description.
+GTK supplies that description to GDBus and validates outgoing/reply signatures;
+GNOME supplies the same description and rejects malformed actions before sending.
+CI checks generated files and compares real daemon introspection with the entire
+contract. Native packages install the XML under `share/dbus-1/interfaces`.
+JSON payload field schemas remain a separate contract; wire signatures alone do
+not validate their contents.
+
+
 Service `io.github.marius4lui.LinuxDrop`, object `/io/github/marius4lui/LinuxDrop`, interface `io.github.marius4lui.LinuxDrop.Manager1`:
 
 | Method | Input | Result |
