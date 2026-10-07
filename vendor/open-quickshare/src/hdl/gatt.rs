@@ -262,7 +262,10 @@ impl ReceiverGattServer {
         ctk.cancelled().await;
         info!("{INNER_NAME}: tracker cancelled, returning");
         tasks.shutdown().await;
-        handle.unregister().await?;
+        handle
+            .unregister()
+            .await
+            .map_err(crate::lifecycle::cleanup_failure)?;
 
         Ok(())
     }

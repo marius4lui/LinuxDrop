@@ -76,7 +76,10 @@ impl BleAdvertiser {
             _ = ctk.cancelled() => false,
             _ = handle.released() => true,
         };
-        handle.unregister().await?;
+        handle
+            .unregister()
+            .await
+            .map_err(crate::lifecycle::cleanup_failure)?;
         if released {
             anyhow::bail!("Bluetooth sender advertisement is no longer active");
         }
@@ -569,7 +572,7 @@ impl ReceiverAdvertiser {
                 tokio::select! {
                     _ = ctk.cancelled() => {
                         info!("{RX_INNER_NAME}: tracker cancelled, returning");
-                        for handle in &mut handles { handle.unregister().await?; }
+                        unregister_all(&mut handles).await?;
                         return Ok(());
                     }
                     _ = async { futures::future::select_all(handles.iter().map(|handle| Box::pin(handle.released()))).await; } => {
@@ -582,7 +585,7 @@ impl ReceiverAdvertiser {
                     }
                     changed = visibility.changed() => {
                         if changed.is_err() {
-                            for handle in &mut handles { handle.unregister().await?; }
+                            unregister_all(&mut handles).await?;
                         return Ok(());
                         }
                         if *visibility.borrow() == Visibility::Invisible {
@@ -620,9 +623,7 @@ impl ReceiverAdvertiser {
             // bluetoothd yet may never be enabled by the controller, and
             // nothing ever retries the enable. The sub-second gap of a clean
             // cycle is invisible next to the phone's scan interval.
-            for handle in &mut handles {
-                handle.unregister().await?;
-            }
+            unregister_all(&mut handles).await?;
             drop(handles);
             if ctk.is_cancelled() {
                 return Ok(());
@@ -767,5 +768,22 @@ mod tests {
         assert_eq!(&with[with.len() - 3..], &[0x01, 0x00, 0x91]);
         // Same bytes up to the trailer.
         assert_eq!(without[..without.len() - 1], with[..with.len() - 3]);
+    }
+}
+
+async fn unregister_all(handles: &mut [bluer::adv::AdvertisementHandle]) -> anyhow::Result<()> {
+    // One failed registration must not prevent the remaining handles from
+    // starting their cleanup. Await every receipt before reporting failure.
+    let outcomes =
+        futures::future::join_all(handles.iter_mut().map(|handle| handle.unregister())).await;
+    let errors: Vec<_> = outcomes
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|e| e.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::lifecycle::cleanup_failure(errors.join("; ")))
     }
 }

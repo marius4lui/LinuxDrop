@@ -232,13 +232,7 @@ impl BleListener {
         } else {
             Ok(())
         };
-        match (outcome, cleanup) {
-            (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("Scanner cleanup also failed: {cleanup:#}")))
-            }
-            (Err(error), _) => Err(error),
-            (_, result) => result,
-        }
+        crate::lifecycle::finish(outcome, cleanup)
     }
 
     /// Is a phone currently connected to us over LE?

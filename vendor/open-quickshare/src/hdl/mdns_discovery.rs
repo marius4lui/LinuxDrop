@@ -80,7 +80,7 @@ impl MDnsDiscovery {
         let result = self.run_inner(ctk).await;
         let cleanup = super::mdns_cleanup::shutdown(&self.daemon).await;
         self.closed = cleanup.is_ok();
-        result.and(cleanup)
+        crate::lifecycle::finish(result, cleanup)
     }
 
     async fn run_inner(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {

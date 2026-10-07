@@ -130,7 +130,11 @@ async fn running_engine_follows_real_address_and_link_changes() {
     engine.run().await.unwrap();
     let mut updates = engine.lan_state().unwrap();
     let (discovery, _discovery_rx) = tokio::sync::broadcast::channel(32);
-    engine.discovery(discovery).unwrap();
+    engine.discovery(discovery.clone()).unwrap();
+    assert!(
+        engine.discovery(discovery).is_err(),
+        "Replacing active discovery must not orphan its cancellation token"
+    );
     let mut status = engine.message_sender.subscribe();
     let port = engine.port_number.unwrap() as u16;
     assert!(updates.borrow().available());
@@ -260,5 +264,6 @@ async fn running_engine_follows_real_address_and_link_changes() {
     }
     tokio::time::timeout(Duration::from_secs(5), engine.stop())
         .await
+        .unwrap()
         .unwrap();
 }

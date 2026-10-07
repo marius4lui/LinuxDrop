@@ -9,12 +9,12 @@ use channel::ChannelMessage;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 use hdl::BleAdvertiser;
 use hdl::MDnsDiscovery;
+use lifecycle::Workers;
 use once_cell::sync::Lazy;
 use rand::Rng;
 use rand::distr::Alphanumeric;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 #[cfg(feature = "experimental")]
 use crate::hdl::BleListener;
@@ -25,6 +25,8 @@ pub mod channel;
 pub mod errors;
 pub mod hdl;
 pub mod lan_policy;
+#[doc(hidden)]
+pub mod lifecycle;
 pub mod manager;
 pub mod payload_budget;
 pub mod utils;
@@ -100,7 +102,8 @@ fn hostname() -> String {
 #[derive(Debug)]
 pub struct RQS {
     pub ble_enabled: bool,
-    tracker: Option<TaskTracker>,
+    tracker: Option<Workers>,
+    stop_error: Option<String>,
     ctoken: Option<CancellationToken>,
     session_ctoken: Option<CancellationToken>,
     // Discovery token is different than ctoken because he is on his own
@@ -154,6 +157,7 @@ impl RQS {
         Self {
             ble_enabled: true,
             tracker: None,
+            stop_error: None,
             ctoken: None,
             session_ctoken: None,
             discovery_ctk: None,
@@ -175,7 +179,10 @@ impl RQS {
         let sessions = CancellationToken::new();
         self.session_ctoken = Some(sessions.clone());
         *SESSION_SHUTDOWN.write().unwrap() = sessions;
-        let tracker = TaskTracker::new();
+        if let Some(error) = &self.stop_error {
+            return Err(anyhow!("Previous cleanup is incomplete: {error}"));
+        }
+        let tracker = Workers::with_events(self.message_sender.clone());
         let ctoken = CancellationToken::new();
         self.tracker = Some(tracker.clone());
         self.ctoken = Some(ctoken.clone());
@@ -209,7 +216,7 @@ impl RQS {
         let ctk = ctoken.clone();
         let lifetime = ctk.clone();
         let status = self.message_sender.clone();
-        tracker.spawn(async move {
+        tracker.spawn("tcp", async move {
             let result = server.run(ctk).await;
             if !lifetime.is_cancelled() {
                 let _ = status.send(channel::ChannelMessage {
@@ -233,10 +240,12 @@ impl RQS {
                 Ok(ble) => {
                     let ctk = ctoken.clone();
                     let status = self.message_sender.clone();
-                    tracker.spawn(async move {
-                        if let Err(error) = ble.run(ctk).await {
+                    tracker.spawn("bluetooth-listener", async move {
+                        let result = ble.run(ctk).await;
+                        if let Err(error) = &result {
                             backend_failure(&status, "bluetooth-listener", error);
                         }
+                        result
                     });
                 }
                 Err(error) => backend_failure(&self.message_sender, "bluetooth-listener", error),
@@ -255,7 +264,7 @@ impl RQS {
         let ctk = ctoken.clone();
         let lifetime = ctk.clone();
         let status = self.message_sender.clone();
-        tracker.spawn(async move {
+        tracker.spawn("mdns", async move {
             let result = mdns.run(ctk).await;
             if !lifetime.is_cancelled() {
                 let _ = status.send(channel::ChannelMessage {
@@ -325,10 +334,11 @@ impl RQS {
                     let l2cap_sender = self.message_sender.clone();
                     let l2cap_tcp_port = service_port;
                     let lctk = ctoken.clone();
-                    tracker.spawn(async move {
+                    tracker.spawn("bluetooth-l2cap", async move {
                         server
                             .run(l2cap_advert, l2cap_sender, l2cap_tcp_port, lctk)
                             .await;
+                        Ok(())
                     });
                 }
 
@@ -340,7 +350,7 @@ impl RQS {
                 let gatt_tcp_port = service_port;
                 let gctk = ctoken.clone();
                 let status = self.message_sender.clone();
-                tracker.spawn(async move {
+                tracker.spawn("bluetooth-gatt", async move {
                     match crate::hdl::ReceiverGattServer::new(
                         gatt_advert,
                         gatt_sender,
@@ -349,12 +359,16 @@ impl RQS {
                     .await
                     {
                         Ok(srv) => {
-                            if let Err(e) = srv.run(gctk).await {
-                                error!("ReceiverGattServer: {}", e);
+                            let result = srv.run(gctk).await;
+                            if let Err(e) = &result {
                                 backend_failure(&status, "bluetooth-gatt", e);
                             }
+                            result
                         }
-                        Err(e) => backend_failure(&status, "bluetooth-gatt", e),
+                        Err(e) => {
+                            backend_failure(&status, "bluetooth-gatt", &e);
+                            Err(e)
+                        }
                     }
                 });
 
@@ -362,7 +376,7 @@ impl RQS {
                 let ctk = ctoken.clone();
                 let adv_vis = self.visibility_receiver.clone();
                 let status = self.message_sender.clone();
-                tracker.spawn(async move {
+                tracker.spawn("bluetooth-receiver", async move {
                     match crate::hdl::ReceiverAdvertiser::new(
                         rx_endpoint_id,
                         crate::utils::DeviceType::Laptop as u8,
@@ -372,12 +386,16 @@ impl RQS {
                     .await
                     {
                         Ok(adv) => {
-                            if let Err(e) = adv.run(adv_vis, ctk).await {
-                                error!("ReceiverAdvertiser: {}", e);
+                            let result = adv.run(adv_vis, ctk).await;
+                            if let Err(e) = &result {
                                 backend_failure(&status, "bluetooth-receiver", e);
                             }
+                            result
                         }
-                        Err(e) => backend_failure(&status, "bluetooth-receiver", e),
+                        Err(e) => {
+                            backend_failure(&status, "bluetooth-receiver", &e);
+                            Err(e)
+                        }
                     }
                 });
             }
@@ -392,6 +410,11 @@ impl RQS {
         &mut self,
         sender: broadcast::Sender<EndpointInfo>,
     ) -> Result<(), anyhow::Error> {
+        if self.discovery_ctk.is_some() {
+            return Err(anyhow!(
+                "Discovery is already started; stop it before replacing it"
+            ));
+        }
         let tracker = self
             .tracker
             .as_ref()
@@ -404,20 +427,21 @@ impl RQS {
         if self.ble_enabled {
             let ctk_blea = ctk.clone();
             let status = self.message_sender.clone();
-            tracker.spawn(async move {
+            tracker.spawn("bluetooth-discovery", async move {
                 let blea = match BleAdvertiser::new().await {
                     Ok(b) => b,
                     Err(e) => {
                         error!("Couldn't init BleAdvertiser: {}", e);
-                        backend_failure(&status, "bluetooth-discovery", e);
-                        return;
+                        backend_failure(&status, "bluetooth-discovery", &e);
+                        return Err(e);
                     }
                 };
 
-                if let Err(e) = blea.run(ctk_blea).await {
-                    error!("Couldn't start BleAdvertiser: {}", e);
+                let result = blea.run(ctk_blea).await;
+                if let Err(e) = &result {
                     backend_failure(&status, "bluetooth-discovery", e);
                 }
+                result
             });
 
             // Discover phones on their Quick Share receive screen over BLE, so
@@ -431,8 +455,9 @@ impl RQS {
             } else {
                 let ble_sender = sender.clone();
                 let ctk_bled = ctk.clone();
-                tracker.spawn(async move {
+                tracker.spawn("bluetooth-peer-discovery", async move {
                     crate::hdl::ble_discovery(ble_sender, ctk_bled).await;
+                    Ok(())
                 });
             }
         }
@@ -448,7 +473,7 @@ impl RQS {
         } else {
             let discovery = MDnsDiscovery::new(sender, self.lan_state()?)?;
             let status = self.message_sender.clone();
-            tracker.spawn(async move {
+            tracker.spawn("discovery", async move {
                 let result = discovery.run(ctk.clone()).await;
                 if !ctk.is_cancelled() {
                     let _ = status.send(channel::ChannelMessage {
@@ -490,7 +515,7 @@ impl RQS {
             .send_modify(|state| *state = nv);
     }
 
-    pub async fn stop(&mut self) {
+    pub async fn stop(&mut self) -> Result<(), String> {
         // An old/cancelled startup must never cancel a newer engine generation.
         if let Some(sessions) = &self.session_ctoken {
             sessions.cancel();
@@ -507,19 +532,23 @@ impl RQS {
             ctoken.cancel();
         }
 
-        if let Some(tracker) = &self.tracker {
+        let result = if let Some(tracker) = &self.tracker {
             // Inorder for TaskTracker::wait to return, close() must be called
             // and the count of tasks being watched should be 0 (i.e. they've all closed).
             //
             // If not, the TaskTracker may forever wait if task count is 0 when wait() was called
             tracker.close();
-            tracker.wait().await;
-        }
+            tracker.wait().await
+        } else {
+            self.stop_error.clone().map_or(Ok(()), Err)
+        };
+        self.stop_error = result.as_ref().err().cloned();
 
         self.ctoken = None;
         self.session_ctoken = None;
         self.tracker = None;
         self.lan_state = None;
+        result
     }
 
     // Setting None here will resume the default settings

@@ -149,4 +149,9 @@ Startup lifetime fixes retain the Quick Share engine and staging until workers
 finish, including caller cancellation. Engine session cancellation is scoped to
 its own generation. mDNS advertiser/discovery objects acquire cleanup ownership
 before configuration, retry a full shutdown queue, and await normal daemon exit.
-The outer RQS stop API still needs explicit worker cleanup-error propagation.
+The outer RQS stop API now returns persistent cleanup failure results. Typed
+cleanup errors and panics survive tracked workers, are reported as backend events,
+and reach the daemon's shutdown receipt. Ordinary operational errors remain
+recoverable when cleanup succeeds. Receiver advertisement removal awaits every
+handle concurrently; active discovery replacement is rejected before it can
+orphan its old cancellation token.

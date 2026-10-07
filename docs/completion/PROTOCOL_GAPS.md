@@ -509,6 +509,31 @@ Quick Share startup regression observes a real opened TCP port, aborts the calle
 and waits for the port and temporary staging directory to be released. The private
 kernel LAN lifecycle test verifies discovery/listener recovery and normal stop.
 These checks do not prove prolonged mDNS resource bounds or physical radio recovery.
-Quick Share's outer RQS stop API still needs propagation of discovery cleanup
-errors currently returned only by its tracked workers. Installed packages and the
-live demo remain unchanged.
+The outer RQS cleanup-error propagation gap found in this pass is resolved by the
+following change. Installed packages and the live demo remain unchanged.
+
+
+## Quick Share shutdown result propagation, 2026-10-07
+
+Top-level Quick Share workers now retain explicit cleanup failures and panics;
+ordinary operational errors with successful cleanup remain recoverable. Discovery
+shutdown, scanner StopDiscovery and GATT/advertisement removal failures carry a
+typed cleanup marker through contextual errors. The engine waits for all workers
+and returns a stable failed result rather than acknowledging an incomplete stop.
+The adapter passes this through the daemon's persistent CommandSender receipt.
+Failure events also reach the running backend instead of leaving a panicked worker
+silently marked ready. Active discovery cannot be replaced without stopping it.
+
+Multiple receiver advertisement removals begin together and all results are
+collected, so one failure cannot skip the remaining handles. Failure results stay
+available after a cancelled waiter and repeated shutdown requests. This does not
+turn a failed cleanup into a successful retry without evidence of restoration.
+
+Passed: 14 default Quick Share tests, including cancellation/panic/contextual-error
+receipt regressions and real encrypted transfer checks; the private BlueZ suite
+now drives the complete backend. It distinguishes a failed StartDiscovery with
+successful cleanup (successful stop) from refused StopDiscovery (failed stop,
+identical on retry). The private kernel LAN lifecycle test also checks duplicate
+discovery rejection and normal acknowledged shutdown. Workspace all-target Clippy
+passed. Physical Bluetooth recovery and prolonged resource-bound acceptance remain
+separate; installed packages and the live demo were not changed.

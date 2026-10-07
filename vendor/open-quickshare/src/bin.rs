@@ -29,7 +29,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Wait for CTRL+C and then stop RQS
     let _ = tokio::signal::ctrl_c().await;
     info!("Stopping service.");
-    rqs.stop().await;
+    rqs.stop().await.map_err(anyhow::Error::msg)?;
 
     Ok(())
 }

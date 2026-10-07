@@ -97,21 +97,27 @@ pub async fn start_with_budget(
     let (send, _) = match engine.run().await {
         Ok(channels) => channels,
         Err(error) => {
-            engine.stop().await;
-            return Err(error);
+            return match engine.stop().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(anyhow::anyhow!("{error}; {cleanup}")),
+            };
         }
     };
     let mut lan_state = match engine.lan_state() {
         Ok(state) => state,
         Err(error) => {
-            engine.stop().await;
-            return Err(error);
+            return match engine.stop().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(anyhow::anyhow!("{error}; {cleanup}")),
+            };
         }
     };
     let (discovery, mut peers_rx) = broadcast::channel::<EndpointInfo>(128);
     if let Err(error) = engine.discovery(discovery) {
-        engine.stop().await;
-        return Err(error);
+        return match engine.stop().await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(anyhow::anyhow!("{error}; {cleanup}")),
+        };
     }
     let (commands, mut rx) = mpsc::channel(32);
     let mut bluetooth_errors = std::collections::BTreeMap::new();
@@ -251,7 +257,7 @@ pub async fn start_with_budget(
                 _ = expiry.tick() => {let expired:Vec<_>=pending.iter().filter(|(_,t)|t.elapsed()>Duration::from_secs(120)).map(|(id,_)|id.clone()).collect(); for id in expired {pending.remove(&id);action(&engine,&id,TransferAction::ConsentDecline);}}
             }
         }
-        engine.stop().await;
+        let cleanup = engine.stop().await;
         for (_, mut transfer) in transfers {
             if !matches!(
                 transfer.state.as_str(),
@@ -265,7 +271,7 @@ pub async fn start_with_budget(
                     .ok();
             }
         }
-        Ok(())
+        cleanup
     });
     Ok(linuxdrop_core::CommandSender::track(commands, task))
 }

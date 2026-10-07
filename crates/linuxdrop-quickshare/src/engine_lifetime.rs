@@ -16,12 +16,15 @@ impl OwnedEngine {
     pub fn staging_path(&self) -> &std::path::Path {
         self.staging.as_ref().expect("staging is owned").path()
     }
-    pub async fn stop(&mut self) {
-        if let Some(engine) = self.engine.as_mut() {
-            engine.stop().await;
-        }
+    pub async fn stop(&mut self) -> Result<(), String> {
+        let result = if let Some(engine) = self.engine.as_mut() {
+            engine.stop().await
+        } else {
+            Ok(())
+        };
         self.engine.take();
         self.staging.take();
+        result
     }
 }
 impl Deref for OwnedEngine {
@@ -42,7 +45,7 @@ impl Drop for OwnedEngine {
             // Cancelling startup must not detach a listening server or remove
             // staging underneath workers. Normal stop awaits this same order.
             tokio::spawn(async move {
-                engine.stop().await;
+                let _ = engine.stop().await;
                 drop(staging);
             });
         }

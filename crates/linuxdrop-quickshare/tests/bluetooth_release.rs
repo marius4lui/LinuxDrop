@@ -350,4 +350,69 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         rqs_lib::hdl::BleListener::new(alerts).await.is_err(),
         "An unavailable selection must not switch to hci0"
     );
+
+    // Exercise the complete adapter -> RQS worker tracker -> CommandSender
+    // receipt path. A recoverable scan-start error must not block shutdown;
+    // an unacknowledged StopDiscovery must remain visible on every retry.
+    selected_scan.powered.store(true, Ordering::SeqCst);
+    let directory = tempfile::tempdir().unwrap();
+    for (start_fails, cleanup_fails) in [(true, false), (false, true)] {
+        selected_scan.fail_stop.store(false, Ordering::SeqCst);
+        let adapter = zbus::Proxy::new(&bus, "org.bluez", "/org/bluez/hci1", "org.bluez.Adapter1")
+            .await
+            .unwrap();
+        adapter
+            .call::<_, _, ()>("StopDiscovery", &())
+            .await
+            .unwrap();
+        selected_scan
+            .fail_start
+            .store(start_fails, Ordering::SeqCst);
+        selected_scan
+            .fail_stop
+            .store(cleanup_fails, Ordering::SeqCst);
+        let starts = selected_scan.starts.load(Ordering::SeqCst);
+        let (events, _receiver) = tokio::sync::mpsc::channel(128);
+        let commands = linuxdrop_quickshare::start(
+            linuxdrop_quickshare::Config {
+                name: "Cleanup receipt test".into(),
+                download_dir: directory.path().into(),
+                visible: false,
+                port: None,
+                ble: true,
+                max_receive_bytes: 1024,
+                max_files: 1,
+                upgrade_lease: None,
+                p2p_connector: None,
+                policy: linuxdrop_core::TransferPolicy {
+                    bluetooth_adapter: Some("hci1".into()),
+                    allowed_interfaces: vec!["lo".into()],
+                    ..Default::default()
+                },
+            },
+            events,
+        )
+        .await
+        .unwrap();
+        wait_for(|| selected_scan.starts.load(Ordering::SeqCst) > starts).await;
+        let result = commands.shutdown().await;
+        if cleanup_fails {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("bluetooth-listener") && error.contains("cleanup failed"),
+                "{error}"
+            );
+            assert_eq!(commands.shutdown().await.unwrap_err(), error);
+        } else {
+            result.unwrap();
+        }
+    }
+    selected_scan.fail_stop.store(false, Ordering::SeqCst);
+    let adapter = zbus::Proxy::new(&bus, "org.bluez", "/org/bluez/hci1", "org.bluez.Adapter1")
+        .await
+        .unwrap();
+    adapter
+        .call::<_, _, ()>("StopDiscovery", &())
+        .await
+        .unwrap();
 }
