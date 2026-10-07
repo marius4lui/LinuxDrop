@@ -2111,6 +2111,7 @@ dependencies = [
  "libc",
  "linuxdrop-core",
  "serde",
+ "serde_json",
  "tokio",
  "tokio-util",
  "zbus",

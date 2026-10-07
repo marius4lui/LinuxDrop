@@ -29,6 +29,7 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Live IPv4 LAN address/interface changes reconcile listeners, mDNS records, discovery probes and readiness without requiring a manual backend restart.
 - [x] IPv6 LAN listeners, scoped discovery endpoints and WIFI_LAN address-candidate offers/selection, including IPv6-only readiness and exact interface binding.
 - [x] IPv6 credentials/candidates for direct/hotspot networks; owned-interface binding and IPv6-only group readiness.
+- [x] Pin supplicant operations and journaled P2P cleanup to the original unique D-Bus owner/bus; abort owner changes and distinguish revoked leases from healthy reservations.
 - [ ] Prolonged mDNS reconfiguration/resource-bound acceptance.
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
@@ -649,3 +650,41 @@ and thirteen daemon tests passed. App, hardware, netd and daemon all-target
 Clippy with warnings denied passed. These are selection/lifecycle software
 fixtures; physical radio unplug, monitor/injection and device interoperability
 remain separately unverified. The user's live demo was not changed.
+
+
+## Supplicant generation ownership and revocation, 2026-10-07
+
+Both group hosting and WPS client discovery/connection resolve a unique
+supplicant owner after subscribing to its NameOwnerChanged signal. Every root,
+peer, group and cleanup call uses that unique destination. Group identities
+persist the owner and D-Bus server GUID; matching object paths on a replacement
+service or a different bus are insufficient authority. Setup, formation and
+cleanup waits are bounded. Owner changes abort both directions, with cleanup
+addressed only to the original connection. A still-connected old owner can
+clean up its own group after relinquishing the well-known name; a dead owner
+never redirects cleanup to the replacement.
+
+The helper's watchdog reads the current service identity outside its global
+state lock and revokes P2P leases on loss/replacement. Revoked or orphaned leases
+are excluded from healthy Status responses, so the daemon's existing health
+path retires peers/transfers instead of treating pending restoration as ready.
+Retained records remain available through RecoveryStatus/RetryRecovery, and
+channel changes/new group operations on revoked reservations are refused.
+Already-revoked records do not repeatedly run restoration in the active watchdog.
+Legacy journals deserialize, but records lacking service identity cannot send
+ambiguous Disconnect calls; unresolved ownership needs explicit recovery rather
+than assuming identical paths mean the same group.
+
+Passed: the private supplicant contract now exercises two actual D-Bus owners
+exporting identical paths, delayed GroupStarted and cancellation races, host
+owner loss, client-discovery owner loss, old-owner cleanup, old-owner death,
+legacy identity and wrong-bus rejection. No cancellation/discovery-stop or group
+disconnect reaches the new owner. Its final native-bus run passed in 0.82 s.
+Default tests passed: 4 network, 9 netd and 13 daemon; the netd regression checks
+healthy Status versus retained recovery and refusal of channel mutations.
+All-target Clippy for network/netd/daemon passed. Physical supplicant/radio crash
+restoration is still a separate acceptance task; these fixtures do not certify
+complete Wi-Fi Direct role/authentication interoperability.
+
+The generation model follows the [D-Bus name/owner specification](https://dbus.freedesktop.org/doc/dbus-specification.html#message-bus-names)
+and the [supplicant P2P D-Bus API](https://w1.fi/wpa_supplicant/devel/dbus.html).

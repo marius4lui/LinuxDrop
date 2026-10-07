@@ -26,6 +26,14 @@ Before mutation a mode-0600 atomic journal records the lease. Recovery deletes o
 
 The currently permitted frequency set is captured at acquisition. The watchdog stops the lease if a previously granted frequency becomes restricted; clients then reacquire after the regulatory-country change. Kernel regulatory enforcement remains authoritative between inventory updates. There is no automatic regulatory-country override. A second inventory check after monitor-VIF creation catches connections that started during acquisition; later competing activation is detected by the two-second watchdog. Userspace snapshots cannot promise an atomic lock against another privileged network manager.
 
+P2P journals also record the supplicant unique D-Bus owner and bus GUID. Cleanup
+addresses that original connection, never a replacement which happens to reuse
+its object paths. Owner loss revokes the active reservation and makes unresolved
+cleanup visible through recovery status. Legacy journal records without this
+identity are retained when their group still exists; the helper refuses to guess
+which service owns it. A missing group needs no Disconnect. Explicit recovery
+can retry confirmed ownership; real crash/unplug behavior still needs radio tests.
+
 ## Build and install
 
 On Ubuntu 24.04, `sudo sh packaging/dev/setup-ubuntu.sh` installs native build dependencies. Install stable Rust for your normal user, then:

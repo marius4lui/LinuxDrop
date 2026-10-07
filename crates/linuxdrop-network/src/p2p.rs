@@ -10,6 +10,9 @@ use zbus::{
     Connection, Proxy,
 };
 
+#[path = "p2p_owner.rs"]
+mod owner;
+
 const SERVICE: &str = "fi.w1.wpa_supplicant1";
 const DEVICE: &str = "fi.w1.wpa_supplicant1.Interface.P2PDevice";
 
@@ -20,6 +23,10 @@ pub struct GroupIdentity {
     pub group_object: String,
     pub parent_interface: String,
     pub peer_object: String,
+    #[serde(default)]
+    pub service_owner: String,
+    #[serde(default)]
+    pub bus_guid: String,
 }
 
 /// Retain this guard until transfer completion. Drop disconnects only this group.
@@ -46,7 +53,11 @@ impl Drop for Group {
         let verify = self.verify;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = disconnect_checked(&connection, &identity, verify).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    disconnect_checked(&connection, &identity, verify),
+                )
+                .await;
             });
         }
     }
@@ -106,24 +117,58 @@ async fn connect_inner(
     frequency: u32,
     cancel: CancellationToken,
 ) -> Result<Group> {
-    let connection = Connection::system().await?;
-    let root = Proxy::new(&connection, SERVICE, "/fi/w1/wpa_supplicant1", SERVICE).await?;
-    let parent: OwnedObjectPath = root
-        .call("GetInterface", &(interface.as_str(),))
-        .await
-        .context("Reserved adapter is not managed by wpa_supplicant")?;
-    let device = Proxy::new(&connection, SERVICE, parent.as_str(), DEVICE).await?;
-    let group: OwnedObjectPath = device.get_property("Group").await?;
-    if group.as_str() != "/" {
-        bail!("Reserved adapter already has a P2P group");
-    }
-    let existing: Vec<OwnedObjectPath> = root.get_property("Interfaces").await?;
-    let mut started = device.receive_signal("GroupStarted").await?;
+    connect_on(
+        Connection::system().await?,
+        interface,
+        peer_name,
+        pin,
+        frequency,
+        cancel,
+        verify_phy,
+    )
+    .await
+}
+
+async fn connect_on(
+    connection: Connection,
+    interface: String,
+    peer_name: String,
+    pin: String,
+    frequency: u32,
+    cancel: CancellationToken,
+    verify: fn(&GroupIdentity) -> Result<()>,
+) -> Result<Group> {
+    let mut owner = owner::Watch::bind(&connection).await?;
+    let destination = owner.name.clone();
+    let bus_guid = connection.server_guid().to_string();
+    let (device, existing, mut started) = tokio::time::timeout(Duration::from_secs(5), async {
+        let root = Proxy::new(
+            &connection,
+            destination.as_str(),
+            "/fi/w1/wpa_supplicant1",
+            SERVICE,
+        )
+        .await?;
+        let parent: OwnedObjectPath = root
+            .call("GetInterface", &(interface.as_str(),))
+            .await
+            .context("Reserved adapter is not managed by wpa_supplicant")?;
+        let device = Proxy::new(&connection, destination.clone(), parent, DEVICE).await?;
+        let group: OwnedObjectPath = device.get_property("Group").await?;
+        if group.as_str() != "/" {
+            bail!("Reserved adapter already has a P2P group");
+        }
+        let existing: Vec<OwnedObjectPath> = root.get_property("Interfaces").await?;
+        let started = device.receive_signal("GroupStarted").await?;
+        Ok::<_, anyhow::Error>((device, existing, started))
+    })
+    .await
+    .context("Supplicant setup timed out")??;
     let mut find = HashMap::new();
     find.insert("Timeout", Value::from(20i32));
     find.insert("DiscoveryType", Value::from("start_with_full"));
-    device.call::<_, _, ()>("Find", &(find,)).await?;
     let operation = async {
+        device.call::<_, _, ()>("Find", &(find,)).await?;
         let peer = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let paths: Vec<OwnedObjectPath> = device.get_property("Peers").await?;
@@ -131,7 +176,7 @@ async fn connect_inner(
                 for path in paths.into_iter().take(256) {
                     let peer = Proxy::new(
                         &connection,
-                        SERVICE,
+                        destination.as_str(),
                         path.as_str(),
                         "fi.w1.wpa_supplicant1.Peer",
                     )
@@ -194,7 +239,7 @@ async fn connect_inner(
         }
         let proxy = Proxy::new(
             &connection,
-            SERVICE,
+            destination.as_str(),
             object.as_str(),
             "fi.w1.wpa_supplicant1.Interface",
         )
@@ -206,20 +251,63 @@ async fn connect_inner(
             group_object: group.to_string(),
             parent_interface: interface.clone(),
             peer_object: peer.to_string(),
+            service_owner: destination.clone(),
+            bus_guid: bus_guid.clone(),
         };
         let guard = Group {
             identity,
             connection: connection.clone(),
             armed: true,
-            verify: verify_phy,
+            verify,
         };
-        verify_phy(&guard.identity)?;
+        verify(&guard.identity)?;
         Ok::<_, anyhow::Error>(guard)
     };
-    let result = tokio::select! { _ = cancel.cancelled() => Err(anyhow::anyhow!("P2P connection cancelled")), result = operation => result };
-    let _ = device.call::<_, _, ()>("StopFind", &()).await;
+    let result = tokio::select! {
+        biased;
+        _ = owner.lost() => Err(anyhow::anyhow!("Supplicant owner changed during P2P connection")),
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("P2P connection cancelled")),
+        result = tokio::time::timeout(Duration::from_secs(70), operation) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("P2P connection timed out"))),
+    };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        device.call::<_, _, ()>("StopFind", &()),
+    )
+    .await;
     if result.is_err() {
-        let _ = device.call::<_, _, ()>("Cancel", &()).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            device.call::<_, _, ()>("Cancel", &()),
+        )
+        .await;
+        if let Ok(Some(signal)) =
+            tokio::time::timeout(Duration::from_millis(250), started.next()).await
+        {
+            if let Ok((properties,)) = signal
+                .body()
+                .deserialize::<(HashMap<String, OwnedValue>,)>()
+            {
+                if let Ok(Ok(identity)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    started_identity(
+                        &connection,
+                        &destination,
+                        &interface,
+                        &existing,
+                        properties,
+                        "client",
+                    ),
+                )
+                .await
+                {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        disconnect_checked(&connection, &identity, verify),
+                    )
+                    .await;
+                }
+            }
+        }
     }
     result
 }
@@ -274,19 +362,32 @@ async fn create_group_inner(
     cancel: CancellationToken,
     verify: fn(&GroupIdentity) -> Result<()>,
 ) -> Result<HostedGroup> {
-    let root = Proxy::new(&connection, SERVICE, "/fi/w1/wpa_supplicant1", SERVICE).await?;
-    let parent: OwnedObjectPath = root
-        .call("GetInterface", &(interface,))
-        .await
-        .context("Reserved adapter is not managed by wpa_supplicant")?;
-    let device = Proxy::new(&connection, SERVICE, parent.as_str(), DEVICE).await?;
-    let group: OwnedObjectPath = device.get_property("Group").await?;
-    anyhow::ensure!(
-        group.as_str() == "/",
-        "Reserved adapter already has a P2P group"
-    );
-    let existing: Vec<OwnedObjectPath> = root.get_property("Interfaces").await?;
-    let mut started = device.receive_signal("GroupStarted").await?;
+    let mut owner = owner::Watch::bind(&connection).await?;
+    let destination = owner.name.clone();
+    let (device, existing, mut started) = tokio::time::timeout(Duration::from_secs(5), async {
+        let root = Proxy::new(
+            &connection,
+            destination.as_str(),
+            "/fi/w1/wpa_supplicant1",
+            SERVICE,
+        )
+        .await?;
+        let parent: OwnedObjectPath = root
+            .call("GetInterface", &(interface,))
+            .await
+            .context("Reserved adapter is not managed by wpa_supplicant")?;
+        let device = Proxy::new(&connection, destination.clone(), parent, DEVICE).await?;
+        let group: OwnedObjectPath = device.get_property("Group").await?;
+        anyhow::ensure!(
+            group.as_str() == "/",
+            "Reserved adapter already has a P2P group"
+        );
+        let existing: Vec<OwnedObjectPath> = root.get_property("Interfaces").await?;
+        let started = device.receive_signal("GroupStarted").await?;
+        Ok::<_, anyhow::Error>((device, existing, started))
+    })
+    .await
+    .context("Supplicant setup timed out")??;
     let operation = async {
         let args: HashMap<&str, Value<'_>> = [
             ("persistent", Value::from(false)),
@@ -300,7 +401,15 @@ async fn create_group_inner(
             .await
             .context("Supplicant stopped during group creation")?;
         let (properties,): (HashMap<String, OwnedValue>,) = signal.body().deserialize()?;
-        let identity = started_identity(&connection, interface, &existing, properties).await?;
+        let identity = started_identity(
+            &connection,
+            &destination,
+            interface,
+            &existing,
+            properties,
+            "GO",
+        )
+        .await?;
         // Own cleanup before reading any further properties, including invalid
         // credentials or an unexpected operating channel.
         let group = Group {
@@ -312,7 +421,7 @@ async fn create_group_inner(
         verify(&group.identity)?;
         let details = Proxy::new(
             &connection,
-            SERVICE,
+            destination.as_str(),
             group.identity.group_object.as_str(),
             "fi.w1.wpa_supplicant1.Group",
         )
@@ -343,6 +452,8 @@ async fn create_group_inner(
         })
     };
     let result = tokio::select! {
+        biased;
+        _ = owner.lost() => Err(anyhow::anyhow!("Supplicant owner changed during P2P group creation")),
         _ = cancel.cancelled() => Err(anyhow::anyhow!("P2P group creation cancelled")),
         result = tokio::time::timeout(Duration::from_secs(45), operation) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("P2P group creation timed out"))),
     };
@@ -361,11 +472,25 @@ async fn create_group_inner(
                 .body()
                 .deserialize::<(HashMap<String, OwnedValue>,)>()
             {
-                if let Ok(identity) =
-                    started_identity(&connection, interface, &existing, properties).await
+                if let Ok(Ok(identity)) = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    started_identity(
+                        &connection,
+                        &destination,
+                        interface,
+                        &existing,
+                        properties,
+                        "GO",
+                    ),
+                )
+                .await
                 {
                     if verify(&identity).is_ok() {
-                        let _ = disconnect_checked(&connection, &identity, verify).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            disconnect_checked(&connection, &identity, verify),
+                        )
+                        .await;
                     }
                 }
             }
@@ -376,9 +501,11 @@ async fn create_group_inner(
 
 async fn started_identity(
     connection: &Connection,
+    destination: &str,
     parent: &str,
     existing: &[OwnedObjectPath],
     mut properties: HashMap<String, OwnedValue>,
+    expected_role: &str,
 ) -> Result<GroupIdentity> {
     let role = String::try_from(properties.remove("role").context("Missing P2P role")?)?;
     let object = OwnedObjectPath::try_from(
@@ -392,12 +519,12 @@ async fn started_identity(
             .context("Missing P2P group")?,
     )?;
     anyhow::ensure!(
-        role == "GO" && !existing.contains(&object) && group.as_str() != "/",
+        role == expected_role && !existing.contains(&object) && group.as_str() != "/",
         "Supplicant returned an existing or unexpected P2P group"
     );
     let proxy = Proxy::new(
         connection,
-        SERVICE,
+        destination,
         object.as_str(),
         "fi.w1.wpa_supplicant1.Interface",
     )
@@ -410,6 +537,8 @@ async fn started_identity(
         group_object: group.to_string(),
         parent_interface: parent.into(),
         peer_object: "/".into(),
+        service_owner: destination.into(),
+        bus_guid: connection.server_guid().to_string(),
     })
 }
 
@@ -425,8 +554,23 @@ fn verify_phy(identity: &GroupIdentity) -> Result<()> {
     Ok(())
 }
 
-/// Crash recovery may call this with a root-owned journal record. Both the
-/// current interface name and group object must still match before disconnect.
+/// Snapshot for netd's health monitor; no request is routed to the supplicant.
+pub async fn service_instance(connection: &Connection) -> Result<(String, String)> {
+    Ok((
+        owner::current(connection).await?,
+        connection.server_guid().to_string(),
+    ))
+}
+
+pub async fn service_matches(connection: &Connection, identity: &GroupIdentity) -> bool {
+    identity.bus_guid == connection.server_guid().as_str()
+        && owner::current(connection)
+            .await
+            .is_ok_and(|name| name == identity.service_owner)
+}
+
+/// Crash recovery uses the journal's original unique owner and bus identity.
+/// Never route a stale group path through the replacement well-known owner.
 pub async fn disconnect(connection: &Connection, identity: &GroupIdentity) -> Result<()> {
     disconnect_checked(connection, identity, verify_phy).await
 }
@@ -435,9 +579,15 @@ async fn disconnect_checked(
     identity: &GroupIdentity,
     verify: fn(&GroupIdentity) -> Result<()>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        identity.bus_guid == connection.server_guid().as_str(),
+        "P2P group belongs to another or unknown D-Bus instance"
+    );
+    zbus::names::UniqueName::try_from(identity.service_owner.as_str())
+        .context("P2P group has no pinned service owner; manual recovery required")?;
     let interface = Proxy::new(
         connection,
-        SERVICE,
+        identity.service_owner.as_str(),
         identity.interface_object.as_str(),
         "fi.w1.wpa_supplicant1.Interface",
     )
@@ -448,7 +598,7 @@ async fn disconnect_checked(
     verify(identity)?;
     let device = Proxy::new(
         connection,
-        SERVICE,
+        identity.service_owner.as_str(),
         identity.interface_object.as_str(),
         DEVICE,
     )

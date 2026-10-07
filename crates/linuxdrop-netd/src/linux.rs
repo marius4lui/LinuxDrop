@@ -132,9 +132,22 @@ pub async fn run() -> io::Result<()> {
             tokio::time::sleep(Duration::from_secs(2)).await;
             if monitor.lock().await.leases.is_empty() { continue; }
             let inventory = inventory().await;
+            let needs_supplicant = monitor.lock().await.leases.values().any(|lease| lease.p2p_group.is_some());
+            let supplicant = if needs_supplicant {
+                timeout(Duration::from_secs(4), async {
+                    let connection = zbus::Connection::system().await?;
+                    linuxdrop_network::p2p::service_instance(&connection).await
+                }).await.ok().and_then(Result::ok)
+            } else { None };
             let mut state = monitor.lock().await;
             let leases: Vec<_> = state.leases.values().cloned().collect();
             for lease in leases {
+                // Orphaned/revoked leases remain visible through RecoveryStatus,
+                // never as healthy actors. Explicit recovery owns further retries.
+                if !state.attached.contains(&lease.id) { continue; }
+                let owner_lost = lease.p2p_group.as_ref().is_some_and(|group| {
+                    supplicant.as_ref().is_none_or(|(owner, bus)| group.service_owner != *owner || group.bus_guid != *bus)
+                });
                 let dead = state
                     .children
                     .get_mut(&lease.id)
@@ -161,7 +174,8 @@ pub async fn run() -> io::Result<()> {
                         })
                     });
                 let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.pending_p2p.get(&lease.id)));
-                if dead || radio_gone || unsafe_use || regulatory_change {
+                if dead || radio_gone || unsafe_use || regulatory_change || owner_lost {
+                    state.attached.remove(&lease.id);
                     if let Some(operation) = state.pending_p2p.remove(&lease.id) { operation.cancel.cancel(); }
                     stop_child(&mut state, &lease.id).await;
                     match restore(&lease).await {
@@ -171,7 +185,7 @@ pub async fn run() -> io::Result<()> {
                         Err(e) => state.recovery_errors.push(e),
                     }
                     state.recovery_errors.push(format!(
-                        "{}: lease stopped after helper exit, unplug, regulatory change, or competing radio use",
+                        "{}: lease stopped after helper exit, supplicant owner loss, unplug, regulatory change, or competing radio use",
                         lease.interface
                     ));
                     let _ = persist(&state);
@@ -433,6 +447,9 @@ async fn join_p2p(
         .get(&lease_id)
         .ok_or("lease not found")?
         .clone();
+    if !state.attached.contains(&lease_id) {
+        return Err("lease is revoked; complete radio recovery first".into());
+    }
     if state.cancelled_p2p.contains(&lease_id) {
         return Err("P2P operation cancelled".into());
     }
@@ -828,7 +845,7 @@ async fn apply(
             leases: state
                 .leases
                 .values()
-                .filter(|l| l.uid == uid)
+                .filter(|l| l.uid == uid && state.attached.contains(&l.id))
                 .cloned()
                 .collect(),
             recovery_errors: state.recovery_errors.clone(),
@@ -1037,6 +1054,9 @@ async fn apply(
             })
         }
         Request::SetChannel { lease_id, channel } => {
+            if !state.attached.contains(&lease_id) {
+                return Err("lease is revoked; complete radio recovery first".into());
+            }
             if !owned.contains(&lease_id) {
                 return Err("lease does not belong to this connection".into());
             }
@@ -1599,6 +1619,59 @@ mod tests {
             direct_capabilities: Default::default(),
         }
     }
+    #[tokio::test]
+    async fn revoked_reservation_is_recovery_only_and_cannot_change_channel() {
+        let lease = direct_lease();
+        let id = lease.id.clone();
+        let uid = lease.uid;
+        let shared = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = shared.lock().await;
+            state.leases.insert(id.clone(), lease);
+            state.attached.insert(id.clone());
+        }
+        let mut owned = vec![id.clone()];
+        match apply(Request::Status, uid, &mut owned, &shared)
+            .await
+            .unwrap()
+        {
+            Response::State { leases, .. } => assert_eq!(leases.len(), 1),
+            _ => panic!("unexpected status"),
+        }
+        // This is the revocation boundary used by watchdog owner-loss handling.
+        shared.lock().await.attached.remove(&id);
+        match apply(Request::Status, uid, &mut owned, &shared)
+            .await
+            .unwrap()
+        {
+            Response::State { leases, .. } => assert!(leases.is_empty()),
+            _ => panic!("unexpected status"),
+        }
+        match apply(Request::RecoveryStatus, uid, &mut owned, &shared)
+            .await
+            .unwrap()
+        {
+            Response::Recovery { issues, .. } => assert_eq!(issues[0].lease_id, id),
+            _ => panic!("missing retained recovery receipt"),
+        }
+        assert!(apply(
+            Request::SetChannel {
+                lease_id: id.clone(),
+                channel: 6
+            },
+            uid,
+            &mut owned,
+            &shared
+        )
+        .await
+        .unwrap_err()
+        .contains("revoked"));
+        assert!(
+            shared.lock().await.leases.contains_key(&id),
+            "unconfirmed cleanup must retain the journal record"
+        );
+    }
+
     fn active_interface(name: &str) -> linuxdrop_hardware::NetworkInterface {
         linuxdrop_hardware::NetworkInterface {
             name: name.into(),
@@ -1633,6 +1706,8 @@ mod tests {
             Some(&pending)
         ));
         lease.p2p_group = Some(linuxdrop_network::p2p::GroupIdentity {
+            service_owner: String::new(),
+            bus_guid: String::new(),
             interface: group.name.clone(),
             interface_object: "/test".into(),
             group_object: "/group".into(),
@@ -1769,6 +1844,8 @@ mod tests {
         lease.id = uuid::Uuid::new_v4().simple().to_string();
         let interface = "ld-p2p0";
         lease.p2p_group = Some(linuxdrop_network::p2p::GroupIdentity {
+            service_owner: String::new(),
+            bus_guid: String::new(),
             interface: interface.into(),
             interface_object: "/test".into(),
             group_object: "/group".into(),
@@ -1851,6 +1928,8 @@ mod tests {
         let mut lease = direct_lease();
         lease.id = uuid::Uuid::new_v4().simple().to_string();
         lease.p2p_group = Some(linuxdrop_network::p2p::GroupIdentity {
+            service_owner: String::new(),
+            bus_guid: String::new(),
             interface: "ld-go0".into(),
             interface_object: "/test".into(),
             group_object: "/group".into(),
