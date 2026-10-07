@@ -84,7 +84,7 @@ sudo dnf install rpm-build systemd-rpm-macros cargo rust gcc gcc-c++ cmake \
   gtk4-devel libadwaita-devel openssl-devel dbus-devel systemd-devel \
   libnl3-devel libpcap-devel libev-devel protobuf-compiler glib2-devel
 sh packaging/build-rpm.sh
-sudo dnf install ./dist/linuxdrop-0.1.0-2.fc44.x86_64.rpm
+sudo dnf install ./dist/linuxdrop-0.1.0-3.fc44.x86_64.rpm
 ```
 
 The filename above is the Fedora 44 x86_64 build. Use the actual distribution and
@@ -120,9 +120,9 @@ optimization settings. They do not disable that entropy source. See the
 [upstream build configuration](https://aws.github.io/aws-lc-rs/resources.html).
 
 The GTK app requires GTK >= 4.12 and libadwaita >= 1.5. The bundled Shell extension
-currently declares GNOME 46 only. Packaging the app for another distribution does
-not establish compatibility with that distribution's newer GNOME Shell; the app
-can run independently while that Shell-version acceptance remains open.
+currently declares GNOME 46 and 50. Native actor/settings and installed GTK
+drop-window checks passed on both; see [Shell acceptance](acceptance/SHELL_50_2026-10-07.md).
+Other Shell majors require their own acceptance before being declared supported.
 
 ## Troubleshooting
 
@@ -130,7 +130,7 @@ can run independently while that Shell-version acceptance remains open.
 - **No radios:** inspect Hardware. VM Ethernet is not a Wi-Fi adapter. Do not switch your current internet adapter into monitor mode.
 - **AirDrop permission denied:** use an active local desktop session with a working polkit authentication agent. Remote/absent sessions cannot acquire radios.
 - **Radio helper not running:** inspect `systemctl status linuxdrop-netd.service`. The package starts this service; source-only GUI launches do not install it.
-- **Bubble missing:** click the LinuxDrop top-panel icon; the bubble is deliberately hidden until opened. If the icon is missing, enable the extension on GNOME 46. A desktop restart after package installation may be needed. Other desktops still run the native app.
+- **Bubble missing:** click the LinuxDrop top-panel icon; the bubble is deliberately hidden until opened. If the icon is missing, enable the extension on GNOME 46 or 50. A desktop restart after package installation may be needed. Other desktops still run the native app.
 - **Window closes but app behavior is unclear:** on a normal Ubuntu session the background daemon has its own D-Bus lifecycle. The isolated WSL launcher intentionally ties its test services to the nested desktop lifetime.
 
 See [hardware and packaging design](HARDWARE_AND_PACKAGING.md) and the acceptance records for verified checks and outstanding device tests.

@@ -116,7 +116,9 @@ export default class LinuxDropExtension extends Extension {
             return Clutter.EVENT_PROPAGATE;
         });
         this._notch.connect('notify::hover', () => this._scheduleCollapse());
-        Main.layoutManager.addChrome(this._notch, {affectsInputRegion: true, trackFullscreen: true});
+        // Input-region tracking is already the default on older shells; GNOME
+        // 50 removed that X11-specific option entirely.
+        Main.layoutManager.addChrome(this._notch, {trackFullscreen: true});
         this._connect(global.stage, 'captured-event', (_, event) => this._dismissFromEvent(event));
         this._connect(global.stage, 'notify::key-focus', () => this._ensureFocusVisible());
         this._body.connect('notify::allocation', () => this._ensureFocusVisible());
@@ -493,6 +495,23 @@ export default class LinuxDropExtension extends Extension {
         const scrollStyle = `max-height: ${Math.max(80, (monitor.height - top) / scale - 76)}px;`;
         if (this._scroll.get_style() !== scrollStyle) this._scroll.set_style(scrollStyle);
         this._notch.set_position(Math.round(monitor.x + (monitor.width - width) / 2), monitor.y + top);
+        this._positionDropSurface();
+    }
+
+    _positionDropSurface() {
+        if (!this._alive || !this._dropWindow) return;
+        const monitor = this._monitor();
+        if (!monitor) return;
+        const rect = this._dropWindow.get_frame_rect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+        const panelBottom = monitor.y + Main.panel.height;
+        const lastTop = Math.max(panelBottom, monitor.y + monitor.height - rect.height - 8 * scale);
+        const y = Math.round(Math.min(panelBottom + this._settings.get_int('top-offset') * scale, lastTop));
+        const x = Math.round(monitor.x + (monitor.width - rect.width) / 2);
+        // GTK chooses its natural size (including text scaling). Reposition after
+        // that size is committed instead of centering an assumed 350px frame.
+        if (rect.x !== x || rect.y !== y) this._dropWindow.move_frame(false, x, y);
     }
 
     _visibility() {
@@ -574,7 +593,8 @@ export default class LinuxDropExtension extends Extension {
             const monitor = this._monitor();
             if (!monitor) return;
             window.make_above();
-            window.move_resize_frame(false, Math.round(monitor.x + (monitor.width - 350) / 2), monitor.y + Main.panel.height + this._settings.get_int('top-offset'), 350, 180);
+            this._connect(window, 'size-changed', () => this._positionDropSurface());
+            this._positionDropSurface();
             this._visibility();
             this._connect(window, 'unmanaged', () => { this._disconnectObject(window); if (this._dropWindow === window) { this._dropWindow = null; this._setExpanded(false); } });
         };

@@ -1,0 +1,62 @@
+name: Native desktop
+on:
+  push:
+    paths:
+      - extensions/gnome-shell/**
+      - app/linuxdrop/tests/shell-review-fixture.py
+      - .github/workflows/desktop.yml
+  pull_request:
+    paths:
+      - extensions/gnome-shell/**
+      - app/linuxdrop/tests/shell-review-fixture.py
+      - .github/workflows/desktop.yml
+permissions:
+  contents: read
+jobs:
+  shell:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:24.04
+            distro: ubuntu
+            shell: '46'
+          - image: fedora:44
+            distro: fedora
+            shell: '50'
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Native Shell runtime
+        env:
+          DISTRO: ${{ matrix.distro }}
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if [ "$DISTRO" = ubuntu ]; then
+            apt-get update
+            apt-get install -y --no-install-recommends git tar locales passwd \
+              gnome-shell gjs dbus-daemon dbus-x11 python3-gi gir1.2-adw-1 \
+              libgl1-mesa-dri libegl-mesa0
+            localedef -i de_DE -f UTF-8 de_DE.UTF-8
+          else
+            dnf -y --setopt=install_weak_deps=False install git tar shadow-utils \
+              gnome-shell gjs dbus-daemon dbus-x11 python3-gobject \
+              mesa-dri-drivers glibc-langpack-de
+          fi
+          useradd --create-home linuxdrop-ci
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verify supported Shell and native controls
+        env:
+          EXPECTED_SHELL: ${{ matrix.shell }}
+        run: |
+          actual=$(gnome-shell --version | awk '{print $3}' | cut -d. -f1)
+          test "$actual" = "$EXPECTED_SHELL"
+          mkdir -p /run/dbus
+          if [ ! -S /run/dbus/system_bus_socket ]; then
+            dbus-daemon --system --fork --nopidfile
+          fi
+          runuser -u linuxdrop-ci -- env LANG=de_DE.UTF-8 LANGUAGE=de \
+            LINUXDROP_SMOKE_TEXT_SCALE=1.5 LINUXDROP_SMOKE_MONITOR=800x600 \
+            bash extensions/gnome-shell/tests/run-bubble-smoke.sh

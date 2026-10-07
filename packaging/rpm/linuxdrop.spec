@@ -1,6 +1,6 @@
 Name:           linuxdrop
 Version:        0.1.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Nearby file sharing for Linux
 License:        GPL-3.0-only
 URL:            https://github.com/marius4lui/LinuxDrop

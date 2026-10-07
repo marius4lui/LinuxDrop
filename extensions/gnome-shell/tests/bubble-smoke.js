@@ -194,6 +194,37 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     } finally { this._proxy = realProxy; }
                     this._setExpanded(false);
                     check(!this._notch.visible && global.stage.get_key_focus() === this._panelButton, 'Close must hide and restore panel focus');
+                    if (GLib.getenv('LINUXDROP_SMOKE_REAL_DROP') === '1') {
+                        for (let attempt = 0; attempt < 2; attempt++) {
+                            this._setExpanded(true);
+                            this.openApp('--notch-drop');
+                            for (let tick = 0; tick < 24 && !this._dropWindow; tick++) await settle();
+                            check(this._dropWindow, 'Installed GTK drop surface must attach to the requesting bubble');
+                            await settle();
+                            const rect = this._dropWindow.get_frame_rect();
+                            const monitor = this._monitor();
+                            check(Math.abs(rect.x + rect.width / 2 - (monitor.x + monitor.width / 2)) <= 3,
+                                `Drop surface must remain centered at its actual size: ${rect.x},${rect.y} ${rect.width}x${rect.height}`);
+                            check(rect.y >= monitor.y + Main.panel.height && rect.y + rect.height <= monitor.y + monitor.height,
+                                'Drop surface must fit below the panel on the selected monitor');
+                            check(!this._notch.visible && !this._dropRequested && !this._dropLaunchPending,
+                                'Attached GTK surface must replace the bubble without a pending launch');
+                            const offset = this._settings.get_int('top-offset');
+                            this._settings.set_int('top-offset', offset + 12);
+                            await settle();
+                            const moved = this._dropWindow.get_frame_rect();
+                            const scale = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+                            check(Math.abs(moved.y - rect.y - 12 * scale) <= 1,
+                                'An open GTK drop surface must follow the configured top offset');
+                            this._settings.set_int('top-offset', offset);
+                            await settle();
+                            await capture(GLib.getenv('LINUXDROP_SMOKE_CAPTURE_DROP'));
+                            this._setExpanded(false);
+                            for (let tick = 0; tick < 12 && this._dropWindow; tick++) await settle();
+                            check(!this._dropWindow && !this._expanded, 'Closing the bubble must dismiss the installed drop surface');
+                        }
+                        console.log('LINUXDROP_REAL_DROP_PASSED: installed Wayland surface launch, measured centering, close and reopen');
+                    }
                     console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, stable action focus, consent focus isolation, literal external names, persistent send/settings, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, post-action snapshot gating, Quick Settings feedback, focus');
                 });
             });

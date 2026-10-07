@@ -10,7 +10,7 @@ This audit follows the complete implementation plan, not a reduced 0.1 scope. Ph
 | Quick Share direct radio | Idle-interface checks in protocol | Shared exclusive netd reservation, coordinated P2P negotiation/ownership |
 | BLE inventory | BlueZ power and advertisement counters | Remaining capacity and advertised feature details |
 | File managers | Nautilus/Dolphin action source, Thunar example | Safe idempotent Thunar installer preserving existing actions; native execution checks |
-| Distribution | Tested Ubuntu DEB; Fedora 44/Arch x86_64 native source builds, private-root install/reinstall/removal, real daemon and installed GTK checks; Fedora revision upgrade | Booted service/polkit lifecycle and Arch cross-version upgrade; newer Shell matrix. See [native package evidence](../acceptance/PACKAGES_NATIVE_2026-10-07.md) |
+| Distribution | Tested Ubuntu DEB; Fedora 44/Arch x86_64 native source builds, private-root install/reinstall/removal, real daemon and installed GTK checks; Fedora revision upgrade | Booted service/polkit lifecycle and Arch cross-version upgrade; remaining Shell majors (46/50 now tested). See [native package evidence](../acceptance/PACKAGES_NATIVE_2026-10-07.md) |
 | Flatpak | Not present | Optional native GUI using the separately installed host daemon, restricted named D-Bus access and file portal compatibility |
 | CI | Rust/resource/package gates | Dependency/license audit, bounded parser fuzzing, tested Shell-version matrix |
 
