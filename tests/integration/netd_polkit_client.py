@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 
 agent = None
+graphical = None
 daemon_mode = '--daemon' in sys.argv
 daemon_started = False
 settings_path = Path.home() / '.config/linuxdrop/settings.json'
@@ -70,6 +71,11 @@ try:
                 'io.github.marius4lui.LinuxDrop', '/io/github/marius4lui/LinuxDrop',
                 'io.github.marius4lui.LinuxDrop.Manager1', 'DiscardDraft', 's', draft],
                 check=True, capture_output=True, timeout=15)
+    if '--gui' in sys.argv:
+        from gnome_polkit_driver import GraphicalAgent
+        stage = 'graphical agent registration'
+        graphical = GraphicalAgent()
+        graphical.start(sys.argv[sys.argv.index('--gui') + 1], sys.argv[sys.argv.index('--capture') + 1])
     if '--agent' in sys.argv:
         stage = 'agent registration'
         read_fd, write_fd = os.pipe()
@@ -111,6 +117,9 @@ try:
                 if len(response) > 65536:
                     raise RuntimeError('Oversized helper response')
         result = json.loads(response)
+    if graphical is not None:
+        stage = 'graphical dialog result'
+        graphical.verify()
     print('LINUXDROP_AUTH_RESULT:' + json.dumps(result), flush=True)
 except Exception as error:
     # Deliberately omit exception text/tracebacks and PTY buffers: only fixed
@@ -120,9 +129,22 @@ except Exception as error:
         diagnostic['unit'] = subprocess.run(['systemctl', '--user', 'show',
             'linuxdropd.service', '-p', 'Result', '-p', 'ExecMainStatus', '-p', 'SubState'],
             capture_output=True, text=True, timeout=5).stdout.strip()
+        if stage == 'user service start':
+            # Only this disposable user's daemon startup log. Authentication
+            # occurs later, in a different process/unit, and is never included.
+            diagnostic['daemon_startup'] = subprocess.run(['journalctl', '--user',
+                '-u', 'linuxdropd.service', '--since=-2min', '-n', '12', '--no-pager', '-o', 'cat'],
+                capture_output=True, text=True, timeout=5).stdout[-3000:]
+            manager_env = subprocess.run(['systemctl', '--user', 'show-environment'],
+                capture_output=True, text=True, timeout=5).stdout.splitlines()
+            diagnostic['desktop_environment'] = dict(line.split('=', 1) for line in manager_env
+                if line.split('=', 1)[0] in ('HOME', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
+                    'XDG_CONFIG_HOME', 'XDG_DATA_HOME'))
     print('LINUXDROP_AUTH_RESULT:' + json.dumps({'status': 'probe_failed', 'message': diagnostic}), flush=True)
     sys.exit(1)
 finally:
+    if graphical is not None:
+        graphical.close()
     if agent is not None:
         agent.terminate()
         try: agent.wait(timeout=2)

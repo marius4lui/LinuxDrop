@@ -10,7 +10,9 @@ import pwd
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 import pexpect
 
@@ -35,6 +37,18 @@ client_file = Path(probe_dir.name) / 'client.py'
 client_file.write_bytes(Path(__file__).with_name('netd_polkit_client.py').read_bytes())
 client_file.chmod(0o644)
 client_path = str(client_file)
+graphical = '--graphical' in sys.argv
+if graphical:
+    for filename in ('gnome_polkit_driver.py', 'gnome_polkit.js'):
+        target = Path(probe_dir.name) / filename
+        target.write_bytes(Path(__file__).with_name(filename).read_bytes())
+        target.chmod(0o644)
+    captures = Path(probe_dir.name) / 'captures'
+    captures.mkdir(mode=0o700)
+    account = pwd.getpwnam(username)
+    os.chown(captures, account.pw_uid, account.pw_gid)
+    capture_destination = Path(os.environ.get('LINUXDROP_GUI_CAPTURE_DIR', 'dist/polkit-gnome')).resolve()
+    capture_destination.mkdir(parents=True, exist_ok=True)
 checks = []
 active_console = Path('/sys/class/tty/tty0/active').read_text().strip()
 console_match = re.fullmatch(r'tty(\d+)', active_console)
@@ -45,7 +59,7 @@ inactive_vt = 2 if active_vt != 2 else 3
 password = secrets.token_hex(16)
 subprocess.run(['chpasswd'], input=username+':'+password+'\n', text=True, check=True, capture_output=True)
 
-def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False):
+def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False, gui=None):
     unit = 'linuxdrop-polkit-' + name + '-' + str(os.getpid())
     args = ['--unit='+unit, '--quiet', '--collect', '--wait', '--pty', '--setenv=LC_ALL=C']
     if not remote:
@@ -56,11 +70,15 @@ def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False):
         # Real logind graphical-session metadata enables Polkit's documented
         # user-service-to-display-session association; no GUI is simulated.
         args.append('--setenv=XDG_SESSION_TYPE=wayland')
+    if gui:
+        args.append('--setenv=LINUXDROP_GUI_LANGUAGE='+os.environ.get('LINUXDROP_GUI_LANGUAGE', 'C.UTF-8'))
     client_args = ['/usr/bin/python3', '-u', client_path]
     if daemon:
         client_args.append('--daemon')
     if agent:
         client_args.append('--agent')
+    if gui:
+        client_args.extend(['--gui', gui, '--capture', str(captures / (name+'.png'))])
     args.extend(['/bin/login', '-f', '-h', '127.0.0.1', username] if remote else client_args)
     child = pexpect.spawn('systemd-run', args, encoding='utf-8', timeout=70, echo=False)
     prompts, session, result = 0, None, None
@@ -72,7 +90,7 @@ def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False):
         while True:
             event = child.expect([r'LINUXDROP_AUTH_SESSION:([^\r\n]+)',
                 r'Choose identity to authenticate as[^:]*:', r'Password:',
-                r'LINUXDROP_AUTH_RESULT:([^\r\n]+)', pexpect.EOF, pexpect.TIMEOUT])
+                r'LINUXDROP_AUTH_RESULT:([^\r\n]+)', r'LINUXDROP_GUI_PASSWORD:', pexpect.EOF, pexpect.TIMEOUT])
             if event == 0:
                 session = json.loads(child.match.group(1))
             elif event == 1:
@@ -91,6 +109,9 @@ def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False):
                 if result.get('status') == 'probe_failed':
                     raise RuntimeError(f'{name}: client failed: {result["message"]}')
                 break
+            elif event == 4:
+                assert gui, 'Unexpected graphical probe credential request'
+                child.sendline(password)
             else:
                 # Session metadata and systemd states are safe; never expose PTY
                 # buffers, which can contain entered authentication credentials.
@@ -106,6 +127,8 @@ def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False):
         assert 'Only trusted callers' not in result['message'], 'Mechanism is not the Polkit action owner'
         if daemon and result['message'] == 'radio not found':
             assert result.get('via_user_service') is True
+        if gui:
+            shutil.copyfile(captures / (name+'.png'), capture_destination / (name+'.png'))
         return prompts, session, result['message']
     finally:
         if child.isalive():
@@ -152,8 +175,15 @@ try:
         subprocess.run(['systemctl', 'stop', hold_unit+'.service'], capture_output=True, check=False)
         if hold.isalive():
             hold.terminate(force=True)
+    if graphical:
+        prompts, session, message = scenario('gui-cancel', 'seat0', active_vt, False, daemon=True, gui='cancel')
+        assert prompts == 0 and message != 'radio not found'
+        checks.append('real GNOME dialog is focused and masked; Cancel denies the installed daemon diagnostic')
+        prompts, session, message = scenario('gui-authenticate', 'seat0', active_vt, False, daemon=True, gui='authenticate')
+        assert prompts == 0 and message == 'radio not found'
+        checks.append('real GNOME password dialog authenticates the installed daemon and renders before submission')
     print(json.dumps({'status': 'passed', 'checks': checks,
-        'open': ['graphical authentication agent/rendered dialog', 'physical adapter mutation']}, indent=2))
+        'open': ([] if graphical else ['graphical authentication agent/rendered dialog']) + ['physical adapter mutation']}, indent=2))
 finally:
     subprocess.run(['passwd', '-l', username], check=True, capture_output=True)
     probe_dir.cleanup()

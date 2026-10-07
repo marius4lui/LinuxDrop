@@ -44,8 +44,10 @@ Remaining code/evidence requirements:
   Actual user-service invocation and remote sessions (including concurrent local
   login of the same UID) pass again on installed `.36`. Booted Ubuntu upgrades,
   ordinary package removal and reinstallation now pass, preserving the service
-  UID and journal. Graphical authentication-agent behavior, other distro package
-  lifecycles and the refreshed remote CI user-service result remain open.
+  UID and journal. Native GNOME 46 graphical authorization/cancellation now also
+  passes in English/German; see [rendered authorization evidence](../acceptance/GNOME_POLKIT_2026-10-07.md).
+  Other distro package lifecycles, other Shell versions and the remote CI
+  user-service startup result remain open.
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.

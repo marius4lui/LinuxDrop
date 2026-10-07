@@ -78,6 +78,42 @@ jobs:
             dist/*_source.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
+  desktop-authorization:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Download the tested package from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name linuxdrop-ubuntu-24.04 --dir dist
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Install real graphical authorization runtime
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnome-shell gjs accountsservice \
+            dbus-x11 libgl1-mesa-dri libegl-mesa0 python3-pexpect locales language-pack-gnome-de ./dist/linuxdrop_*.deb
+          printf '%s\n' linuxdrop-systemd-acceptance-v1 | sudo tee /etc/linuxdrop-disposable-acceptance >/dev/null
+      - name: Authenticate and cancel through the actual GNOME dialog
+        run: |
+          sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 LINUXDROP_GUI_LANGUAGE=de_DE.UTF-8 \
+            LINUXDROP_GUI_CAPTURE_DIR="$PWD/dist/polkit-gnome" \
+            python3 tests/integration/netd_polkit.py --graphical > dist/GNOME_POLKIT.json
+          cat dist/GNOME_POLKIT.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linuxdrop-gnome-authorization
+          path: |
+            dist/GNOME_POLKIT.json
+            dist/polkit-gnome/*.png
+          if-no-files-found: error
   dependency-policy:
     runs-on: ubuntu-24.04
     steps:

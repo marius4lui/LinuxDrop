@@ -93,6 +93,11 @@ PrepareSend/DiscardDraft path. The real administrator challenge still works and
 both remote-session denials remain effective. A fresh remote run is required
 to close the runner-specific failure; the previous failing runs stay recorded.
 
+The native GNOME 46 graphical agent now also passes cancel/authenticate in
+English and German on the installed `.37` package. See the
+[graphical acceptance report](GNOME_POLKIT_2026-10-07.md), including inspected
+renderings and the remaining remote startup failure after capability setup.
+
 Graphical authentication-agent behavior and physical adapter mutation remain
 separate acceptance work. These probes use real services and authorization but
 an intentionally nonexistent radio, so they do not establish hardware support.
