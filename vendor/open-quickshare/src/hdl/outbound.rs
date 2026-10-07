@@ -1512,12 +1512,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         let introduction = async {
             send_plain_frame(&mut tcp, &intro.encode_to_vec()).await?;
             if requires_ack {
+                // Google's ForBwuIntroductionAck emits only the event; the
+                // optional empty client_introduction_ack message may be absent.
                 let bytes = read_plain_frame(&mut tcp).await?;
                 let frame = OfflineFrame::decode(bytes.as_slice())?;
                 anyhow::ensure!(frame.version == Some(1) && frame.v1.as_ref().is_some_and(|v|
                     v.r#type() == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
                     && v.bandwidth_upgrade_negotiation.as_ref().is_some_and(|b|
-                        b.event_type() == EventType::ClientIntroductionAck && b.client_introduction_ack.is_some())),
+                        b.event_type() == EventType::ClientIntroductionAck)),
                     "Invalid bandwidth upgrade introduction acknowledgment");
             }
             Ok(())

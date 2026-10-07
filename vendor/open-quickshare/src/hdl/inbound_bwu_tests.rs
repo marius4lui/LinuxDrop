@@ -652,7 +652,18 @@ async fn client_scenario(scenario: &str) {
             let ack = if scenario == "wrong-ack" {
                 InboundRequest::<MigratableStream>::bwu_frame(EventType::UpgradeFailure, None, None)
             } else {
-                InboundRequest::<MigratableStream>::bwu_ack_frame()
+                let mut frame = InboundRequest::<MigratableStream>::bwu_ack_frame();
+                if scenario == "ack" {
+                    frame
+                        .v1
+                        .as_mut()
+                        .unwrap()
+                        .bandwidth_upgrade_negotiation
+                        .as_mut()
+                        .unwrap()
+                        .client_introduction_ack = None;
+                }
+                frame
             };
             send_frame_on(&mut tcp, &ack.encode_to_vec()).await.unwrap();
         }

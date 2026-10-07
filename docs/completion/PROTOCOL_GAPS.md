@@ -783,7 +783,8 @@ a competing control/network future cannot discard a partially read header or
 body. During radio joining, TCP connection, introduction acknowledgment and
 prior-channel drain, local cancellation remains active and old-channel frames
 continue through the encrypted dispatcher. The sender reads an introduction ACK
-only when the offer advertises it, and checks version/type/event/body. Both
+only when the offer advertises it, and checks version/type/event. The empty optional ACK submessage may be absent,
+as in Google's own event-only constructor. Both
 sender roles require LAST_WRITE and SAFE_TO_CLOSE before committing the swap.
 EOF, invalid sequence/signature, timeout or rejection during that drain ends the
 session; process_consent no longer turns a damaged handoff into BLE fallback.
@@ -804,8 +805,8 @@ existing UKEY2 keys, sequence numbers and consent remain required.
 
 Evidence: fourteen protocol unit tests, sixteen Quick Share wrapper/integration
 tests (including UKEY2/exact file bytes), and both isolated kernel handoff tests
-pass. The outbound regression has ten scenarios: ACK/no-ACK, wrong type, missing
-body, wrong version, oversized ACK, early LAST_WRITE with valid/invalid ACK,
+pass. The outbound regression has ten scenarios: ACK/no-ACK, event-only ACK, wrong type,
+wrong version, oversized ACK, early LAST_WRITE with valid/invalid ACK,
 truncated drain and local cancellation. Successful cases continue encrypted TCP
 with matching sequence state. Both receiver host authentication modes reject a
 closed client, wrong endpoint and oversized introduction before accepting the
@@ -818,3 +819,8 @@ Primary event/frame references: Google's
 [bandwidth-upgrade manager](https://chromium.googlesource.com/external/github.com/google/nearby-connections/+/02354e29683393549b588a3ce2599a717f6da98e/connections/implementation/bwu_manager.cc)
 and [frame constructors](https://chromium.googlesource.com/external/github.com/google/nearby-connections/+/8efa219dcfb6157fcc0791e45ef45989d681518b/connections/implementation/offline_frames.cc).
 No upstream implementation code was copied.
+
+Final source review confirmed Google's ForBwuIntroductionAck omits the optional
+empty ACK body. Both client roles accept that event-only representation, and
+both encrypted handoff fixtures exercise it. Requiring the body would reject a
+valid Google peer; only introduction (not acknowledgment) needs its endpoint body.

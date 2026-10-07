@@ -47,7 +47,7 @@ async fn client_handoff_requires_negotiated_ack_and_complete_encrypted_drain() {
         "ack",
         "no-ack",
         "bad-ack",
-        "missing-body",
+        "event-only-ack",
         "bad-version",
         "oversized-ack",
         "early-last-write",
@@ -107,7 +107,7 @@ async fn client_handoff_requires_negotiated_ack_and_complete_encrypted_drain() {
                     if case == "bad-ack" || case == "early-bad-ack" {
                         ack.v1.as_mut().unwrap().r#type = Some(FrameType::KeepAlive.into());
                     }
-                    if case == "missing-body" {
+                    if case == "event-only-ack" {
                         ack.v1
                             .as_mut()
                             .unwrap()
@@ -126,9 +126,7 @@ async fn client_handoff_requires_negotiated_ack_and_complete_encrypted_drain() {
                 if case == "early-bad-ack" {
                     // The sender must end the damaged session without writing
                     // a fallback after its peer already ended the old channel.
-                } else if ["bad-ack", "missing-body", "bad-version", "oversized-ack"]
-                    .contains(&case)
-                {
+                } else if ["bad-ack", "bad-version", "oversized-ack"].contains(&case) {
                     assert_eq!(
                         event(peer.read_encrypted_offline_frame().await.unwrap()),
                         EventType::UpgradeFailure
@@ -182,7 +180,7 @@ async fn client_handoff_requires_negotiated_ack_and_complete_encrypted_drain() {
                     outcome.is_err(),
                     "Missing LAST_WRITE cannot commit a channel swap"
                 ),
-                "bad-ack" | "missing-body" | "bad-version" | "oversized-ack" => {
+                "bad-ack" | "bad-version" | "oversized-ack" => {
                     assert!(!outcome.unwrap())
                 }
                 _ => {

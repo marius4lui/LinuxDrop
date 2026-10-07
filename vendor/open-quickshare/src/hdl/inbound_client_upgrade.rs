@@ -227,14 +227,15 @@ impl InboundRequest<MigratableStream> {
             );
             send_frame_on(&mut tcp, &intro.encode_to_vec()).await?;
             if offer.supports_client_introduction_ack() {
+                // Event-only ACKs are the form emitted by Google's constructor.
+                // The optional empty submessage carries no additional evidence.
                 let bytes = tokio::time::timeout(Duration::from_secs(5), read_frame_from(&mut tcp))
                     .await??;
                 let frame = OfflineFrame::decode(bytes.as_slice())?;
                 anyhow::ensure!(
                     frame.version == Some(1)
                         && negotiation(&frame).is_some_and(|bwu| bwu.event_type()
-                            == EventType::ClientIntroductionAck
-                            && bwu.client_introduction_ack.is_some()),
+                            == EventType::ClientIntroductionAck),
                     "Invalid bandwidth upgrade introduction acknowledgment"
                 );
             }
