@@ -8,7 +8,10 @@ journal publication clears only the group and restores the direct reservation.
 Failed teardown or persistence retains its identity as recovery-only state.
 
 A full retirement queued during group cleanup waits for that receipt outside
-State, then reads the final identity before proceeding. The group worker cannot
+State, then reads the final identity before proceeding. Watchdog scans capture a
+network-state revision before inventory/address I/O and discard observations if
+an intervening radio operation changes it; an old group cannot be judged as the
+current group after asynchronous leave/rejoin. The group worker cannot
 reattach a lease already selected for full retirement. Pending group formation
 is rejected by partial leave; producer cancellation settlement is still a
 [separate concrete gap](../completion/NETD_LIFECYCLE.md).

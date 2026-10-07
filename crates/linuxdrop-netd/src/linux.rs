@@ -36,8 +36,15 @@ struct State {
     cancelled_p2p: std::collections::HashSet<String>,
     cleanups: HashMap<String, CleanupReceipt>,
     group_cleanups: HashMap<String, CleanupReceipt>,
+    network_revision: u64,
 }
 impl State {
+    fn radio_changed(&mut self) {
+        self.network_revision = self.network_revision.wrapping_add(1);
+    }
+    fn observation_is_current(&self, revision: u64, id: &str) -> bool {
+        self.network_revision == revision && self.attached.contains(id)
+    }
     fn record_recovery_error(&mut self, error: String) {
         self.recovery_errors.push(error);
         let excess = self.recovery_errors.len().saturating_sub(128);
@@ -88,6 +95,22 @@ where
     P: FnOnce(&State) -> io::Result<()> + Send + 'static,
 {
     let mut state = shared.lock().await;
+    begin_cleanup_locked_with(&mut state, shared, id, operation, journal)
+}
+
+fn begin_cleanup_locked_with<F, Fut, P>(
+    state: &mut State,
+    shared: &Shared,
+    id: &str,
+    operation: F,
+    journal: P,
+) -> CleanupReceipt
+where
+    F: FnOnce(Lease, Option<tokio::process::Child>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    P: FnOnce(&State) -> io::Result<()> + Send + 'static,
+{
+    state.radio_changed();
     if let Some(receipt) = state.cleanups.get(id) {
         return receipt.clone();
     }
@@ -113,6 +136,7 @@ where
         }
         let (lease, child) = {
             let mut state = shared.lock().await;
+            state.radio_changed();
             let current = state.leases.get(&lease.id).cloned().unwrap_or(lease);
             let child = state.children.remove(&current.id);
             (current, child)
@@ -124,6 +148,7 @@ where
             .await
             .unwrap_or_else(|error| Err(format!("Cleanup operation stopped: {error}")));
         let mut state = shared.lock().await;
+        state.radio_changed();
         if result.is_ok() {
             state.leases.remove(&original.id);
             if let Err(error) = journal(&state) {
@@ -167,6 +192,7 @@ where
     P: FnOnce(&State) -> io::Result<()> + Send + 'static,
 {
     let mut state = shared.lock().await;
+    state.radio_changed();
     if state.cleanups.contains_key(id) {
         return Err("lease cleanup is in progress".into());
     }
@@ -196,6 +222,7 @@ where
             .await
             .unwrap_or_else(|error| Err(format!("Group cleanup operation stopped: {error}")));
         let mut state = shared.lock().await;
+        state.radio_changed();
         if result.is_ok() {
             let mut restored = original.clone();
             restored.p2p_group = None;
@@ -272,6 +299,7 @@ impl Drop for P2pOperation {
         let lease_id = self.lease_id.clone();
         tokio::spawn(async move {
             let mut state = shared.lock().await;
+            state.radio_changed();
             if state
                 .pending_p2p
                 .get(&lease_id)
@@ -368,7 +396,11 @@ pub async fn run() -> io::Result<()> {
     tasks.spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            if monitor.lock().await.leases.is_empty() { continue; }
+            let revision = {
+                let state = monitor.lock().await;
+                if state.leases.is_empty() { continue; }
+                state.network_revision
+            };
             let inventory = inventory().await;
             let needs_supplicant = monitor.lock().await.leases.values().any(|lease| lease.p2p_group.is_some());
             let supplicant = if needs_supplicant {
@@ -377,11 +409,15 @@ pub async fn run() -> io::Result<()> {
                     linuxdrop_network::p2p::service_instance(&connection).await
                 }).await.ok().and_then(Result::ok)
             } else { None };
-            let leases: Vec<_> = monitor.lock().await.leases.values().cloned().collect();
+            let leases: Vec<_> = {
+                let state = monitor.lock().await;
+                if state.network_revision != revision { continue; }
+                state.leases.values().cloned().collect()
+            };
             for lease in leases {
                 let dead = {
                     let mut state = monitor.lock().await;
-                    if !state.attached.contains(&lease.id) { continue; }
+                    if !state.observation_is_current(revision, &lease.id) { continue; }
                     state.children.get_mut(&lease.id).is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
                 };
                 // Address inspection can wait on an external process. It must
@@ -389,9 +425,9 @@ pub async fn run() -> io::Result<()> {
                 let ipv6_survives = dead
                     && lease.p2p_group.as_ref().is_some_and(|group| group.peer_object != "/")
                     && p2p_addresses(&lease).await.is_ok_and(|a| a.ipv6.is_some());
-                let retire = {
+                {
                     let mut state = monitor.lock().await;
-                    if !state.attached.contains(&lease.id) { continue; }
+                    if !state.observation_is_current(revision, &lease.id) { continue; }
                     if ipv6_survives { state.children.remove(&lease.id); }
                     let owner_lost = lease.p2p_group.as_ref().is_some_and(|group| {
                         supplicant.as_ref().is_none_or(|(owner, bus)| group.service_owner != *owner || group.bus_guid != *bus)
@@ -401,14 +437,13 @@ pub async fn run() -> io::Result<()> {
                         lease.allowed_frequencies.iter().any(|frequency| !radio.channels.iter().any(|c| c.frequency_mhz == *frequency && !c.disabled && !c.no_ir && !c.radar))
                     });
                     let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.pending_p2p.get(&lease.id)));
-                    (dead && !ipv6_survives) || radio_gone || unsafe_use || regulatory_change || owner_lost
-                };
-                if retire {
-                    // The worker publishes its eventual outcome. Do not stop
-                    // monitoring other radios while this lease is being retired.
-                    let _ = begin_cleanup(&monitor, &lease.id).await;
-                    monitor.lock().await.record_recovery_error(format!(
-                        "{}: lease stopped after helper exit, supplicant owner loss, unplug, regulatory change, or competing radio use", lease.interface));
+                    if (dead && !ipv6_survives) || radio_gone || unsafe_use || regulatory_change || owner_lost {
+                        // Validate the observation and reserve cleanup under the
+                        // same lock. Slow I/O still runs in the persistent worker.
+                        let _ = begin_cleanup_locked_with(&mut state, &monitor, &lease.id, restore_child_and_lease, persist);
+                        state.record_recovery_error(format!(
+                            "{}: lease stopped after helper exit, supplicant owner loss, unplug, regulatory change, or competing radio use", lease.interface));
+                    }
                 }
             }
         }
@@ -641,6 +676,7 @@ async fn join_p2p(
     // and read-only status requests must remain serviceable throughout.
     let inv = inventory().await;
     let mut state = shared.lock().await;
+    state.radio_changed();
     let mut lease = state
         .leases
         .get(&lease_id)
@@ -757,6 +793,7 @@ async fn join_p2p(
     )
     .await?;
     let mut state = shared.lock().await;
+    state.radio_changed();
     if cancel.is_cancelled() || !state.leases.contains_key(&lease_id) {
         return Err("P2P radio lease ended during group formation".into());
     }
@@ -773,6 +810,7 @@ async fn join_p2p(
         _ = cancel.cancelled() => Err("P2P radio lease ended during address acquisition".into()),
     };
     let mut state = shared.lock().await;
+    state.radio_changed();
     let lease_exists = state.leases.contains_key(&lease_id);
     let cleanup_running = state.cleanups.contains_key(&lease_id);
     let still_owned = lease_exists && !cancel.is_cancelled();
@@ -813,6 +851,7 @@ async fn join_p2p(
             drop(state);
             if lease_exists && !cleanup_running && restore_p2p(&lease).await.is_ok() {
                 let mut state = shared.lock().await;
+                state.radio_changed();
                 if let Some(current) = state.leases.get_mut(&lease_id) {
                     current.p2p_group = None;
                 }
@@ -938,6 +977,12 @@ async fn apply(
         let _ = cleanup_all(shared, abandoned).await;
     }
     let mut state = shared.lock().await;
+    if !matches!(
+        request,
+        Request::Status | Request::RecoveryStatus | Request::RetryRecovery
+    ) {
+        state.radio_changed();
+    }
     let awdl = matches!(request, Request::AcquireAwdl { .. });
     match request {
         Request::Diagnose { .. } => unreachable!(),
@@ -1909,6 +1954,7 @@ mod tests {
             state.leases.insert(id.clone(), lease);
             state.attached.insert(id.clone());
         }
+        let before_leave = shared.lock().await.network_revision;
         let (release, held) = tokio::sync::oneshot::channel();
         let receipt = begin_group_cleanup_with(
             &shared,
@@ -1925,6 +1971,13 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            !shared
+                .lock()
+                .await
+                .observation_is_current(before_leave, &id),
+            "A watchdog observation made before leave cannot retire the changed group"
+        );
         let duplicate = begin_group_cleanup_with(
             &shared,
             &id,
@@ -2015,6 +2068,7 @@ mod tests {
                 state.attached.insert(id.clone());
                 state.cancelled_p2p.insert(id.clone());
             }
+            let observed_revision = shared.lock().await.network_revision;
             let receipt = begin_group_cleanup_with(
                 &shared,
                 &id,
@@ -2044,6 +2098,11 @@ mod tests {
             assert_eq!(lease.kind, LeaseKind::DirectWifi);
             assert_eq!(lease.p2p_group.is_none(), success);
             assert_eq!(state.attached.contains(&id), success);
+            if success {
+                assert!(!state.observation_is_current(observed_revision, &id),
+                    "A completed leave reattaches the lease but must invalidate old watchdog observations");
+                assert!(state.observation_is_current(state.network_revision, &id));
+            }
             assert_eq!(!state.cancelled_p2p.contains(&id), success);
             assert!(state.group_cleanups.is_empty());
         }
