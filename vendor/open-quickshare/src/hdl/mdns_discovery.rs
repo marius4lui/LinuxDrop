@@ -67,6 +67,7 @@ pub struct MDnsDiscovery {
     closed: bool,
     sender: broadcast::Sender<EndpointInfo>,
     lan_state: tokio::sync::watch::Receiver<crate::lan_policy::LanSnapshot>,
+    configured_interfaces: Vec<linuxdrop_network::InterfaceAddress>,
 }
 
 impl Drop for MDnsDiscovery {
@@ -83,19 +84,25 @@ impl MDnsDiscovery {
         lan_state: tokio::sync::watch::Receiver<crate::lan_policy::LanSnapshot>,
     ) -> Result<Self, anyhow::Error> {
         let daemon = ServiceDaemon::new()?;
+        let configured_interfaces = lan_state.borrow().interfaces.clone();
         let this = Self {
             daemon,
             closed: false,
             sender,
             lan_state,
+            configured_interfaces,
         };
-        crate::lan_policy::configure_mdns_on(&this.daemon, &this.lan_state.borrow().interfaces)?;
+        crate::lan_policy::configure_mdns_on(&this.daemon, &this.configured_interfaces)?;
         Ok(this)
     }
 
     pub async fn run(mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         let result = self.run_inner(ctk).await;
-        let cleanup = super::mdns_cleanup::shutdown(&self.daemon).await;
+        let cleanup = if self.closed {
+            Ok(())
+        } else {
+            super::mdns_cleanup::shutdown(&self.daemon).await
+        };
         self.closed = cleanup.is_ok();
         crate::lifecycle::finish(result, cleanup)
     }
@@ -104,7 +111,8 @@ impl MDnsDiscovery {
         let service_type = "_FC9F5ED42C8A._tcp.local.";
         let mut receiver = self.daemon.browse(service_type)?;
         let mut cache: HashMap<String, EndpointInfo> = HashMap::new();
-        let monitor = self.daemon.monitor()?;
+        let mut monitor = self.daemon.monitor()?;
+        let mut interfaces = self.configured_interfaces.clone();
         let mut probes = tokio::task::JoinSet::<(String, u64, Option<EndpointInfo>)>::new();
         let mut pending = HashMap::new();
         let mut sequence = 0u64;
@@ -115,17 +123,24 @@ impl MDnsDiscovery {
                 changed = self.lan_state.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = self.lan_state.borrow_and_update().clone();
+                    if snapshot.interfaces == interfaces { continue; }
                     probes.abort_all();
+                    while probes.join_next().await.is_some() {}
                     pending.clear();
-                    cache.retain(|_, endpoint| {
-                        let valid = endpoint.socket_address().ok().is_some_and(|address| {
-                            crate::lan_policy::source_for_on(address, &snapshot.interfaces).is_ok()
-                        });
-                        if !valid { let _ = self.sender.send(EndpointInfo { id: endpoint.id.clone(), ..Default::default() }); }
-                        valid
-                    });
+                    // The new resolver has no old TTL/removal state. Retaining
+                    // same-subnet peers here could leave them visible forever
+                    // after switching to a different WLAN using the same range.
+                    for (_, endpoint) in cache.drain() {
+                        let _ = self.sender.send(EndpointInfo { id: endpoint.id, ..Default::default() });
+                    }
                     self.daemon.stop_browse(service_type)?;
+                    super::mdns_cleanup::shutdown(&self.daemon).await?;
+                    self.closed = true;
+                    self.daemon = ServiceDaemon::new()?;
+                    self.closed = false;
                     crate::lan_policy::configure_mdns_on(&self.daemon, &snapshot.interfaces)?;
+                    monitor = self.daemon.monitor()?;
+                    interfaces = snapshot.interfaces;
                     receiver = self.daemon.browse(service_type)?;
                 },
                 event = monitor.recv_async() => match event {

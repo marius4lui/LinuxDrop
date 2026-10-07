@@ -43,6 +43,7 @@ pub struct MDnsServer {
     endpoint_id: [u8; 4],
     service_port: u16,
     registered: bool,
+    configured_interfaces: Vec<linuxdrop_network::InterfaceAddress>,
 }
 
 impl Drop for MDnsServer {
@@ -82,6 +83,7 @@ impl MDnsServer {
             endpoint_id,
             service_port,
             registered: false,
+            configured_interfaces: snapshot.interfaces.clone(),
         };
         crate::lan_policy::configure_mdns_on(&this.daemon, &snapshot.interfaces)?;
         Ok(this)
@@ -89,14 +91,19 @@ impl MDnsServer {
 
     pub async fn run(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         let result = self.run_inner(ctk).await;
-        let cleanup = super::mdns_cleanup::shutdown(&self.daemon).await;
+        let cleanup = if self.closed {
+            Ok(())
+        } else {
+            super::mdns_cleanup::shutdown(&self.daemon).await
+        };
         self.closed = cleanup.is_ok();
         crate::lifecycle::finish(result, cleanup)
     }
 
     async fn run_inner(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
-        let monitor = self.daemon.monitor()?;
+        let mut monitor = self.daemon.monitor()?;
+        let mut interfaces = self.configured_interfaces.clone();
         let mut visibility = *self.visibility_receiver.borrow();
         if visibility != Visibility::Invisible && !self.service_info.get_addresses().is_empty() {
             self.daemon.register(self.service_info.clone())?;
@@ -120,8 +127,18 @@ impl MDnsServer {
                 changed = self.lan_state.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = self.lan_state.borrow_and_update().clone();
+                    if snapshot.interfaces == interfaces { continue; }
                     self.unregister().await?;
+                    // Interface selection in the pinned mDNS library is an
+                    // append-only history. Retire that history, sockets and
+                    // monitor before constructing a fresh bounded generation.
+                    super::mdns_cleanup::shutdown(&self.daemon).await?;
+                    self.closed = true;
+                    self.daemon = ServiceDaemon::new()?;
+                    self.closed = false;
                     crate::lan_policy::configure_mdns_on(&self.daemon, &snapshot.interfaces)?;
+                    monitor = self.daemon.monitor()?;
+                    interfaces = snapshot.interfaces.clone();
                     self.service_info = Self::build_service_on(self.endpoint_id, self.service_port, DeviceType::Laptop, &snapshot.interfaces)?;
                     if *self.visibility_receiver.borrow() != Visibility::Invisible && !self.service_info.get_addresses().is_empty() {
                         self.daemon.register(self.service_info.clone())?;

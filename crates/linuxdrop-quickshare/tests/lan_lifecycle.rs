@@ -4,6 +4,123 @@ use std::{net::SocketAddr, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
+#[ignore = "Requires the isolated network namespace created by run-lan-lifecycle.sh"]
+async fn mdns_reconfiguration_retires_threads_and_bounds_descriptors() {
+    use std::{
+        collections::BTreeSet,
+        sync::{Arc, Mutex},
+    };
+    assert_eq!(
+        std::env::var("LINUXDROP_TEST_PRIVATE_LAN").as_deref(),
+        Ok("1")
+    );
+    assert_ne!(
+        std::fs::read_link("/proc/self/ns/net").unwrap(),
+        std::fs::read_link("/proc/1/ns/net").unwrap()
+    );
+    for args in [
+        vec!["link", "set", "lo", "up"],
+        vec!["link", "add", "ld-mdns0", "type", "dummy"],
+        vec!["addr", "add", "198.18.4.1/24", "dev", "ld-mdns0"],
+        vec!["link", "set", "ld-mdns0", "up"],
+    ] {
+        assert!(
+            std::process::Command::new("ip")
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    lan_policy::set(TransferPolicy {
+        allowed_interfaces: vec!["ld-mdns0".into()],
+        ..Default::default()
+    });
+    fn workers() -> BTreeSet<String> {
+        std::fs::read_dir("/proc/self/task")
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                (std::fs::read_to_string(entry.path().join("comm"))
+                    .ok()?
+                    .trim()
+                    == "mDNS_daemon")
+                    .then(|| entry.file_name().to_string_lossy().into_owned())
+            })
+            .collect()
+    }
+    fn descriptors() -> usize {
+        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    }
+    async fn replaced(previous: &BTreeSet<String>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = workers();
+                if current.len() == 2 && current.is_disjoint(previous) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("Old mDNS threads were not retired");
+    }
+    let live = lan_policy::LanSnapshot {
+        interfaces: lan_policy::interfaces(false).unwrap(),
+        errors: vec![],
+    };
+    let (lan, watched) = tokio::sync::watch::channel(lan_policy::LanSnapshot::default());
+    let (visibility, visible) = tokio::sync::watch::channel(rqs_lib::Visibility::Visible);
+    let (_ble, ble) = tokio::sync::broadcast::channel(8);
+    let (peers, _peer_events) = tokio::sync::broadcast::channel(32);
+    let mut advertiser = rqs_lib::hdl::MDnsServer::new(
+        *b"TEST",
+        12345,
+        ble,
+        Arc::new(Mutex::new(visibility)),
+        visible,
+        watched.clone(),
+    )
+    .unwrap();
+    let discovery = rqs_lib::hdl::MDnsDiscovery::new(peers, watched).unwrap();
+    let original = workers();
+    assert_eq!(original.len(), 2);
+    // Exercise a snapshot change between construction and starting the worker.
+    lan.send_replace(live.clone());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let advert_stop = stop.clone();
+    let browse_stop = stop.clone();
+    let advert_task = tokio::spawn(async move { advertiser.run(advert_stop).await });
+    let browse_task = tokio::spawn(discovery.run(browse_stop));
+    replaced(&original).await;
+    let baseline = descriptors();
+    for cycle in 0..32 {
+        let previous = workers();
+        lan.send_replace(if cycle % 2 == 0 {
+            Default::default()
+        } else {
+            live.clone()
+        });
+        replaced(&previous).await;
+        assert!(!advert_task.is_finished() && !browse_task.is_finished());
+        assert!(
+            descriptors() <= baseline + 4,
+            "mDNS descriptors accumulated across network changes"
+        );
+    }
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        advert_task.await.unwrap().unwrap();
+        browse_task.await.unwrap().unwrap();
+        while !workers().is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn listener_updates_preserve_sessions_and_advertise_only_bound_addresses() {
     lan_policy::set(TransferPolicy {
         allowed_interfaces: vec!["lo".into()],
