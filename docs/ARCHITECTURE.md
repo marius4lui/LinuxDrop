@@ -111,3 +111,12 @@ A live link blocks backend restarts/network-setting changes. Replacing a link
 requires it to have no active streams, then waits for confirmed shutdown; failed
 replacement keeps the prepared file selection. The Transfers page exposes a
 persistent stop action with retry on failure.
+
+### GNOME status contract
+
+The Shell consumes generated Snapshot/Settings schemas from linuxdrop-ipc.
+Run `python3 tools/sync-ipc-schema.py` after model changes; CI checks the output.
+Its bounded GJS reader validates structure and cross-field invariants before
+publishing status. Invalid replies clear consent/remote actions and recover on a
+valid subsequent snapshot. Hardware detail remains an opaque object until its
+separate model migration. See [status acceptance](acceptance/SHELL_STATUS_SCHEMA_2026-10-07.md).

@@ -146,12 +146,13 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         check(!this._actionError && this._indicator.toggle.subtitle !== t('Needs attention'), 'Successful launch retry must retire its old error when the bubble reopens');
                         check(!this._body.get_children().some(child => child instanceof St.Label && child.text === 'Launch failure for smoke test'), 'Successful launch retry must remove stale failure text');
                     } finally { this._launchApp = launchApp; }
+                    const fixtureSettings = this._snapshot.settings;
                     this._actionPending = false; this._serviceState = 'offline'; this._snapshot = null; this._render();
                     check(!find(this._body, 'Cancel') && find(this._body, 'Open LinuxDrop'), 'Offline state must replace stale transfer actions');
                     const realProxy = this._proxy;
                     const requests = [];
                     let owner = ':smoke.old';
-                    const snapshot = revision => ({epoch: owner, revision, peers: [], backends: [], transfers: [{id: 'reconnect', state: 'verification', direction: 'incoming', peer_name: 'Reconnect peer', verification_code: '123456', files: [{name: 'review.txt', size: 10}]}]});
+                    const snapshot = revision => ({epoch: owner, revision, restarting: false, download_link_active: false, hardware: {}, settings: fixtureSettings, known_peers: [], peers: [], backends: [], transfers: [{id: 'reconnect', peer_id: 'fixture-peer', protocol: 'quickshare', state: 'verification', direction: 'incoming', peer_name: 'Reconnect peer', verification_code: '123456', saved_paths: [], total_bytes: 10, transferred_bytes: 0, files: [{name: 'review.txt', size: 10, transferred: 0}]}]});
                     const reply = (request, value) => request.callback(this._proxy, {deep_unpack: () => [JSON.stringify(value)]});
                     this._proxy = {
                         get_name_owner: () => owner,
@@ -184,6 +185,12 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         const newRead = requests.shift();
                         reply(newRead, snapshot(1));
                         check(this._serviceState === 'ready' && find(this._body, 'Codes match'), 'New owner must recover without requiring the polling timer');
+                        this._refresh();
+                        reply(requests.shift(), {...snapshot(2), restarting: 'false'});
+                        check(!this._snapshot && this._serviceState === 'offline' && !this._indicator.toggle.reactive && !find(this._body, 'Codes match'), 'Malformed status must retire consent and remote actions');
+                        this._refresh();
+                        reply(requests.shift(), snapshot(2));
+                        check(this._serviceState === 'ready' && this._indicator.toggle.reactive && find(this._body, 'Codes match'), 'Valid status after malformed data must recover without stale pending state');
                         find(this._body, 'Codes match').grab_key_focus();
                         this._snapshot.transfers.push(extra); this._render();
                         check(global.stage.get_key_focus() === find(this._body, 'Codes match'), 'Unrelated arrivals must preserve consent focus for the same request');

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub schema_version: u64,
@@ -21,6 +22,7 @@ pub struct Settings {
     pub diagnostics: DiagnosticsSettings,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralSettings {
     pub device_name: String,
@@ -30,6 +32,7 @@ pub struct GeneralSettings {
     pub close_behavior: String,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiveSettings {
     pub directory: String,
@@ -42,6 +45,7 @@ pub struct ReceiveSettings {
     pub subfolders: String,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisibilitySettings {
     pub mode: String,
@@ -49,6 +53,7 @@ pub struct VisibilitySettings {
     pub hide_on_lock: bool,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalsendSettings {
     pub enabled: bool,
@@ -59,6 +64,7 @@ pub struct LocalsendSettings {
     pub pin: String,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuickshareSettings {
     pub enabled: bool,
@@ -66,6 +72,7 @@ pub struct QuickshareSettings {
     pub port: u64,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AirdropSettings {
     pub enabled: bool,
@@ -74,6 +81,7 @@ pub struct AirdropSettings {
     pub receive: bool,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareSettings {
     pub preferred_adapter: String,
@@ -83,11 +91,13 @@ pub struct HardwareSettings {
     pub open_on_adapter: bool,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BluetoothSettings {
     pub adapter: String,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationsSettings {
     pub completed: bool,
@@ -97,6 +107,7 @@ pub struct NotificationsSettings {
     pub private_content: bool,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransfersSettings {
     pub max_parallel: u64,
@@ -105,16 +116,48 @@ pub struct TransfersSettings {
     pub bandwidth_limit_mbps: u64,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSettings {
     pub allowed_interfaces: Vec<String>,
     pub allow_virtual_interfaces: bool,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsSettings {
     pub log_level: String,
 }
+
+pub const SETTING_NUMBER_LIMITS: &[(&str, &str, u64, u64)] = &[
+    ("localsend", "port", 1024, 65535),
+    ("quickshare", "port", 1024, 65535),
+    ("receive", "max_files", 1, 10000),
+    ("receive", "max_bytes", 1, 10995116277760),
+    ("visibility", "duration_minutes", 0, 1440),
+    ("transfers", "max_parallel", 1, 16),
+    ("transfers", "history_limit", 0, 10000),
+    ("transfers", "history_days", 0, 3650),
+    ("transfers", "bandwidth_limit_mbps", 0, 100000),
+];
+
+pub const SETTING_CHOICES: &[(&str, &str, &[&str])] = &[
+    ("general", "appearance", &["system", "light", "dark"]),
+    ("visibility", "mode", &["hidden", "everyone"]),
+    ("general", "language", &["system", "de", "en"]),
+    (
+        "general",
+        "close_behavior",
+        &["background", "quit_when_idle"],
+    ),
+    ("receive", "collision_policy", &["rename", "reject"]),
+    (
+        "receive",
+        "subfolders",
+        &["none", "sender", "date", "sender_date"],
+    ),
+    ("diagnostics", "log_level", &["warn", "info", "debug"]),
+];
 
 impl Settings {
     pub fn defaults(directory: impl Into<String>) -> Self {
@@ -154,17 +197,7 @@ fn validate_semantics(value: &Value) -> Result<()> {
     ) {
         bail!("Invalid visibility");
     }
-    for (section, key, min, max) in [
-        ("localsend", "port", 1024, 65535),
-        ("quickshare", "port", 1024, 65535),
-        ("receive", "max_files", 1, 10000),
-        ("receive", "max_bytes", 1, 10995116277760),
-        ("visibility", "duration_minutes", 0, 1440),
-        ("transfers", "max_parallel", 1, 16),
-        ("transfers", "history_limit", 0, 10000),
-        ("transfers", "history_days", 0, 3650),
-        ("transfers", "bandwidth_limit_mbps", 0, 100000),
-    ] {
+    for &(section, key, min, max) in SETTING_NUMBER_LIMITS {
         let number = value[section][key]
             .as_u64()
             .ok_or_else(|| anyhow::anyhow!("Invalid number {section}.{key}"))?;
@@ -179,21 +212,7 @@ fn validate_semantics(value: &Value) -> Result<()> {
     if value["hardware"]["protect_active_connection"] != true {
         bail!("Active internet adapters remain protected; choose a dedicated adapter");
     }
-    for (section, key, choices) in [
-        ("general", "language", &["system", "de", "en"][..]),
-        (
-            "general",
-            "close_behavior",
-            &["background", "quit_when_idle"][..],
-        ),
-        ("receive", "collision_policy", &["rename", "reject"][..]),
-        (
-            "receive",
-            "subfolders",
-            &["none", "sender", "date", "sender_date"][..],
-        ),
-        ("diagnostics", "log_level", &["warn", "info", "debug"][..]),
-    ] {
+    for &(section, key, choices) in SETTING_CHOICES {
         if !value[section][key]
             .as_str()
             .is_some_and(|s| choices.contains(&s))

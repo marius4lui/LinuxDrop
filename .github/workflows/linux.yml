@@ -12,7 +12,7 @@ jobs:
       - name: Native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi busybox
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi busybox gjs
       - name: Rust tools
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
@@ -20,6 +20,7 @@ jobs:
         run: |
           cargo fmt --all --check
           python3 tools/sync-ipc-contract.py --check
+          python3 tools/sync-ipc-schema.py --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
       - name: Unit and integration tests
@@ -41,12 +42,13 @@ jobs:
           python3 integrations/thunar/test_install_action.py
           python3 packaging/helpers/test_p2p_dhcp.py
           node --check extensions/gnome-shell/extension.js
+          gjs -m extensions/gnome-shell/tests/snapshot-smoke.js
           sh -n packaging/install.sh packaging/build-deb.sh
       - name: Build installable package
         run: sh packaging/build-deb.sh
       - name: Daemon session and HTTPS integration
         run: |
-          LINUXDROP_TEST_CONTRACT=1 LINUXDROP_CONTRACT_PROBE="$PWD/target/debug/examples/check_contract" dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
+          LINUXDROP_TEST_GJS_STATUS=1 LINUXDROP_TEST_CONTRACT=1 LINUXDROP_CONTRACT_PROBE="$PWD/target/debug/examples/check_contract" dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
           dbus-run-session -- python3 tests/integration/daemon_shutdown.py target/release/linuxdropd
       - name: Package smoke test
         run: |

@@ -6,6 +6,7 @@ import GObject from 'gi://GObject';
 import Pango from 'gi://Pango';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
+import {parseSnapshot} from './snapshot.js';
 import {t, nearby, filesStatus, transferError} from './locale.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -230,7 +231,7 @@ export default class LinuxDropExtension extends Extension {
             this._pending = null;
             try {
                 const [json] = proxy.call_finish(result).deep_unpack();
-                const snapshot = JSON.parse(json);
+                const snapshot = parseSnapshot(json);
                 const revision = `${snapshot.epoch}:${snapshot.revision}`;
                 const actionSettled = request.afterAction;
                 if (actionSettled) {

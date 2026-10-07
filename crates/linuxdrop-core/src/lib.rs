@@ -28,6 +28,7 @@ pub struct TransferPolicy {
     pub bluetooth_adapter: Option<String>,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub id: String,
@@ -38,6 +39,7 @@ pub struct Peer {
     pub available: bool,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferFile {
     pub name: String,
@@ -45,6 +47,7 @@ pub struct TransferFile {
     pub transferred: u64,
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {
     pub id: String,
@@ -78,6 +81,7 @@ impl Transfer {
     }
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendState {
     pub id: String,

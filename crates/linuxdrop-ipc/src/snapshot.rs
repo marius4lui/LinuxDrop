@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 pub const IDENTITY_SCOPE: &str = "Preferences apply to this protocol identifier; they do not authenticate a person. Discovery identifiers can change.";
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerView {
     #[serde(flatten)]
@@ -22,6 +23,7 @@ pub struct PeerView {
     pub preferred_protocol: Option<String>,
     pub identity_scope: String,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownPeer {
     pub id: String,
@@ -31,12 +33,14 @@ pub struct KnownPeer {
     pub preferred_protocol: String,
     pub available: bool,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionMode {
     Native,
     PublishSelected,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferView {
     #[serde(flatten)]
@@ -46,6 +50,7 @@ pub struct TransferView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_mode: Option<SelectionMode>,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub epoch: String,

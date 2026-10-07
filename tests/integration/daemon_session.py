@@ -62,8 +62,12 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
                 time.sleep(0.05)
             raise AssertionError("Timed out waiting for daemon state")
 
+        observed_snapshots = []
         def snapshot():
-            return json.loads(call("GetSnapshot"))
+            value = call("GetSnapshot")
+            if os.environ.get("LINUXDROP_TEST_GJS_STATUS") == "1":
+                observed_snapshots.append(value)
+            return json.loads(value)
 
         wait(lambda: any(b["id"] == "localsend" and b["state"] == "ready"
                          for b in snapshot()["backends"]))
@@ -309,6 +313,12 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
             offer.shutdown()
             offer.server_close()
             thread.join(timeout=2)
+        if os.environ.get("LINUXDROP_TEST_GJS_STATUS") == "1":
+            responses = root / "status-responses.json"
+            responses.write_text(json.dumps(observed_snapshots))
+            repo = Path(__file__).resolve().parents[2]
+            subprocess.run(["gjs", "-m", str(repo / "extensions/gnome-shell/tests/snapshot-smoke.js"),
+                str(repo / "crates/linuxdrop-ipc/settings.defaults.json"), str(responses)], check=True, timeout=15)
         call("StopWhenIdle")
         assert daemon.wait(timeout=5) == 0
         print("PASS restart admission/quiescing and active-request protection, actual D-Bus/HTTPS consent and timestamp/forward-field interoperability, subset/custom destination, duplicate decision, private persisted preferences/history, redacted diagnostics, download-link network restriction with draft retention, reverse-download PIN and consent while hidden, idle shutdown")

@@ -5,9 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+schema = ["dep:schemars", "linuxdrop-core/schema"]
 client = ["dep:zbus"]
 
 [dependencies]
+schemars = { version = "1.2", optional = true }
 linuxdrop-core = { path = "../linuxdrop-core" }
 anyhow.workspace = true
 serde.workspace = true
@@ -21,3 +23,7 @@ futures-util.workspace = true
 [[example]]
 name = "check_contract"
 required-features = ["client"]
+
+[[example]]
+name = "export_schema"
+required-features = ["schema"]

@@ -12,3 +12,8 @@ pub use settings::*;
 
 mod snapshot;
 pub use snapshot::*;
+
+#[cfg(feature = "schema")]
+mod schema;
+#[cfg(feature = "schema")]
+pub use schema::snapshot_schema;
