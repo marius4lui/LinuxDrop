@@ -1872,6 +1872,7 @@ impl Ui {
                             "data_injection" => "Data frame injection",
                             "awdl" => "AWDL compatibility",
                             "protected" => "Protected from interruption",
+                            "reserved_for" => "Reserved for",
                             "powered" => "Powered on",
                             "supported_advertisements" => "Bluetooth advertisement capacity",
                             "active_advertisements" => "Active advertisements",
@@ -1914,7 +1915,11 @@ impl Ui {
                     button.set_tooltip_text(Some(&tr("Run active hardware test")));
                     button.set_sensitive(
                         !item["protected"].as_bool().unwrap_or(false)
-                            && !item["rfkill"].as_bool().unwrap_or(false),
+                            && !item["rfkill"].as_bool().unwrap_or(false)
+                            && !matches!(
+                                item["reserved_for"].as_str(),
+                                Some("AirDrop" | "Quick Share")
+                            ),
                     );
                     let id = text(&item, "id").to_owned();
                     let weak = Rc::downgrade(self);

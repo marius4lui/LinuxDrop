@@ -191,6 +191,8 @@ pub fn tr(message: &str) -> String {
         "Diagnostic report saved" => "Diagnosebericht gespeichert",
         "This active test may briefly create a monitor interface and change its channel. It never runs automatically. The daemon refuses tests on protected or busy adapters." => "Dieser aktive Test kann kurz eine Monitor-Schnittstelle erstellen und ihren Kanal ändern. Er läuft niemals automatisch. Geschützte oder belegte Adapter werden abgewiesen.",
         "Test channel" => "Testkanal",
+        "Reserved for" => "Reserviert f?r",
+        "Not reserved" => "Nicht reserviert",
         "Run active hardware test" => "Aktiven Hardwaretest starten",
         "Run test" => "Test starten",
         "Hardware diagnostic" => "Hardwarediagnose",

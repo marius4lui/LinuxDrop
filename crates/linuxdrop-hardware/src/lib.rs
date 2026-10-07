@@ -1,5 +1,6 @@
 //! Passive Linux hardware inventory. No method in this crate changes radio state.
 //! `iw` is the kernel nl80211 client; it is invoked directly, never through a shell.
+pub mod allocation;
 pub mod details;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -171,7 +172,7 @@ pub fn select_radio(inventory: &Inventory, request: &SelectionRequest) -> Select
             if r.monitor.value != CapabilityValue::Yes {
                 exclusions.push("monitor mode not reported by kernel".into());
             }
-            if request.leased.contains(&r.id) {
+            if request.leased.contains(&r.id) || request.leased.contains(&r.phy) {
                 exclusions.push("radio is already leased".into());
             }
             if request.require_tested_awdl && r.awdl.value != CapabilityValue::Yes {

@@ -1201,16 +1201,38 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     if shared.data.lock().await.stop_when_idle {
         return;
     }
+    // Allocate jointly before either backend reserves a radio. AirDrop needs
+    // its radio; Quick Share can continue on LAN when only one is available.
+    let inventory = linuxdrop_hardware::inventory().await;
+    let mut allocation = radio_allocation_request(&settings);
+    let plan = linuxdrop_hardware::allocation::allocate(&inventory, &allocation);
+    if settings["airdrop"]["enabled"] == true {
+        let result = start_airdrop(
+            shared,
+            &settings,
+            plan.airdrop,
+            name.clone(),
+            directory.clone(),
+            visible,
+            events.clone(),
+        )
+        .await;
+        install_backend(shared, "airdrop", result).await;
+    } else {
+        disabled(shared, "airdrop").await;
+    }
+    if shared.data.lock().await.stop_when_idle {
+        return;
+    }
     if settings["quickshare"]["enabled"] == true {
-        let preferred = settings["hardware"]["preferred_adapter"]
-            .as_str()
-            .unwrap_or("");
-        let inventory = linuxdrop_hardware::inventory().await;
-        let upgrade_radio = inventory
-            .radios
-            .iter()
-            .find(|r| r.id == preferred && !r.protected && !r.rfkill)
-            .map(|r| r.id.clone());
+        // A failed AirDrop startup can release its radio for Direct Wi-Fi. A
+        // retained failed-cleanup lease must remain excluded until restoration.
+        allocation.airdrop = false;
+        if let Some(lease) = shared.helper.lock().await.as_ref() {
+            allocation.leased.push(lease.expected.phy.clone());
+        }
+        let upgrade_radio =
+            linuxdrop_hardware::allocation::allocate(&inventory, &allocation).quickshare;
         let upgrade_lease = if let Some(radio_id) = upgrade_radio {
             match reserve_direct_wifi(shared, radio_id).await {
                 Ok(lease) => Some(lease),
@@ -1250,13 +1272,6 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     }
     if shared.data.lock().await.stop_when_idle {
         return;
-    }
-    if settings["airdrop"]["enabled"] == true {
-        let result =
-            start_airdrop(shared, &settings, name, directory, visible, events.clone()).await;
-        install_backend(shared, "airdrop", result).await;
-    } else {
-        disabled(shared, "airdrop").await;
     }
     {
         let mut d = shared.data.lock().await;
@@ -1315,44 +1330,32 @@ async fn disabled(shared: &Arc<Shared>, id: &str) {
     );
 }
 
+fn radio_allocation_request(settings: &Value) -> linuxdrop_hardware::allocation::Request {
+    linuxdrop_hardware::allocation::Request {
+        airdrop: settings["airdrop"]["enabled"] == true,
+        quickshare: settings["quickshare"]["enabled"] == true,
+        preferred: settings["hardware"]["preferred_adapter"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+        prefer_usb: settings["hardware"]["prefer_usb"] == true,
+        auto_use_usb: settings["hardware"]["auto_use_usb"] == true,
+        leased: vec![],
+    }
+}
+
 async fn start_airdrop(
     shared: &Arc<Shared>,
     settings: &Value,
+    choice: Option<linuxdrop_hardware::allocation::AwdlChoice>,
     name: String,
     directory: PathBuf,
     visible: bool,
     events: EventSender,
 ) -> Result<CommandSender> {
-    let inventory = linuxdrop_hardware::inventory().await;
-    let leased = shared
-        .quickshare_helper
-        .lock()
-        .await
-        .as_ref()
-        .map(|lease| vec![lease.expected.phy.clone()])
-        .unwrap_or_default();
-    let preferred = settings["hardware"]["preferred_adapter"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
-    let mut chosen = None;
-    for channel in [44, 6, 149] {
-        let choice = linuxdrop_hardware::select_radio(
-            &inventory,
-            &linuxdrop_hardware::SelectionRequest {
-                preferred: preferred.clone(),
-                channel: Some(channel),
-                require_tested_awdl: false,
-                leased: leased.clone(),
-                prefer_usb: settings["hardware"]["prefer_usb"] == true,
-            },
-        );
-        if let Some(id) = choice.selected {
-            chosen = Some((id, channel));
-            break;
-        }
-    }
-    let (radio_id,channel)=chosen.context("No idle monitor-capable WLAN adapter with a permitted AWDL channel. Attach a dedicated adapter; physical compatibility is still experimental.")?;
+    let choice = choice.context("No idle monitor-capable WLAN adapter with a permitted AWDL channel. Attach a dedicated adapter; physical compatibility is still experimental.")?;
+    let radio_id = choice.radio_id;
+    let channel = choice.channel;
     let mut client = linuxdrop_netd::Client::connect()
         .await
         .context("AirDrop network helper is not installed or running")?;
@@ -1606,17 +1609,47 @@ async fn main() -> Result<()> {
     let hardware_watch = tokio::spawn(async move {
         let mut inventories = linuxdrop_hardware::watch_inventory();
         let mut initialized = false;
+        let mut radio_changes = linuxdrop_hardware::allocation::HotplugAllocation::default();
         loop {
             tokio::select! {
                 biased;
                 _ = hardware_stop.cancelled() => break,
                 result = inventories.changed() => { if result.is_err() { break; } }
             }
-            let value =
-                serde_json::to_value(inventories.borrow_and_update().clone()).unwrap_or_default();
+            let inventory = inventories.borrow_and_update().clone();
+            let mut value = serde_json::to_value(&inventory).unwrap_or_default();
+            // Read lease ownership before Data; helper I/O never runs under Data.
+            let awdl_phy = hardware
+                .helper
+                .lock()
+                .await
+                .as_ref()
+                .map(|lease| lease.expected.phy.clone());
+            let direct_phy = hardware
+                .quickshare_helper
+                .lock()
+                .await
+                .as_ref()
+                .map(|lease| lease.expected.phy.clone());
+            if let Some(radios) = value["radios"].as_array_mut() {
+                for radio in radios {
+                    radio["reserved_for"] = if radio["phy"].as_str() == awdl_phy.as_deref() {
+                        json!("AirDrop")
+                    } else if radio["phy"].as_str() == direct_phy.as_deref() {
+                        json!("Quick Share")
+                    } else {
+                        json!("Not reserved")
+                    };
+                }
+            }
+            let link_active = hardware
+                .download_offer
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|offer| offer.is_active());
             let mut d = hardware.data.lock().await;
             let changed = d.hardware != value;
-            let radios_changed = d.hardware["radios"] != value["radios"];
             let show_adapter = initialized
                 && d.settings["hardware"]["open_on_adapter"] == true
                 && !hardware.locked.load(std::sync::atomic::Ordering::Relaxed)
@@ -1632,18 +1665,22 @@ async fn main() -> Result<()> {
                                 .flatten()
                                 .any(|old| old["id"] == radio["id"])
                     });
-            let retry = radios_changed
-                && d.settings["airdrop"]["enabled"] == true
-                && d.settings["hardware"]["auto_use_usb"] == true
-                && d.backends
-                    .get("airdrop")
-                    .is_some_and(|b| b.state == "error")
-                && !d.transfers.values().any(|t| !t.is_terminal());
+            let mut missing = radio_allocation_request(&d.settings);
+            missing.airdrop &= awdl_phy.is_none();
+            missing.quickshare &= direct_phy.is_none();
+            missing
+                .leased
+                .extend(awdl_phy.into_iter().chain(direct_phy));
+            let busy = d.restarting
+                || d.stop_when_idle
+                || link_active
+                || d.transfers.values().any(|t| !t.is_terminal());
+            let retry = radio_changes.observe(&inventory, &missing, busy);
             d.hardware = value;
             initialized = true;
             drop(d);
-            if retry {
-                let _ = Manager(hardware.clone()).restart_backends().await;
+            if retry && Manager(hardware.clone()).restart_backends().await.is_ok() {
+                radio_changes.queued();
             }
             if changed {
                 hardware.changed().await;

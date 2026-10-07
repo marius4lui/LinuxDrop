@@ -612,3 +612,40 @@ DHCP without router/DNS options, live LAN address/link reconciliation, and
 receiver-hosted Direct upgrade with encrypted sequence continuity. The runner
 derives test executables from Cargo JSON and is wired into Linux CI; remote CI
 has not run for these unpushed changes. No physical radio acceptance is implied.
+
+
+## Joint radio allocation and deferred hotplug, 2026-10-07
+
+The daemon now plans AirDrop and Direct Wi-Fi together before acquiring either
+radio. It maximizes the number of radio-backed protocols, then gives a lone
+AWDL-capable radio to AirDrop because Quick Share retains its LAN transport.
+Preferences and deterministic capability scoring resolve remaining choices.
+This avoids assigning the sole AWDL-capable adapter to Quick Share when a second
+station-capable adapter is available. AirDrop starts first using the planned
+radio/channel. After a failed AirDrop start, Quick Share can use a successfully
+released radio; failed-cleanup ownership remains excluded by kernel phy.
+
+Quick Share now selects suitable idle hardware automatically, including when no
+preferred ID is set. Selection excludes rfkill, absent drivers, active/connecting
+interfaces, leased PHYs, unavailable channels and incompatible modes. Automatic
+USB opt-out is honored, with explicit preference remaining an intentional choice.
+Changing that option now goes through the backend restart/admission guard. No
+active injection test is implied by passive selection. The privileged helper
+still validates live state before acquisition.
+
+Hotplug considers both backends. A topology change during a transfer, active
+link or restart is retained until idle rather than lost. Repeated inventory
+polls do not repeatedly queue restarts, and temporary-interface churn after a
+failed startup cannot cause unlimited automatic attempts for the same selected
+attachment. Unplug/replug or rfkill resets that automatic attempt budget; the
+explicit restart action remains available. The Hardware screen shows the backend
+holding each radio reservation and disables active diagnostic controls on it.
+A reservation can be held for pending cleanup; it is not a ready-state claim.
+
+Validation: eight hardware tests (including joint scarce-capability assignment,
+order independence, preferred-but-busy refusal, USB opt-out, ID/PHY exclusions,
+regulatory constraints, postponed hotplug and failed-engine interface churn)
+and thirteen daemon tests passed. App, hardware, netd and daemon all-target
+Clippy with warnings denied passed. These are selection/lifecycle software
+fixtures; physical radio unplug, monitor/injection and device interoperability
+remain separately unverified. The user's live demo was not changed.

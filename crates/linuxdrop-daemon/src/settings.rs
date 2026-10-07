@@ -74,6 +74,7 @@ pub fn needs_backend_restart(old: &Value, next: &Value) -> bool {
             ("receive", "max_bytes"),
             ("hardware", "preferred_adapter"),
             ("hardware", "prefer_usb"),
+            ("hardware", "auto_use_usb"),
             ("transfers", "bandwidth_limit_mbps"),
         ]
         .iter()
@@ -209,6 +210,9 @@ mod tests {
             &json!({"network":{"allowed_interfaces":["wlan0"]}}),
         )
         .unwrap();
+        assert!(needs_backend_restart(&old, &next));
+        let mut next = old.clone();
+        merge(&mut next, &json!({"hardware":{"auto_use_usb":false}})).unwrap();
         assert!(needs_backend_restart(&old, &next));
     }
 }
