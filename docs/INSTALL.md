@@ -99,7 +99,7 @@ through the wrapper as a normal user (it intentionally refuses root):
 sudo pacman -S --needed base-devel rust cmake pkgconf protobuf libnl libpcap \
   libev gtk4 libadwaita openssl systemd dbus polkit iw iproute2 ethtool python busybox
 sh packaging/build-arch.sh
-sudo pacman -U ./dist/linuxdrop-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./dist/linuxdrop-0.1.0-2-x86_64.pkg.tar.zst
 ```
 
 Arch's optional runtime integrations are `networkmanager`, `bluez` and
