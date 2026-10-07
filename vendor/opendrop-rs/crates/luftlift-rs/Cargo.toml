@@ -34,7 +34,6 @@ plist = "1"
 rcgen = "0.13"
 # TLS for the AirDrop HTTPS server on port 8771. ring backend (portable, no C deps).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
 # Pure-Rust mDNS (no system avahi/dbus dependency) for _airdrop._tcp announce.
 mdns-sd = "0.11"
 # SIGINT/SIGTERM handler for graceful mDNS goodbye (TTL=0) on `receive` exit.

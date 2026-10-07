@@ -36,13 +36,13 @@ jobs:
         run: |
           if [ "$DISTRO" = ubuntu ]; then
             apt-get update
-            apt-get install -y --no-install-recommends git tar locales passwd \
-              gnome-shell gjs dbus-daemon dbus-x11 python3-gi gir1.2-adw-1 \
+            apt-get install -y --no-install-recommends ca-certificates git tar locales passwd \
+              gnome-shell gjs dbus-daemon dbus-x11 python3-dbusmock python3-gi gir1.2-adw-1 \
               libgl1-mesa-dri libegl-mesa0
             localedef -i de_DE -f UTF-8 de_DE.UTF-8
           else
-            dnf -y --setopt=install_weak_deps=False install git tar shadow-utils \
-              gnome-shell gjs dbus-daemon dbus-x11 python3-gobject \
+            dnf -y --setopt=install_weak_deps=False install ca-certificates git tar shadow-utils \
+              gnome-shell gjs dbus-daemon dbus-x11 python3-dbusmock python3-gobject \
               mesa-dri-drivers glibc-langpack-de
           fi
           useradd --create-home linuxdrop-ci
@@ -53,10 +53,6 @@ jobs:
         run: |
           actual=$(gnome-shell --version | awk '{print $3}' | cut -d. -f1)
           test "$actual" = "$EXPECTED_SHELL"
-          mkdir -p /run/dbus
-          if [ ! -S /run/dbus/system_bus_socket ]; then
-            dbus-daemon --system --fork --nopidfile
-          fi
           runuser -u linuxdrop-ci -- env LANG=de_DE.UTF-8 LANGUAGE=de \
-            LINUXDROP_SMOKE_TEXT_SCALE=1.5 LINUXDROP_SMOKE_MONITOR=800x600 \
+            LINUXDROP_SMOKE_MOCK_LOGIND=1 LINUXDROP_SMOKE_TEXT_SCALE=1.5 LINUXDROP_SMOKE_MONITOR=800x600 \
             bash extensions/gnome-shell/tests/run-bubble-smoke.sh

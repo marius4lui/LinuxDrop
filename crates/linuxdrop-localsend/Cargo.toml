@@ -17,7 +17,7 @@ tokio-util.workspace = true
 uuid.workspace = true
 tracing.workspace = true
 axum = "0.8"
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = "0.13"
@@ -25,7 +25,6 @@ sha2 = "0.10"
 hex = "0.4"
 socket2 = { version = "0.5", features = ["all"] }
 futures-util = "0.3"
-rustls-pemfile = "2"
 libc = "0.2"
 
 [dev-dependencies]

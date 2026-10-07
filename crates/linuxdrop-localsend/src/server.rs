@@ -4,7 +4,7 @@ use axum_server::{tls_rustls::RustlsConfig, Handle};
 use linuxdrop_network::InterfaceAddress;
 
 struct Listener {
-    handle: Handle,
+    handle: Handle<SocketAddr>,
     task: tokio::task::JoinHandle<()>,
     discovery: Option<tokio::task::JoinHandle<Result<()>>>,
 }
@@ -75,17 +75,20 @@ impl Network {
                 let tls = self.tls.clone();
                 let state = self.state.clone();
                 let task = self.tasks.spawn(async move {
-                    let result = if let Some(tls) = tls {
-                        axum_server::from_tcp_rustls(listener, tls)
-                            .handle(task_handle.clone())
-                            .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
-                            .await
-                    } else {
-                        axum_server::from_tcp(listener)
-                            .handle(task_handle.clone())
-                            .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
-                            .await
-                    };
+                    let result = async {
+                        if let Some(tls) = tls {
+                            axum_server::from_tcp_rustls(listener, tls)?
+                                .handle(task_handle.clone())
+                                .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
+                                .await
+                        } else {
+                            axum_server::from_tcp(listener)?
+                                .handle(task_handle.clone())
+                                .serve(routes.into_make_service_with_connect_info::<SocketAddr>())
+                                .await
+                        }
+                    }
+                    .await;
                     // axum-server returns before detached connections finish on
                     // forced shutdown (including TLS handshakes). Keep this task
                     // alive until their watcher guards have actually been dropped.

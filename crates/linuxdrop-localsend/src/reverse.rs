@@ -268,6 +268,7 @@ pub async fn start_sources_with_budget(
     let task = tokio::spawn(async move {
         let handle = axum_server::Handle::new();
         let server = axum_server::from_tcp(listener.into_std().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?
             .handle(handle.clone())
             .serve(router.into_make_service_with_connect_info::<SocketAddr>());
         tokio::pin!(server);

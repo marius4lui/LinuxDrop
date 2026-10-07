@@ -1,11 +1,11 @@
 use anyhow::{bail, Result};
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    pki_types::{CertificateDer, ServerName, UnixTime},
+    pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime},
     DigitallySignedStruct, SignatureScheme,
 };
 use sha2::{Digest, Sha256};
-use std::{io::BufReader, os::unix::fs::OpenOptionsExt, path::Path, sync::Arc};
+use std::{os::unix::fs::OpenOptionsExt, path::Path, sync::Arc};
 
 pub fn identity(dir: &Path) -> Result<(Vec<u8>, Vec<u8>, String)> {
     std::fs::create_dir_all(dir)?;
@@ -29,10 +29,7 @@ pub fn identity(dir: &Path) -> Result<(Vec<u8>, Vec<u8>, String)> {
     }
     let cert = std::fs::read(cert_path)?;
     let key = std::fs::read(key_path)?;
-    let der = rustls_pemfile::certs(&mut BufReader::new(cert.as_slice()))
-        .next()
-        .transpose()?
-        .ok_or_else(|| anyhow::anyhow!("Certificate missing"))?;
+    let der = CertificateDer::from_pem_slice(&cert)?;
     let fingerprint = hex::encode(Sha256::digest(der.as_ref()));
     Ok((cert, key, fingerprint))
 }

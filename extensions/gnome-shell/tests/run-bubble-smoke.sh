@@ -33,7 +33,14 @@ dbus-run-session -- bash -c '
     python3 app/linuxdrop/tests/shell-review-fixture.py > "$LINUXDROP_SMOKE_ROOT/fixture.log" 2>&1 &
     fixture_pid=$!
     shell_pid=
-    trap '\''kill ${shell_pid:-} "$fixture_pid" 2>/dev/null || true'\'' EXIT
+    logind_pid=
+    trap '\''kill ${shell_pid:-} ${logind_pid:-} "$fixture_pid" 2>/dev/null || true'\'' EXIT
+    if [ "${LINUXDROP_SMOKE_MOCK_LOGIND:-0}" = 1 ]; then
+        export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" XDG_SESSION_ID=linuxdrop_ci
+        python3 -m dbusmock --session -t logind > "$LINUXDROP_SMOKE_ROOT/logind.log" 2>&1 &
+        logind_pid=$!
+        python3 extensions/gnome-shell/tests/mock-session.py
+    fi
     sleep 1
     gsettings set org.gnome.shell enabled-extensions "['\''linuxdrop@marius4lui.github.io'\'']"
     gsettings set org.gnome.desktop.interface enable-animations false

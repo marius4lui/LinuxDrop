@@ -36,3 +36,8 @@ path = "fuzz_targets/hardware_report.rs"
 test = false
 doc = false
 bench = false
+
+# Independent fuzz workspaces do not inherit the product workspace patches.
+# Exercise the same owner-pinned Bluetooth implementation as the shipped daemon.
+[patch.crates-io]
+bluer = { path = "../vendor/bluer" }

@@ -5,9 +5,10 @@ mod tls;
 use anyhow::{bail, Context, Result};
 use linuxdrop_core::{BackendCommand, BackendEvent};
 use linuxdrop_localsend::{start_bound, Config};
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{io::BufReader, net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{net::Ipv4Addr, path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -58,10 +59,7 @@ async fn main() -> Result<()> {
         });
     let public_cert = std::fs::read(daemon_data.join("localsend-cert.pem"))
         .context("Start the real LinuxDrop daemon first; its public TLS certificate is required")?;
-    let der = rustls_pemfile::certs(&mut BufReader::new(public_cert.as_slice()))
-        .next()
-        .transpose()?
-        .context("Daemon certificate missing")?;
+    let der = CertificateDer::from_pem_slice(&public_cert).context("Daemon certificate missing")?;
     let daemon_fingerprint = hex::encode(Sha256::digest(der.as_ref()));
     let (events, mut receiver) = mpsc::channel(256);
     let commands = start_bound(
