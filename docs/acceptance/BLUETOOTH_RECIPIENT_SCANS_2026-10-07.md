@@ -48,3 +48,12 @@ claim to solve that separate concern. No live-demo restart or browser use.
 Follow-up: the bluez-async signal queue limitation above is addressed by
 [bounded subscriptions](BLUETOOTH_SIGNAL_BOUNDS_2026-10-07.md). Broader long-running
 resource and physical acceptance remain open.
+# Restart-gap follow-up
+
+The selected-controller monitor now classifies a D-Bus `NameHasNoOwner`
+response during a BlueZ restart as loss of the original daemon generation.
+Other bus errors retain their original cause. The private-bus recipient fixture
+explicitly checks both the ownerless interval and the replacement owner, then
+verifies cleanup reaches only the original scanner. The focused fixture passed
+in 16.12 seconds. This removes dependence on how quickly a replacement daemon
+claims its name; physical Bluetooth interoperability remains unverified.

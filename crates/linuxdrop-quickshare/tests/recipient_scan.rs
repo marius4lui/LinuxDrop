@@ -320,7 +320,14 @@ async fn recipient_selection_waits_for_stop_and_recovers_without_trusting_names_
         .await
     });
     wait_for(|| old_radio.starts.load(Ordering::SeqCst) == starts + 1).await;
+    let monitor = linuxdrop_network::bluetooth_lifetime::ControllerMonitor::new(adapter.name())
+        .await
+        .unwrap();
     bus.release_name("org.bluez").await.unwrap();
+    // Keep the restart gap observable instead of depending on whether the
+    // replacement wins a race with the monitor's GetNameOwner request.
+    let missing = monitor.check().await.unwrap_err();
+    assert!(missing.to_string().contains("owner changed"), "{missing:#}");
     let radio = Arc::new(scanner::State::default());
     radio.powered.store(true, Ordering::SeqCst);
     let replacement = zbus::connection::Builder::session()
@@ -334,12 +341,17 @@ async fn recipient_selection_waits_for_stop_and_recovers_without_trusting_names_
         .build()
         .await
         .unwrap();
+    let replaced = monitor.check().await.unwrap_err();
+    assert!(
+        replaced.to_string().contains("owner changed"),
+        "{replaced:#}"
+    );
     let error = tokio::time::timeout(Duration::from_secs(3), task)
         .await
         .unwrap()
         .unwrap()
         .unwrap_err();
-    assert!(error.to_string().contains("owner changed"));
+    assert!(error.to_string().contains("owner changed"), "{error:#}");
     assert_eq!(old_radio.stops.load(Ordering::SeqCst), stops + 1);
     assert_eq!(radio.stops.load(Ordering::SeqCst), 0);
     assert!(!old_radio.active.load(Ordering::SeqCst));

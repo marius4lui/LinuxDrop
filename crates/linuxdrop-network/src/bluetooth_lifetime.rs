@@ -32,7 +32,17 @@ impl ControllerMonitor {
     pub async fn check(&self) -> Result<()> {
         tokio::time::timeout(Duration::from_secs(3), async {
             let bus = zbus::fdo::DBusProxy::new(&self.connection).await?;
-            if bus.get_name_owner("org.bluez".try_into()?).await?.as_str() != self.owner {
+            // A daemon restart includes a period without any owner. Treat that
+            // as loss of this generation, just like a replacement owner; retain
+            // other bus failures instead of disguising transport errors.
+            let owner = match bus.get_name_owner("org.bluez".try_into()?).await {
+                Ok(owner) => owner,
+                Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
+                    bail!("Bluetooth daemon owner changed (service disappeared)");
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if owner.as_str() != self.owner {
                 bail!("Bluetooth daemon owner changed");
             }
             let path = format!("/org/bluez/{}", self.name);
