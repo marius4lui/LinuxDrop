@@ -62,7 +62,7 @@ pub async fn start_with_budget(
         Some(config.name),
     );
     let mut engine = engine_lifetime::OwnedEngine::new(engine, staging);
-    let bluetooth = if config.ble {
+    let mut bluetooth = if config.ble {
         match tokio::time::timeout(
             Duration::from_secs(5),
             bluetooth_ready(config.policy.bluetooth_adapter.as_deref()),
@@ -75,14 +75,14 @@ pub async fn start_with_budget(
     } else {
         Ok(String::new())
     };
-    engine.ble_enabled = config.ble && bluetooth.is_ok();
-    rqs_lib::set_bluetooth_adapter(
+    engine.ble_enabled = config.ble;
+    rqs_lib::set_bluetooth_adapter(config.policy.bluetooth_adapter.clone().or_else(|| {
         bluetooth
             .as_ref()
             .ok()
             .filter(|name| !name.is_empty())
-            .cloned(),
-    );
+            .cloned()
+    }));
     rqs_lib::lan_policy::set(config.policy.clone());
     rqs_lib::set_receive_limits(config.max_receive_bytes, config.max_files);
     rqs_lib::payload_budget::set_budget(bandwidth);
@@ -124,7 +124,14 @@ pub async fn start_with_budget(
         };
     }
     let (commands, mut rx) = mpsc::channel(32);
+    let mut scanner_paused = false;
     let mut bluetooth_errors = std::collections::BTreeMap::new();
+    if config.ble {
+        bluetooth_errors.insert(
+            "bluetooth-listener".to_string(),
+            "Waiting for the Bluetooth scanner".to_string(),
+        );
+    }
     let initial_network = lan_state.borrow().clone();
     events
         .send(BackendEvent::StateChanged(network_status(
@@ -132,6 +139,7 @@ pub async fn start_with_budget(
             &bluetooth,
             config.ble,
             &bluetooth_errors,
+            scanner_paused,
         )))
         .await
         .ok();
@@ -148,7 +156,7 @@ pub async fn start_with_budget(
                 changed = lan_state.changed() => {
                     if changed.is_err() { break; }
                     let snapshot = lan_state.borrow_and_update().clone();
-                    events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors))).await.ok();
+                    events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors, scanner_paused))).await.ok();
                 },
                 command = rx.recv() => match command {
                     None | Some(BackendCommand::Shutdown) => break,
@@ -203,11 +211,19 @@ pub async fn start_with_budget(
                     Err(_) => break,
                 },
                 message = messages.recv() => match message {
+                    Ok(ChannelMessage {msg:Message::BluetoothScannerReady {adapter, paused},..}) => {
+                        bluetooth = Ok(adapter);
+                        scanner_paused = paused;
+                        bluetooth_errors.remove("bluetooth-listener");
+                        let snapshot = lan_state.borrow().clone();
+                        events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors, scanner_paused))).await.ok();
+                    }
                     Ok(ChannelMessage {msg:Message::Backend {component,detail},..}) => {
                         if component.starts_with("bluetooth-") {
+                            if component == "bluetooth-listener" { scanner_paused = false; }
                             bluetooth_errors.insert(component, detail);
                             let snapshot = lan_state.borrow().clone();
-                            events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors))).await.ok();
+                            events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors, scanner_paused))).await.ok();
                         } else {
                             events.send(BackendEvent::StateChanged(BackendState { id: "quickshare".into(), state: "error".into(), detail: format!("Quick Share {component} stopped: {detail}. Restart the backend from Settings.") })).await.ok();
                             break;
@@ -285,6 +301,7 @@ fn network_status(
     bluetooth: &Result<String>,
     ble_enabled: bool,
     failures: &std::collections::BTreeMap<String, String>,
+    scanner_paused: bool,
 ) -> BackendState {
     let lan_ready = lan.available();
     let ble_ready = ble_enabled && bluetooth.is_ok() && failures.is_empty();
@@ -300,7 +317,10 @@ fn network_status(
         Ok(name) if ble_enabled && failures.is_empty() => detail.push_str(&format!("; Bluetooth discovery on {name}")),
         Ok(name) if ble_enabled => detail.push_str(&format!("; Bluetooth controller {name}")),
         Ok(_) => detail.push_str("; Bluetooth discovery disabled in settings"),
-        Err(error) => detail.push_str(&format!("; Bluetooth unavailable: {error}. Enable a BlueZ controller and restart LinuxDrop to use Bluetooth discovery")),
+        Err(error) => detail.push_str(&format!("; Bluetooth unavailable: {error}. The scanner retries automatically when the selected controller is available")),
+    }
+    if scanner_paused && ble_enabled {
+        detail.push_str("; Bluetooth scanner paused while the radio is in use");
     }
     for (component, reason) in failures {
         detail.push_str(&format!("; {component} unavailable: {reason}"));
@@ -494,7 +514,7 @@ mod tests {
         let mut failures = std::collections::BTreeMap::new();
         failures.insert("bluetooth-gatt".into(), "No advertisement slots".into());
         assert_eq!(
-            super::network_status(&lan, &bluetooth, true, &failures).state,
+            super::network_status(&lan, &bluetooth, true, &failures, false).state,
             "error"
         );
         lan.interfaces.push(linuxdrop_network::InterfaceAddress {
@@ -504,14 +524,18 @@ mod tests {
             index: 1,
             loopback: false,
         });
-        let recovered = super::network_status(&lan, &bluetooth, true, &failures);
+        let recovered = super::network_status(&lan, &bluetooth, true, &failures, false);
         assert_eq!(recovered.state, "ready");
         assert!(recovered.detail.contains("LAN active"));
         assert!(recovered.detail.contains("No advertisement slots"));
         assert!(!recovered.detail.contains("Bluetooth discovery on"));
+        let paused = super::network_status(&lan, &bluetooth, true, &failures, true);
+        assert!(paused.detail.contains("scanner paused"));
+        assert!(paused.detail.contains("No advertisement slots"));
         lan.interfaces.clear();
         assert_eq!(
-            super::network_status(&lan, &Ok(String::new()), false, &Default::default()).state,
+            super::network_status(&lan, &Ok(String::new()), false, &Default::default(), false)
+                .state,
             "unavailable"
         );
     }

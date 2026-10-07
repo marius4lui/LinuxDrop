@@ -16,6 +16,20 @@ pub struct State {
     pub fail_stop: AtomicBool,
     pub wake: Notify,
 }
+impl State {
+    pub fn set_power(&self, powered: bool) {
+        self.powered.store(powered, Ordering::SeqCst);
+        if !powered {
+            self.active.store(false, Ordering::SeqCst);
+        }
+    }
+}
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.bluez.Error")]
+pub enum Error {
+    Failed(String),
+    NotReady(String),
+}
 pub struct Scanner(pub Arc<State>);
 #[zbus::interface(name = "org.bluez.Adapter1")]
 impl Scanner {
@@ -62,7 +76,7 @@ impl Scanner {
         }
         Ok(())
     }
-    async fn stop_discovery(&self) -> zbus::fdo::Result<()> {
+    async fn stop_discovery(&self) -> Result<(), Error> {
         self.0.stops.fetch_add(1, Ordering::SeqCst);
         loop {
             let wake = self.0.wake.notified();
@@ -72,7 +86,10 @@ impl Scanner {
             wake.await;
         }
         if self.0.fail_stop.load(Ordering::SeqCst) {
-            return Err(zbus::fdo::Error::Failed("Stop was refused".into()));
+            return Err(Error::Failed("Stop was refused".into()));
+        }
+        if !self.0.powered.load(Ordering::SeqCst) {
+            return Err(Error::NotReady("Controller is off".into()));
         }
         self.0.active.store(false, Ordering::SeqCst);
         Ok(())

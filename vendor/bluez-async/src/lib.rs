@@ -445,6 +445,38 @@ impl BluetoothSession {
                 .method_call("org.freedesktop.DBus", "NameHasOwner", (&self.owner,))
                 .await?;
             if alive {
+                // BlueZ clears discovery clients on power-off, then StopDiscovery
+                // returns NotReady. Confirm the state instead of retrying cleanup.
+                if matches!(adapter.powered().await, Ok(false))
+                    && matches!(adapter.discovering().await, Ok(false))
+                {
+                    return Ok(());
+                }
+                if matches!(
+                    error.name(),
+                    Some(
+                        "org.freedesktop.DBus.Error.UnknownObject"
+                            | "org.freedesktop.DBus.Error.UnknownMethod"
+                            | "org.freedesktop.DBus.Error.UnknownInterface"
+                    )
+                ) {
+                    let root = Proxy::new(
+                        self.owner.clone(),
+                        "/",
+                        DBUS_METHOD_CALL_TIMEOUT,
+                        self.connection.clone(),
+                    );
+                    if let Ok(objects) = root.get_managed_objects().await {
+                        if objects
+                            .get(&adapter_id.object_path)
+                            .is_none_or(|interfaces| {
+                                !interfaces.contains_key(ORG_BLUEZ_ADAPTER1_NAME)
+                            })
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
                 return Err(error.into());
             }
         }

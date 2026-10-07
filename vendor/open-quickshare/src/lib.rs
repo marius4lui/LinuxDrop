@@ -236,20 +236,12 @@ impl RQS {
 
         #[cfg(feature = "experimental")]
         if self.ble_enabled {
-            match BleListener::new(self.ble_sender.clone()).await {
-                Ok(ble) => {
-                    let ctk = ctoken.clone();
-                    let status = self.message_sender.clone();
-                    tracker.spawn("bluetooth-listener", async move {
-                        let result = ble.run(ctk).await;
-                        if let Err(error) = &result {
-                            backend_failure(&status, "bluetooth-listener", error);
-                        }
-                        result
-                    });
-                }
-                Err(error) => backend_failure(&self.message_sender, "bluetooth-listener", error),
-            }
+            let sender = self.ble_sender.clone();
+            let status = self.message_sender.clone();
+            let ctk = ctoken.clone();
+            tracker.spawn("bluetooth-listener", async move {
+                BleListener::supervise(sender, status, ctk).await
+            });
         }
 
         // Start MDnsServer in own "task"

@@ -355,6 +355,11 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
     // receipt path. A recoverable scan-start error must not block shutdown;
     // an unacknowledged StopDiscovery must remain visible on every retry.
     selected_scan.powered.store(true, Ordering::SeqCst);
+    // Prevent the outgoing advertiser from intentionally suppressing this scanner.
+    bus.object_server()
+        .remove::<Advertising, _>("/org/bluez/hci1")
+        .await
+        .unwrap();
     let directory = tempfile::tempdir().unwrap();
     for (start_fails, cleanup_fails) in [(true, false), (false, true)] {
         selected_scan.fail_stop.store(false, Ordering::SeqCst);
@@ -371,8 +376,7 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         selected_scan
             .fail_stop
             .store(cleanup_fails, Ordering::SeqCst);
-        let starts = selected_scan.starts.load(Ordering::SeqCst);
-        let (events, _receiver) = tokio::sync::mpsc::channel(128);
+        let (events, mut receiver) = tokio::sync::mpsc::channel(128);
         let commands = linuxdrop_quickshare::start(
             linuxdrop_quickshare::Config {
                 name: "Cleanup receipt test".into(),
@@ -394,7 +398,26 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         )
         .await
         .unwrap();
-        wait_for(|| selected_scan.starts.load(Ordering::SeqCst) > starts).await;
+        // Outbound discovery has its own scanner. Wait for this worker's status,
+        // not an adapter-wide start counter that could belong to discovery.
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let event = receiver.recv().await.expect("Backend state stream closed");
+                if let linuxdrop_core::BackendEvent::StateChanged(state) = event
+                    && (start_fails
+                        && state.detail.contains(
+                            "bluetooth-listener unavailable: Bluetooth scan could not start",
+                        )
+                        || !start_fails
+                            && !state.detail.contains("bluetooth-listener")
+                            && !state.detail.contains("scanner paused"))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
         let result = commands.shutdown().await;
         if cleanup_fails {
             let error = result.unwrap_err();
@@ -496,7 +519,7 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
     replacement.close().await.unwrap();
     let third_state = Arc::new(scanner::State::default());
     third_state.powered.store(true, Ordering::SeqCst);
-    let _third = zbus::connection::Builder::session()
+    let third = zbus::connection::Builder::session()
         .unwrap()
         .name("org.bluez")
         .unwrap()
@@ -518,4 +541,123 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         0,
         "Cleanup after daemon disconnection must not mutate a replacement"
     );
+    // The production supervisor starts offline and recovers without backend restart.
+    third_state.set_power(false);
+    let (alerts, _) = tokio::sync::broadcast::channel(4);
+    let (status, mut messages) = tokio::sync::broadcast::channel(64);
+    let cancel = CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let supervisor = tokio::spawn(async move {
+        rqs_lib::hdl::BleListener::supervise(alerts, status, run_cancel).await
+    });
+    async fn scanner_state(
+        messages: &mut tokio::sync::broadcast::Receiver<rqs_lib::channel::ChannelMessage>,
+        ready: Option<bool>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                match messages.recv().await.unwrap().msg {
+                    rqs_lib::channel::Message::BluetoothScannerReady { adapter, paused }
+                        if ready == Some(paused) =>
+                    {
+                        assert_eq!(adapter, "hci1");
+                        return;
+                    }
+                    rqs_lib::channel::Message::Backend { component, .. }
+                        if ready.is_none() && component == "bluetooth-listener" =>
+                    {
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("Scanner recovery state did not arrive");
+    }
+    scanner_state(&mut messages, None).await;
+    assert_eq!(third_state.starts.load(Ordering::SeqCst), 0);
+    let suppression = rqs_lib::hdl::BleScanSuppressor::new();
+    third_state.powered.store(true, Ordering::SeqCst);
+    scanner_state(&mut messages, Some(true)).await;
+    assert_eq!(
+        third_state.starts.load(Ordering::SeqCst),
+        0,
+        "Protected radio airtime must remain paused, not reported as an active scan"
+    );
+    third_state.set_power(false);
+    scanner_state(&mut messages, None).await;
+    drop(suppression);
+    third_state.powered.store(true, Ordering::SeqCst);
+    scanner_state(&mut messages, Some(false)).await;
+    assert!(third_state.active.load(Ordering::SeqCst));
+    third_state.set_power(false);
+    scanner_state(&mut messages, None).await;
+    assert!(!third_state.active.load(Ordering::SeqCst));
+    third_state.powered.store(true, Ordering::SeqCst);
+    scanner_state(&mut messages, Some(false)).await;
+    third
+        .object_server()
+        .remove::<scanner::Scanner, _>("/org/bluez/hci1")
+        .await
+        .unwrap();
+    third_state.active.store(false, Ordering::SeqCst);
+    scanner_state(&mut messages, None).await;
+    third
+        .object_server()
+        .at("/org/bluez/hci1", scanner::Scanner(third_state.clone()))
+        .await
+        .unwrap();
+    scanner_state(&mut messages, Some(false)).await;
+    let fourth_state = Arc::new(scanner::State::default());
+    fourth_state.powered.store(true, Ordering::SeqCst);
+    third.release_name("org.bluez").await.unwrap();
+    let fourth = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.bluez")
+        .unwrap()
+        .serve_at("/", zbus::fdo::ObjectManager)
+        .unwrap()
+        .serve_at("/org/bluez/hci0", scanner::Scanner(first_scan.clone()))
+        .unwrap()
+        .serve_at("/org/bluez/hci1", scanner::Scanner(fourth_state.clone()))
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    scanner_state(&mut messages, None).await;
+    scanner_state(&mut messages, Some(false)).await;
+    assert!(!third_state.active.load(Ordering::SeqCst));
+    assert_eq!(fourth_state.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(first_scan.starts.load(Ordering::SeqCst), 0);
+    assert!(!supervisor.is_finished());
+    // Never retry when cleanup of a still-live controller is unconfirmed.
+    fourth_state.fail_stop.store(true, Ordering::SeqCst);
+    fourth_state.powered.store(false, Ordering::SeqCst);
+    let error = tokio::time::timeout(Duration::from_secs(5), supervisor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("Unconfirmed cleanup"));
+    assert_eq!(fourth_state.starts.load(Ordering::SeqCst), 1);
+    fourth_state.fail_stop.store(false, Ordering::SeqCst);
+    cancel.cancel();
+    // Cancelling during unavailable-controller backoff must return immediately.
+    let (alerts, _) = tokio::sync::broadcast::channel(4);
+    let (status, mut messages) = tokio::sync::broadcast::channel(4);
+    let cancel = CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let waiting = tokio::spawn(async move {
+        rqs_lib::hdl::BleListener::supervise(alerts, status, run_cancel).await
+    });
+    scanner_state(&mut messages, None).await;
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(fourth_state.starts.load(Ordering::SeqCst), 1);
+    drop(fourth);
 }

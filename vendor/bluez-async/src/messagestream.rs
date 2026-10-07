@@ -37,6 +37,12 @@ impl Drop for MessageStream {
     fn drop(&mut self) {
         let connection = self.connection.clone();
         let msg_match = self.msg_match.take().unwrap();
-        tokio::spawn(async move { connection.remove_match(msg_match.token()).await.unwrap() });
+        tokio::spawn(async move {
+            if let Err(error) = connection.remove_match(msg_match.token()).await {
+                if error.name() != Some("org.freedesktop.DBus.Error.MatchRuleNotFound") {
+                    log::warn!("Bluetooth signal subscription cleanup: {error}");
+                }
+            }
+        });
     }
 }

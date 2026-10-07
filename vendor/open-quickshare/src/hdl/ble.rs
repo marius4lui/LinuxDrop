@@ -76,11 +76,15 @@ pub(crate) fn scanning_suppressed() -> bool {
 
 pub struct BleListener {
     adapter: Adapter,
+    controller: linuxdrop_network::bluetooth_lifetime::ControllerMonitor,
     sender: Sender<()>,
 }
 
 impl BleListener {
     pub async fn new(sender: Sender<()>) -> Result<Self, anyhow::Error> {
+        let selected = crate::bluetooth_adapter().await?.name().to_owned();
+        let controller =
+            linuxdrop_network::bluetooth_lifetime::ControllerMonitor::new(&selected).await?;
         let manager = Manager::new().await?;
         let adapters = manager.adapters().await?;
         if adapters.is_empty() {
@@ -89,7 +93,6 @@ impl BleListener {
 
         // Resolve through the same powered-controller policy as advertising,
         // GATT and L2CAP; never silently take the first scanner adapter.
-        let selected = crate::bluetooth_adapter().await?.name().to_owned();
         let mut chosen = None;
         for adapter in adapters {
             let information = adapter.adapter_info().await?;
@@ -109,11 +112,63 @@ impl BleListener {
             adapter: chosen.ok_or_else(|| {
                 anyhow!("Selected Bluetooth controller is unavailable to the scanner")
             })?,
+            controller,
             sender,
         })
     }
 
+    /// Recreate only the scanner; never cancel independent transfer workers.
+    pub async fn supervise(
+        sender: Sender<()>,
+        status: Sender<crate::channel::ChannelMessage>,
+        ctk: CancellationToken,
+    ) -> Result<(), anyhow::Error> {
+        let mut retry = Duration::from_secs(2);
+        loop {
+            let mut ready = false;
+            let created = tokio::select! {
+                _ = ctk.cancelled() => return Ok(()),
+                result = tokio::time::timeout(DBUS_CALL_TIMEOUT, Self::new(sender.clone())) =>
+                    result.context("Bluetooth scanner setup timed out").and_then(|r| r),
+            };
+            let result = match created {
+                Ok(scanner) => {
+                    scanner
+                        .run_reported(ctk.clone(), Some(status.clone()), &mut ready)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                crate::backend_failure(&status, "bluetooth-listener", &error);
+                if crate::lifecycle::cleanup_unconfirmed(&error) {
+                    return Err(error);
+                }
+            }
+            if ctk.is_cancelled() {
+                return Ok(());
+            }
+            if ready {
+                retry = Duration::from_secs(2);
+            }
+            tokio::select! {
+                _ = ctk.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(retry) => {},
+            }
+            retry = (retry * 2).min(Duration::from_secs(15));
+        }
+    }
+
     pub async fn run(self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+        self.run_reported(ctk, None, &mut false).await
+    }
+
+    async fn run_reported(
+        self,
+        ctk: CancellationToken,
+        status: Option<Sender<crate::channel::ChannelMessage>>,
+        made_ready: &mut bool,
+    ) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
 
         let mut events = self.adapter.events().await?;
@@ -130,6 +185,25 @@ impl BleListener {
 
         let mut last_alert: SystemTime = SystemTime::UNIX_EPOCH;
         let mut scanning = false;
+        let mut reported = None;
+        let mut report = |paused: bool| {
+            *made_ready = true;
+            if reported == Some(paused) {
+                return;
+            }
+            reported = Some(paused);
+            if let Some(status) = &status {
+                let _ = status.send(crate::channel::ChannelMessage {
+                    id: "backend".into(),
+                    msg: crate::channel::Message::BluetoothScannerReady {
+                        adapter: self.controller.name().into(),
+                        paused,
+                    },
+                });
+            }
+        };
+        let loss = self.controller.lost();
+        tokio::pin!(loss);
         // Fires immediately, which opens the first scan window.
         let mut phase_deadline = Instant::now();
 
@@ -144,6 +218,7 @@ impl BleListener {
                 phase_deadline
             };
             tokio::select! {
+                error = &mut loss => return Err(error),
                 _ = ctk.cancelled() => {
                     info!("{INNER_NAME}: tracker cancelled, breaking");
                     break;
@@ -160,9 +235,11 @@ impl BleListener {
                         scanning = false;
                         phase_deadline = Instant::now() + SCAN_PAUSE;
                     } else if scanning_suppressed() {
+                        report(true);
                         // Something else needs the radio; skip this window.
                         phase_deadline = Instant::now() + SCAN_PAUSE;
                     } else if self.phone_connected().await {
+                        report(true);
                         // A phone is connected to us -- almost certainly a
                         // Quick Share GATT fetch or transfer in flight. Scan
                         // windows were measured stretching its ATT round-trips
@@ -177,6 +254,7 @@ impl BleListener {
                         tokio::time::timeout(DBUS_CALL_TIMEOUT, self.adapter.start_scan(ScanFilter::default())).await
                             .context("Bluetooth start-scan acknowledgement timed out")?
                             .context("Bluetooth scan could not start")?;
+                        report(false);
                         phase_deadline = Instant::now() + SCAN_WINDOW;
                     }
                 }

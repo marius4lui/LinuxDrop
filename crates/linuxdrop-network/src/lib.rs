@@ -69,6 +69,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 static ADVERTISEMENT_REGISTRATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub mod bluetooth_lifetime;
 
 /// Resolve one powered controller once, then pass its name to every operation.
 pub async fn bluetooth_adapter(requested: Option<&str>) -> Result<bluer::Adapter> {

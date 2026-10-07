@@ -26,6 +26,7 @@ pub enum Message {
     Lib { action: TransferAction },
     Client(MessageClient),
     Backend { component: String, detail: String },
+    BluetoothScannerReady { adapter: String, paused: bool },
 }
 
 impl Message {

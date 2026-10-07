@@ -201,3 +201,11 @@ controllers; cleanup cannot target a replacement. NameHasOwner confirms release
 when the original daemon has disconnected. Owner lookup precedes persistent IO
 worker spawn. Private-bus regressions cover reachable and disconnected old daemons.
 See docs/acceptance/BLUETOOTH_SCANNER_OWNER_2026-10-07.md. No upstream code copied.
+
+2026-10-07 local FastInit scanner recovery: separate supervised generations,
+selected-controller monitoring, bounded backoff, explicit active/paused status,
+and no restart after unconfirmed cleanup. bluez-async verifies power-off or adapter
+absence before treating cleanup as complete and tolerates an already removed
+signal match. Private-bus fixtures exercise real workers through power, removal,
+owner replacement and cancellation. Broader GATT/L2CAP recovery remains separate;
+no new upstream implementation code copied.

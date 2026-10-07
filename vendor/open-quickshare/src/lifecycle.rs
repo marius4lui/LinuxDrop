@@ -21,6 +21,10 @@ pub fn cleanup_failure(error: impl fmt::Display) -> anyhow::Error {
     anyhow::Error::new(CleanupFailure(error.to_string()))
 }
 
+pub fn cleanup_unconfirmed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<CleanupFailure>().is_some()
+}
+
 /// Keep operational errors recoverable, but never hide failed cleanup behind
 /// the earlier error which caused the worker to stop.
 pub fn finish(operation: anyhow::Result<()>, cleanup: anyhow::Result<()>) -> anyhow::Result<()> {
