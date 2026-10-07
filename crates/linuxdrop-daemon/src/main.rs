@@ -1771,23 +1771,7 @@ async fn main() -> Result<()> {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupting =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let helper = shared.clone();
-    let helper_stop = stop.clone();
-    let helper_watch = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                _ = helper_stop.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-            }
-            for (backend, socket) in [
-                ("airdrop", &helper.helper),
-                ("quickshare", &helper.quickshare_helper),
-            ] {
-                helper::poll(&helper, backend, socket).await;
-            }
-        }
-    });
+    let mut helper_watches = helper::watch(shared.clone(), stop.clone());
     let (events, mut event_rx) = mpsc::channel(256);
     let supervisor = shared.clone();
     let event_tx = events.clone();
@@ -1923,13 +1907,10 @@ async fn main() -> Result<()> {
         }
     }
     lifecycle::begin_stop(&shared, &stop).await;
+    helper_watches.extend([hardware_watch, visibility_watch]);
     let cleanup = tokio::time::timeout(
         Duration::from_secs(120),
-        lifecycle::finish(
-            &shared,
-            supervisor,
-            vec![helper_watch, hardware_watch, visibility_watch],
-        ),
+        lifecycle::finish(&shared, supervisor, helper_watches),
     );
     tokio::pin!(cleanup);
     // Backends can publish more than one channel's capacity while draining.

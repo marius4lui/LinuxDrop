@@ -54,6 +54,10 @@ Google's wire schema distinguishes password-based joining from device-name disco
 - [x] ReceiveOptions destination/selection/collision policy.
 - [x] Incoming/outgoing archive bandwidth uses the daemon's shared payload budget; outgoing sockets remain bound to the leased AWDL interface.
 - [ ] Reconnect/channel/hardware-loss integration exercised with helper simulations; no false ready state after lease failure.
+  The real AirDrop listener/discovery worker now has [lease-revocation, socket-loss
+  and interface-reconnect evidence](../acceptance/AIRDROP_HELPER_LIFETIME_2026-10-07.md).
+  AirDrop health checks also run independently of pending Wi-Fi Direct operations.
+  The combined row remains open for actual helper/channel integration.
 
 ## Physical acceptance (software work continues independently)
 

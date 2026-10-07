@@ -30,6 +30,39 @@ impl HelperLease {
     }
 }
 
+/// Each backend owns its health loop. A direct-Wi-Fi operation can hold its
+/// helper socket for minutes and must not postpone AWDL failure detection.
+pub(super) fn watch(
+    shared: Arc<Shared>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    ["airdrop", "quickshare"]
+        .into_iter()
+        .map(|backend| {
+            let shared = shared.clone();
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let socket = match backend {
+                    "airdrop" => &shared.helper,
+                    _ => &shared.quickshare_helper,
+                };
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    // Await a started request completely. Cancelling a framed
+                    // request could leave its reply ahead of the Release reply.
+                    poll(&shared, backend, socket).await;
+                }
+            })
+        })
+        .collect()
+}
+
 pub(super) async fn poll(shared: &Arc<Shared>, backend: &str, socket: &Mutex<Option<HelperLease>>) {
     let mut slot = socket.lock().await;
     let Some(lease) = slot.as_mut() else {
@@ -389,6 +422,148 @@ pub(crate) mod tests {
                 state.detail.contains("restoration test failure"),
                 cleanup_failure
             );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the private network namespace in run-awdl-lifecycle.sh"]
+    async fn actual_airdrop_actor_retires_after_helper_loss_and_reopens_on_reconnect() {
+        assert_eq!(
+            std::env::var("LINUXDROP_TEST_PRIVATE_AWDL").as_deref(),
+            Ok("1")
+        );
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap(),
+        );
+        async fn ip(args: &[&str]) {
+            let output = tokio::process::Command::new("ip")
+                .args(args)
+                .kill_on_drop(true)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        ip(&["link", "set", "lo", "up"]).await;
+        let fixture = Fixture::new();
+        let shared = &fixture.0;
+        let config = || linuxdrop_airdrop::Config {
+            name: "AWDL lifecycle fixture".into(),
+            download_dir: shared.data_dir.clone(),
+            interface: "ldawdltest".into(),
+            visible: false,
+            ble_wake: false,
+            max_receive_bytes: 1024 * 1024,
+            max_files: 4,
+            policy: Default::default(),
+        };
+        // The first generation sees explicit lease revocation, the replacement
+        // sees helper socket EOF. Both use the actual AirDrop listener, discovery
+        // worker and shutdown receipt, not a stand-in backend actor.
+        for generation in 1..=2 {
+            ip(&["link", "add", "ldawdltest", "type", "dummy"]).await;
+            ip(&["link", "set", "dev", "ldawdltest", "addrgenmode", "none"]).await;
+            ip(&["link", "set", "ldawdltest", "up"]).await;
+            ip(&[
+                "-6",
+                "addr",
+                "add",
+                "fd42:77::1/64",
+                "dev",
+                "ldawdltest",
+                "nodad",
+            ])
+            .await;
+            shared
+                .backend_generation
+                .store(generation, Ordering::Release);
+            shared.data.lock().await.failed_backends.clear();
+            let (events, mut incoming) = mpsc::channel(64);
+            let commands = linuxdrop_airdrop::start(config(), events.clone())
+                .await
+                .unwrap();
+            install_backend(shared, "airdrop", Ok(commands.clone())).await;
+            let ready = tokio::time::timeout(Duration::from_secs(3), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(&ready, BackendEvent::StateChanged(state) if state.state == "ready"));
+            handle_event(shared, generation, ready.clone()).await;
+            assert_eq!(shared.data.lock().await.backends["airdrop"].state, "ready");
+            drop(
+                tokio::net::TcpStream::connect("[fd42:77::1]:8771")
+                    .await
+                    .unwrap(),
+            );
+            let mut expected = lease();
+            expected.awdl_interface = Some("ldawdltest".into());
+            let mut replies = vec![vec![expected.clone()]];
+            if generation == 1 {
+                replies.push(vec![]);
+            }
+            *shared.helper.lock().await =
+                Some(HelperLease::new(status_client(replies), expected, shared));
+            poll(shared, "airdrop", &shared.helper).await;
+            assert!(shared.data.lock().await.commands.contains_key("airdrop"));
+            ip(&["link", "del", "ldawdltest"]).await;
+            poll(shared, "airdrop", &shared.helper).await;
+            tokio::time::timeout(Duration::from_secs(8), commands.shutdown())
+                .await
+                .unwrap()
+                .unwrap();
+            handle_event(shared, generation, ready).await;
+            while let Ok(event) = incoming.try_recv() {
+                handle_event(shared, generation, event).await;
+            }
+            assert_eq!(shared.data.lock().await.backends["airdrop"].state, "error");
+            assert!(!shared.data.lock().await.commands.contains_key("airdrop"));
+            assert!(linuxdrop_airdrop::start(config(), events).await.is_err());
+            shared.data.lock().await.retiring.remove("airdrop");
+        }
+    }
+
+    #[tokio::test]
+    async fn awdl_loss_is_detected_while_direct_wifi_owns_its_socket() {
+        let fixture = Fixture::new();
+        let shared = &fixture.0;
+        *shared.helper.lock().await = Some(HelperLease::new(
+            status_client(vec![vec![lease()], vec![]]),
+            lease(),
+            shared,
+        ));
+        let (commands, entering, release) = actor();
+        shared
+            .data
+            .lock()
+            .await
+            .commands
+            .insert("airdrop".into(), commands.clone());
+        // Model an in-flight P2P negotiation without releasing its socket. The
+        // first AWDL status is healthy; the next must still observe its loss.
+        let direct_operation = shared.quickshare_helper.lock().await;
+        let stop = tokio_util::sync::CancellationToken::new();
+        let watches = watch(shared.clone(), stop.clone());
+        tokio::time::timeout(Duration::from_secs(8), entering)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(shared.data.lock().await.backends["airdrop"].state, "error");
+        assert!(shared.helper.lock().await.is_none());
+        assert!(!watches[1].is_finished());
+        stop.cancel();
+        drop(direct_operation);
+        release.send(()).unwrap();
+        commands.shutdown().await.unwrap();
+        for worker in watches {
+            tokio::time::timeout(Duration::from_secs(1), worker)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 

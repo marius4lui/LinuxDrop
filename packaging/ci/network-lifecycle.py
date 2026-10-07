@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
     subprocess.run([
         "cargo", "test", "--locked", "--no-run", "--message-format=json",
-        "-p", "linuxdrop-netd", "-p", "linuxdrop-quickshare", "-p", "rqs_lib",
+        "-p", "linuxdrop-netd", "-p", "linuxdrop-quickshare", "-p", "rqs_lib", "-p", "linuxdrop-daemon",
     ], cwd=ROOT, stdout=output, check=True)
     output.seek(0)
     binaries = {}
@@ -24,6 +24,7 @@ with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
         binaries[(target["name"], tuple(target["kind"]))] = artifact["executable"]
 
 cases = [
+    ("crates/linuxdrop-daemon/tests/run-awdl-lifecycle.sh", ("linuxdropd", ("bin",))),
     ("crates/linuxdrop-netd/tests/run-p2p-addresses.sh", ("linuxdrop-netd", ("bin",))),
     ("crates/linuxdrop-netd/tests/run-p2p-host-network.sh", ("linuxdrop-netd", ("bin",))),
     ("crates/linuxdrop-quickshare/tests/run-lan-lifecycle.sh", ("lan_lifecycle", ("test",))),
