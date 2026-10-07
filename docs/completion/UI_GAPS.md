@@ -121,7 +121,9 @@ items above. No live demo restart was performed.
 library paths are corrected. Native 46/50 scenarios now include installed GTK
 drop-window launch, measured centering after natural sizing, live spacing,
 close/reopen and snapshots. See [Shell 50 acceptance](../acceptance/SHELL_50_2026-10-07.md).
-Remaining observed accessibility work: fixed-pixel GTK custom labels scale
-differently from native buttons in the 150% drop-surface capture; normalize
-font scaling and verify compact layouts. Actual external drag payload on 50
-and the remaining Shell-version matrix are not asserted by the launch test.
+The subsequent [GTK text scaling pass](../acceptance/GTK_FONT_SCALING_2026-10-07.md)
+replaced fixed-pixel custom fonts and fixed the horizontal overflow exposed by
+150% desktop text at compact width. Native send/settings/hardware/drop/incoming
+renders and regression assertions pass. Actual external drag payload on 50,
+screen-reader speech, fractional/multi-monitor acceptance and the remaining
+Shell-version matrix are not asserted by these tests.

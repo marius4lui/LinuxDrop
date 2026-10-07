@@ -218,10 +218,12 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     icon.set_pixel_size(28);
     icon.set_halign(gtk::Align::Center);
     icon.add_css_class("drop-icon");
-    drop.append(&icon);
+    let drop_heading = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    drop_heading.append(&icon);
     let title = label("Drop files here", "drop-title");
     title.set_hexpand(true);
-    drop.append(&title);
+    drop_heading.append(&title);
+    drop.append(&drop_heading);
     let choose = gtk::Button::with_label(&tr("Choose files"));
     choose.add_css_class("pill");
     choose.set_halign(gtk::Align::Center);
@@ -268,6 +270,23 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     send.add_css_class("pill");
     send.set_sensitive(false);
     actions.append(&send);
+    // Scale-aware breakpoints follow desktop text size. Keep every action
+    // reachable instead of forcing a wider viewport at large accessibility text.
+    let compact_actions = adw::Breakpoint::new(
+        adw::BreakpointCondition::parse("max-width: 440sp").expect("Static breakpoint"),
+    );
+    compact_actions.add_setter(
+        &drop,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    compact_actions.add_setter(&choose, "halign", Some(&gtk::Align::Fill.to_value()));
+    compact_actions.add_setter(
+        &actions,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    window.add_breakpoint(compact_actions);
     send_bar.append(&actions);
     let share_link = gtk::Button::with_label(&tr("Share with a link"));
     share_link.add_css_class("flat");
@@ -372,7 +391,7 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         file_box,
         file_scroll,
         drop_zone: drop.clone(),
-        drop_details: vec![icon.upcast(), title.upcast()],
+        drop_details: vec![drop_heading.upcast()],
         choose_button: choose.clone(),
         files: RefCell::new(Vec::new()),
         file_checks: RefCell::new(HashMap::new()),

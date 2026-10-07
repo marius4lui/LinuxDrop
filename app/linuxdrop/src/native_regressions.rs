@@ -24,23 +24,56 @@ async fn settle() {
 }
 
 fn capture(ui: &Ui, name: &str) {
+    capture_window(&ui.window, name);
+}
+
+fn capture_window(window: &impl IsA<gtk::Window>, name: &str) {
+    let window = window.as_ref();
     let Some(directory) = std::env::var_os("LINUXDROP_TEST_CAPTURES") else {
         return;
     };
-    let paintable = gtk::WidgetPaintable::new(Some(&ui.window));
+    let paintable = gtk::WidgetPaintable::new(Some(window));
     let snapshot = gtk::Snapshot::new();
     paintable.snapshot(
         &snapshot,
-        f64::from(ui.window.width()),
-        f64::from(ui.window.height()),
+        f64::from(window.width()),
+        f64::from(window.height()),
     );
     let node = snapshot.to_node().expect("mapped window render node");
-    let renderer = ui.window.renderer().expect("native window renderer");
+    let renderer = window.renderer().expect("native window renderer");
     let texture = renderer.render_texture(&node, None);
     std::fs::create_dir_all(&directory).unwrap();
     texture
         .save_to_png(std::path::Path::new(&directory).join(name))
         .unwrap();
+}
+
+fn custom_type_samples(root: &impl IsA<gtk::Widget>) -> Vec<(gtk::Widget, i32)> {
+    let root = root.as_ref();
+    let mut samples = Vec::new();
+    if root.is::<gtk::Label>()
+        && root.css_classes().iter().any(|class| {
+            matches!(
+                class.as_str(),
+                "drop-title"
+                    | "compact-note"
+                    | "section-heading"
+                    | "status-chip"
+                    | "protocol-badge"
+            )
+        })
+    {
+        samples.push((
+            root.clone(),
+            root.create_pango_layout(Some("Ag")).pixel_size().1,
+        ));
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        samples.extend(custom_type_samples(&widget));
+        child = widget.next_sibling();
+    }
+    samples
 }
 
 #[test]
@@ -247,6 +280,41 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             ui.peers.compute_bounds(&ui.window).unwrap().y() < 480.0,
             "Nearby must be visible before the bottom actions at 480x600"
         );
+        // Exercise the real desktop DPI path; fixed-pixel application fonts
+        // must not stay small while native controls grow with accessibility text.
+        let gtk_settings = gtk::Settings::default().unwrap();
+        let original_dpi: i32 = gtk_settings.property("gtk-xft-dpi");
+        gtk_settings.set_property("gtk-xft-dpi", 96 * 1024);
+        settle().await;
+        let samples = custom_type_samples(&ui.window);
+        assert!(samples.len() >= 3, "Sample real custom text from the send view");
+        gtk_settings.set_property("gtk-xft-dpi", 144 * 1024);
+        settle().await;
+        for (widget, normal_height) in samples {
+            let large_height = widget.create_pango_layout(Some("Ag")).pixel_size().1;
+            assert!(large_height * 10 >= normal_height * 13,
+                "Custom text must follow 150% desktop scaling: {:?}: {normal_height} -> {large_height}", widget.css_classes());
+        }
+        assert!(ui.window.width() <= 480, "Large text must retain the compact window width");
+        assert!(ui.toasts.measure(gtk::Orientation::Horizontal, -1).0 <= ui.window.width(),
+            "Large text must not force content outside the compact viewport");
+        capture(&ui, "send-compact-large-text.png");
+        ui.stack.set_visible_child_name("settings");
+        settle().await;
+        capture(&ui, "settings-compact-large-text.png");
+        ui.stack.set_visible_child_name("hardware");
+        settle().await;
+        capture(&ui, "hardware-compact-large-text.png");
+        ui.notch_drop();
+        settle().await;
+        let drop_window = app.windows().into_iter().find(|window| window.title().as_deref() == Some("LinuxDrop Drop Surface")).unwrap();
+        assert!(drop_window.width() <= 480 && drop_window.height() <= 500,
+            "The large-text drop surface must fit a compact desktop");
+        capture_window(&drop_window, "drop-surface-large-text.png");
+        drop_window.close();
+        gtk_settings.set_property("gtk-xft-dpi", original_dpi);
+        ui.stack.set_visible_child_name("send");
+        settle().await;
         *ui.selected.borrow_mut() = Some("pixel".into());
         ui.render_peers();
         ui.protocol.set_selected(2);
@@ -561,6 +629,13 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         find(&dialog,"incoming-file-1").unwrap().downcast::<gtk::CheckButton>().unwrap().set_active(false);
         glib::timeout_future(Duration::from_millis(400)).await;
         capture(&ui,"incoming-verification-review.png");
+        gtk_settings.set_property("gtk-xft-dpi", 144 * 1024);
+        settle().await;
+        capture(&ui, "incoming-compact-large-text.png");
+        assert!(ui.toasts.measure(gtk::Orientation::Horizontal, -1).0 <= ui.window.width(),
+            "Incoming review must remain within the large-text compact viewport");
+        gtk_settings.set_property("gtk-xft-dpi", original_dpi);
+        settle().await;
         assert_eq!(dialog.response_label("accept"),tr("Codes match — accept"));
         find(&dialog,"incoming-collision").unwrap().downcast::<adw::ComboRow>().unwrap().set_selected(1);
         fail_next_accept.set(true);
