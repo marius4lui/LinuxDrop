@@ -31,7 +31,11 @@ Remaining code/evidence requirements:
 - Startup now listens while journaled leases recover through receipts. A real
   helper process in private mount/network namespaces passes old-boot cleanup,
   retained ownership failure across restart, normal shutdown, and malformed or
-  unreadable journal rejection. Booted systemd/polkit lifecycle remains separate.
+  unreadable journal rejection. A separate booted Ubuntu/systemd installation
+  now passes real unit identity/capabilities, restart/stop/start, malformed journal
+  recovery and inactive-user denial; see
+  [installed service evidence](../acceptance/BOOTED_UBUNTU_SERVICE_2026-10-07.md).
+  Interactive Polkit/session matrix and booted package upgrade/removal remain open.
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.
