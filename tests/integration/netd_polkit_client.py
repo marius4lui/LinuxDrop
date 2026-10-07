@@ -6,19 +6,52 @@ import select
 import socket
 import subprocess
 import sys
+import shlex
+from pathlib import Path
 
 agent = None
+daemon_mode = '--daemon' in sys.argv
+daemon_started = False
+settings_path = Path.home() / '.config/linuxdrop/settings.json'
+original_settings = None
+settings_existed = False
 try:
-    session = os.environ.get('XDG_SESSION_ID')
+    # Resolve the calling PID through real logind rather than trusting its env.
+    session_path = shlex.split(subprocess.check_output(['busctl', 'call',
+        'org.freedesktop.login1', '/org/freedesktop/login1', 'org.freedesktop.login1.Manager',
+        'GetSessionByPID', 'u', str(os.getpid())], text=True))[1]
+    session = shlex.split(subprocess.check_output(['busctl', 'get-property',
+        'org.freedesktop.login1', session_path, 'org.freedesktop.login1.Session', 'Id'], text=True))[1]
     metadata = subprocess.check_output(['loginctl', 'show-session', session,
-        '-p', 'Active', '-p', 'Remote', '-p', 'Seat', '-p', 'VTNr', '-p', 'Leader'], text=True)
+        '-p', 'Active', '-p', 'Remote', '-p', 'Seat', '-p', 'VTNr', '-p', 'Leader', '-p', 'User'], text=True)
     details = dict(line.split('=', 1) for line in metadata.splitlines())
-    assert details['Leader'] == str(os.getpid()), 'Client must lead its actual PAM session'
+    assert details['User'] == str(os.getuid()), 'Client must belong to its actual PAM session'
     print('LINUXDROP_AUTH_SESSION:' + json.dumps(details), flush=True)
+    if '--hold' in sys.argv:
+        input()
+        sys.exit(0)
     subprocess.run(['pkcheck', '--revoke-temp'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    subject_pid = os.getpid()
+    if daemon_mode:
+        active = subprocess.run(['systemctl', '--user', 'is-active', 'linuxdropd.service'], capture_output=True, text=True)
+        assert active.stdout.strip() != 'active', 'Do not replace an existing user daemon'
+        settings_existed = settings_path.exists()
+        if settings_existed:
+            original_settings = settings_path.read_bytes()
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(json.dumps({
+            'localsend': {'enabled': False}, 'quickshare': {'enabled': False},
+            'airdrop': {'enabled': False}, 'hardware': {'auto_use_usb': False}}))
+        daemon_started = True
+        subprocess.run(['systemctl', '--user', 'start', 'linuxdropd.service'], check=True, capture_output=True, timeout=15)
+        subject_pid = int(subprocess.check_output(['systemctl', '--user', 'show', 'linuxdropd.service', '--property=MainPID', '--value'], text=True))
+        assert subject_pid > 0 and subject_pid != os.getpid()
+        cgroup = Path(f'/proc/{subject_pid}/cgroup').read_text()
+        assert 'user@' in cgroup and 'linuxdropd.service' in cgroup and 'session-' not in cgroup, 'Daemon must run as a real user service'
+        assert Path(f'/proc/{subject_pid}').stat().st_uid == os.getuid()
     if '--agent' in sys.argv:
         read_fd, write_fd = os.pipe()
-        agent = subprocess.Popen(['pkttyagent', '--process', str(os.getpid()), '--notify-fd', str(write_fd)], pass_fds=(write_fd,))
+        agent = subprocess.Popen(['pkttyagent', '--process', str(subject_pid), '--notify-fd', str(write_fd)], pass_fds=(write_fd,))
         os.close(write_fd)
         if not select.select([read_fd], [], [], 10)[0]:
             raise RuntimeError('Agent registration timed out')
@@ -27,22 +60,44 @@ try:
         if agent.poll() is not None:
             raise RuntimeError('Agent could not register')
     print('LINUXDROP_AUTH_CLIENT_READY', flush=True)
-    with socket.socket(socket.AF_UNIX) as client:
-        client.settimeout(65)
-        client.connect('/run/linuxdrop/netd.sock')
-        client.sendall(b'{"operation":"reserve","radio_id":"acceptance-no-radio"}\n')
-        response = bytearray()
-        while not response.endswith(b'\n'):
-            chunk = client.recv(4096)
-            if not chunk:
-                raise RuntimeError('Helper closed before authorization result')
-            response.extend(chunk)
-            if len(response) > 65536:
-                raise RuntimeError('Oversized helper response')
-    print('LINUXDROP_AUTH_RESULT:' + json.dumps(json.loads(response)), flush=True)
+    if daemon_mode:
+        called = subprocess.run(['busctl', '--user', '--timeout=90', 'call',
+            'io.github.marius4lui.LinuxDrop', '/io/github/marius4lui/LinuxDrop',
+            'io.github.marius4lui.LinuxDrop.Manager1', 'RunHardwareDiagnostic', 'sq',
+            'acceptance-no-radio', '6'], capture_output=True, text=True, timeout=95)
+        if called.returncode != 0:
+            result = {'status': 'error', 'message': called.stderr.strip()}
+        else:
+            signature, payload = shlex.split(called.stdout)
+            assert signature == 's'
+            report = json.loads(payload)
+            assert report['radio_id'] == 'acceptance-no-radio' and report['transmitted_frames'] == 0
+            assert report['restored'] and len(report['steps']) == 1
+            result = {'status': 'error', 'message': report['steps'][0]['detail'], 'via_user_service': True}
+    else:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(65)
+            client.connect('/run/linuxdrop/netd.sock')
+            client.sendall(b'{"operation":"reserve","radio_id":"acceptance-no-radio"}\n')
+            response = bytearray()
+            while not response.endswith(b'\n'):
+                chunk = client.recv(4096)
+                if not chunk:
+                    raise RuntimeError('Helper closed before authorization result')
+                response.extend(chunk)
+                if len(response) > 65536:
+                    raise RuntimeError('Oversized helper response')
+        result = json.loads(response)
+    print('LINUXDROP_AUTH_RESULT:' + json.dumps(result), flush=True)
 finally:
     if agent is not None:
         agent.terminate()
         try: agent.wait(timeout=2)
         except subprocess.TimeoutExpired:
             agent.kill(); agent.wait()
+    if daemon_started:
+        subprocess.run(['systemctl', '--user', 'stop', 'linuxdropd.service'], check=False, capture_output=True, timeout=20)
+        if settings_existed:
+            settings_path.write_bytes(original_settings)
+        else:
+            settings_path.unlink(missing_ok=True)

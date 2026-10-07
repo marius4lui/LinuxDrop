@@ -9,7 +9,9 @@ from pathlib import Path
 import pwd
 import re
 import secrets
+import shlex
 import subprocess
+import tempfile
 import pexpect
 
 marker = Path('/etc/linuxdrop-disposable-acceptance')
@@ -25,7 +27,14 @@ try:
     pwd.getpwnam(username)
 except KeyError:
     subprocess.run(['useradd', '-m', '-G', 'sudo', '-s', '/bin/bash', username], check=True, capture_output=True)
-client_path = str(Path(__file__).with_name('netd_polkit_client.py').resolve())
+# The dedicated user cannot necessarily traverse a CI runner's checkout/home.
+# Copy only this non-secret probe into a root-owned readable temporary directory.
+probe_dir = tempfile.TemporaryDirectory(prefix='linuxdrop-auth-')
+os.chmod(probe_dir.name, 0o755)
+client_file = Path(probe_dir.name) / 'client.py'
+client_file.write_bytes(Path(__file__).with_name('netd_polkit_client.py').read_bytes())
+client_file.chmod(0o644)
+client_path = str(client_file)
 checks = []
 active_console = Path('/sys/class/tty/tty0/active').read_text().strip()
 console_match = re.fullmatch(r'tty(\d+)', active_console)
@@ -36,18 +45,30 @@ inactive_vt = 2 if active_vt != 2 else 3
 password = secrets.token_hex(16)
 subprocess.run(['chpasswd'], input=username+':'+password+'\n', text=True, check=True, capture_output=True)
 
-def scenario(name, seat, vt, agent, wrong=False):
+def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False):
     unit = 'linuxdrop-polkit-' + name + '-' + str(os.getpid())
-    args = ['--unit='+unit, '--quiet', '--collect', '--wait', '--pty', '--uid='+username,
-        '--property=PAMName=login', '--setenv=LC_ALL=C']
+    args = ['--unit='+unit, '--quiet', '--collect', '--wait', '--pty', '--setenv=LC_ALL=C']
+    if not remote:
+        args.extend(['--uid='+username, '--property=PAMName=login'])
     if seat:
         args.extend(['--setenv=XDG_SEAT='+seat, '--setenv=XDG_VTNR='+str(vt)])
-    args.extend(['/usr/bin/python3', '-u', client_path])
+    if daemon:
+        # Real logind graphical-session metadata enables Polkit's documented
+        # user-service-to-display-session association; no GUI is simulated.
+        args.append('--setenv=XDG_SESSION_TYPE=wayland')
+    client_args = ['/usr/bin/python3', '-u', client_path]
+    if daemon:
+        client_args.append('--daemon')
     if agent:
-        args.append('--agent')
+        client_args.append('--agent')
+    args.extend(['/bin/login', '-f', '-h', '127.0.0.1', username] if remote else client_args)
     child = pexpect.spawn('systemd-run', args, encoding='utf-8', timeout=70, echo=False)
     prompts, session, result = 0, None, None
     try:
+        if remote:
+            if child.expect([r'[$#] ', pexpect.EOF, pexpect.TIMEOUT]) != 0:
+                raise RuntimeError('Remote PAM login did not start')
+            child.sendline('exec ' + shlex.join(client_args))
         while True:
             event = child.expect([r'LINUXDROP_AUTH_SESSION:([^\r\n]+)',
                 r'Choose identity to authenticate as[^:]*:', r'Password:',
@@ -69,14 +90,20 @@ def scenario(name, seat, vt, agent, wrong=False):
                 result = json.loads(child.match.group(1))
                 break
             else:
-                raise RuntimeError('Authentication probe ended without a result; terminal contents suppressed')
+                # Session metadata and systemd states are safe; never expose PTY
+                # buffers, which can contain entered authentication credentials.
+                state = subprocess.check_output(['systemctl', 'show', unit+'.service',
+                    '-p', 'ActiveState', '-p', 'SubState', '-p', 'Result', '-p', 'ExecMainStatus'], text=True)
+                raise RuntimeError(f'{name}: probe ended without result; session={session}, prompts={prompts}; {state}')
         if child.expect([pexpect.EOF, pexpect.TIMEOUT]) != 0:
             raise RuntimeError('Authentication client did not terminate')
         child.close()
         assert child.exitstatus == 0, 'Authentication client failed'
-        assert session is not None and session['Remote'] == 'no', 'Missing real PAM/logind session'
+        assert session is not None and session['Remote'] == ('yes' if remote else 'no'), 'Missing real PAM/logind session'
         assert result['status'] == 'error', 'Nonexistent test radio must not create a lease'
         assert 'Only trusted callers' not in result['message'], 'Mechanism is not the Polkit action owner'
+        if daemon and result['message'] == 'radio not found':
+            assert result.get('via_user_service') is True
         return prompts, session, result['message']
     finally:
         if child.isalive():
@@ -100,7 +127,30 @@ try:
     assert session['Active'] == 'yes' and session['Seat'] == 'seat0' and prompts > 0
     assert message == 'radio not found', 'Successful authentication did not reach the permitted operation'
     checks.append('correct administrator authentication reaches radio selection through the non-root installed helper')
+    prompts, session, message = scenario('user-service', 'seat0', active_vt, True, daemon=True)
+    assert prompts > 0 and message == 'radio not found', 'Installed user-service authorization failed'
+    checks.append('installed linuxdropd user service passes D-Bus diagnostic through real Polkit authentication')
+    prompts, session, message = scenario('remote', None, 0, True, remote=True)
+    assert prompts == 0 and 'local desktop session' in message.lower()
+    checks.append('real remote PAM login rejected before authentication')
+    hold_unit = 'linuxdrop-polkit-local-hold-' + str(os.getpid())
+    hold = pexpect.spawn('systemd-run', ['--unit='+hold_unit, '--quiet', '--collect', '--wait', '--pty',
+        '--uid='+username, '--property=PAMName=login', '--setenv=LC_ALL=C',
+        '--setenv=XDG_SEAT=seat0', '--setenv=XDG_VTNR='+str(active_vt),
+        '/usr/bin/python3', '-u', client_path, '--hold'], encoding='utf-8', timeout=20, echo=False)
+    try:
+        hold.expect(r'LINUXDROP_AUTH_SESSION:([^\r\n]+)')
+        local = json.loads(hold.match.group(1))
+        assert local['Active'] == 'yes' and local['Remote'] == 'no' and local['Seat'] == 'seat0'
+        prompts, session, message = scenario('remote-with-local', None, 0, True, remote=True)
+        assert prompts == 0 and message != 'radio not found'
+        checks.append('remote caller cannot borrow an active local session of the same user')
+    finally:
+        subprocess.run(['systemctl', 'stop', hold_unit+'.service'], capture_output=True, check=False)
+        if hold.isalive():
+            hold.terminate(force=True)
     print(json.dumps({'status': 'passed', 'checks': checks,
-        'open': ['graphical authentication agent and actual user-service invocation', 'remote session matrix', 'physical adapter mutation']}, indent=2))
+        'open': ['graphical authentication agent/rendered dialog', 'physical adapter mutation']}, indent=2))
 finally:
     subprocess.run(['passwd', '-l', username], check=True, capture_output=True)
+    probe_dir.cleanup()

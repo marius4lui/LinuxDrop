@@ -38,7 +38,31 @@ After adding it, a seatless session correctly remained denied; a real seat-bound
 session produced the expected password challenge. This distinction is preserved
 in the assertions, not bypassed by a permissive test rule.
 
-The probes are added to the Linux CI installed-package phase with python3-pexpect;
-remote execution is pending. Graphical authentication-agent behavior, actual
-user-service invocation, remote-session combinations and physical adapter
-mutation remain separate acceptance work.
+The extended matrix also passes against installed package `.35` on booted
+Ubuntu, without changing its policy or binaries:
+
+- The actual `linuxdropd.service` runs in the user's systemd manager, outside
+  the login session cgroup. A D-Bus `RunHardwareDiagnostic` call triggers real
+  administrator authentication for that daemon PID and reaches radio selection.
+  All transport backends are disabled for this test account; its settings are
+  restored and the service stopped afterwards. The PAM session carries real
+  logind graphical-session metadata; this does not test a rendered GUI agent.
+- A root-created `/bin/login -h` PAM session is verified as remote by logind
+  and denied without a password prompt.
+- With an independently verified active local session for the same UID held
+  open, the remote caller is still denied by Polkit without a prompt. It cannot
+  borrow the local session's authority.
+
+The first remote CI run (`37646105711`) passed build, Clippy, tests, fuzzing,
+dependency policy and the installed systemd probe, but failed to obtain a result
+from the first Polkit client. The test now copies its non-secret client to a
+root-owned readable temporary directory, removing dependency on runner-home
+permissions, and reports safe unit/session state on failure. Raw terminal buffers
+remain suppressed. Package CI installs required dependencies without optional
+desktop recommendations, avoiding an unrelated display-manager installation
+during this test. A fresh remote CI result is still required; the initial failure
+is not counted as a pass.
+
+Graphical authentication-agent behavior and physical adapter mutation remain
+separate acceptance work. These probes use real services and authorization but
+an intentionally nonexistent radio, so they do not establish hardware support.

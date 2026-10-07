@@ -54,7 +54,7 @@ jobs:
           dbus-run-session -- python3 tests/integration/daemon_shutdown.py target/release/linuxdropd
       - name: Package smoke test
         run: |
-          sudo apt-get install -y ./dist/linuxdrop_*.deb
+          sudo apt-get install -y --no-install-recommends ./dist/linuxdrop_*.deb
           dpkg-query -W linuxdrop
           test -x /usr/bin/linuxdrop
           test -x /usr/bin/linuxdropd

@@ -38,8 +38,10 @@ Remaining code/evidence requirements:
   Real terminal-agent Polkit authorization now passes active/inactive/seatless,
   no-agent and wrong/correct password cases after fixing the mechanism action-owner
   annotation; see [authorization evidence](../acceptance/POLKIT_AUTHORIZATION_2026-10-07.md).
-  Graphical agent/user-service invocation, remote-session combinations and booted
-  package upgrade/removal remain open.
+  Actual user-service invocation and remote sessions (including concurrent local
+  login of the same UID) now pass the installed `.35` probe. A real `.34` to `.35`
+  package upgrade also passed. Graphical authentication-agent behavior, booted
+  package removal/reinstallation and the refreshed remote CI result remain open.
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.
