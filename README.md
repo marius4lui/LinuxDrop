@@ -25,7 +25,7 @@ sudo apt install ./linuxdrop_0.1.0_amd64.deb
 
 Open **LinuxDrop** from the app menu. Enable visibility when receiving; it starts hidden. Enable the optional extension in GNOME **Extensions** for Quick Settings and the notch. Log out/in after first installing the extension if GNOME has not discovered it.
 
-Click the LinuxDrop icon in the top panel to open the bubble; it stays hidden until you ask for it. The opened bubble can reveal a native GTK drop surface positioned by the shell, so real Wayland file drags can be received. File-manager actions are included for Nautilus and Dolphin; a Thunar custom-action example is provided.
+Click the LinuxDrop icon in the top panel to open the bubble; it stays hidden until you ask for it. The opened bubble can reveal a native GTK drop surface positioned by the shell, so real Wayland file drags can be received. File-manager actions are included for Nautilus and Dolphin. Thunar offers LinuxDrop in its Send To menu automatically after package installation; the optional custom-action installer is also retained.
 
 Full instructions, WSL launcher and troubleshooting: [INSTALL](docs/INSTALL.md).
 

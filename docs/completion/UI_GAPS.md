@@ -127,3 +127,9 @@ replaced fixed-pixel custom fonts and fixed the horizontal overflow exposed by
 renders and regression assertions pass. Actual external drag payload on 50,
 screen-reader speech, fractional/multi-monitor acceptance and the remaining
 Shell-version matrix are not asserted by these tests.
+
+2026-10-07 native file-manager follow-up: Nautilus/Thunar/Dolphin actual menu
+handoffs preserve a three-file selection with special characters. Installed
+Fedora revision 3 GTK captures expose horizontal clipping at the default window
+width; rebuild the current app there and diagnose any remaining 4.22/1.9 layout
+incompatibility. See [file-manager acceptance](../acceptance/FILEMANAGERS_2026-10-07.md).

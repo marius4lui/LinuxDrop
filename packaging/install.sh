@@ -25,6 +25,7 @@ install -Dm644 "$root/packaging/io.github.marius4lui.LinuxDrop.desktop" "$dest$p
 install -Dm644 "$root/packaging/io.github.marius4lui.LinuxDrop.metainfo.xml" "$dest$prefix/share/metainfo/io.github.marius4lui.LinuxDrop.metainfo.xml"
 install -Dm644 "$root/integrations/nautilus/linuxdrop.py" "$dest$prefix/share/nautilus-python/extensions/linuxdrop.py"
 install -Dm644 "$root/integrations/dolphin/linuxdrop.desktop" "$dest$prefix/share/kio/servicemenus/linuxdrop.desktop"
+install -Dm644 "$root/integrations/thunar/linuxdrop.desktop" "$dest$prefix/share/Thunar/sendto/linuxdrop.desktop"
 install -Dm644 "$root/integrations/thunar/uca.xml.example" "$dest$prefix/share/doc/linuxdrop/thunar-uca.xml.example"
 install -Dm755 "$root/integrations/thunar/install-action.py" "$dest$prefix/bin/linuxdrop-thunar-install"
 install -Dm644 "$root/LICENSE" "$dest$prefix/share/doc/linuxdrop/copyright"

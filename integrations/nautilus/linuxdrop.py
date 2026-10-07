@@ -1,5 +1,5 @@
 """Nautilus 43+ menu provider. File paths are argv entries, never shell text."""
-from gi.repository import GObject, Nautilus, Gio
+from gi.repository import GObject, Nautilus, Gio, GLib
 
 
 class LinuxDropMenu(GObject.GObject, Nautilus.MenuProvider):
@@ -13,7 +13,15 @@ class LinuxDropMenu(GObject.GObject, Nautilus.MenuProvider):
             paths.append(path)
         if not paths:
             return []
-        menu = Nautilus.MenuItem(name="LinuxDrop::send", label="Send with LinuxDrop", tip="Share these files with a nearby device")
+        preferred = (language.split("_")[0].split(".")[0].split("-")[0]
+                     for language in GLib.get_language_names())
+        german = next((language for language in preferred if language in ("de", "en", "C")), "en") == "de"
+        menu = Nautilus.MenuItem(
+            name="LinuxDrop::send",
+            label="Mit LinuxDrop senden" if german else "Send with LinuxDrop",
+            tip="Diese Dateien mit einem Gerät in der Nähe teilen" if german else "Share these files with a nearby device",
+            icon="io.github.marius4lui.LinuxDrop",
+        )
         menu.connect("activate", self._send, paths)
         return [menu]
 

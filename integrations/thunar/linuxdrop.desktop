@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LinuxDrop
+Comment=Share these files with a nearby device
+Comment[de]=Diese Dateien mit einem Gerät in der Nähe teilen
+Icon=io.github.marius4lui.LinuxDrop
+TryExec=linuxdrop
+Exec=linuxdrop send -- %F
+Terminal=false
+# Thunar matches MIME types exactly, without inheritance. The app validates files.

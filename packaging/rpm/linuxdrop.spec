@@ -74,6 +74,7 @@ install -Dm644 packaging/linuxdrop.sysusers %{buildroot}%{_sysusersdir}/linuxdro
 %{_datadir}/polkit-1/rules.d/50-linuxdrop-netd.rules
 %{_datadir}/nautilus-python/extensions/linuxdrop.py
 %{_datadir}/kio/servicemenus/linuxdrop.desktop
+%{_datadir}/Thunar/sendto/linuxdrop.desktop
 %{_datadir}/gnome-shell/extensions/linuxdrop@marius4lui.github.io/
 %{_datadir}/icons/hicolor/scalable/apps/io.github.marius4lui.LinuxDrop.svg
 %{_datadir}/doc/linuxdrop/
