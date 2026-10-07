@@ -41,7 +41,7 @@ jobs:
             apt-get update
             apt-get install -y --no-install-recommends ca-certificates git tar locales passwd \
               gnome-shell gjs dbus-daemon dbus-x11 python3-dbusmock python3-gi gir1.2-adw-1 \
-              libgl1-mesa-dri libegl-mesa0 orca nautilus
+              libgl1-mesa-dri libegl-mesa0 orca nautilus xvfb x11-xkb-utils
             localedef -i de_DE -f UTF-8 de_DE.UTF-8
           else
             dnf -y --setopt=install_weak_deps=False install ca-certificates git tar shadow-utils \

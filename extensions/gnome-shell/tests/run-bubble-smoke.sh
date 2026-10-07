@@ -41,9 +41,22 @@ dbus-run-session -- bash -c '
     shell_pid=
     logind_pid=
     orca_pid=
+    xkb_pid=
     cleanup() {
+        result=$?
+        if [ "$result" != 0 ] && [ "${LINUXDROP_SMOKE_ORCA:-0}" = 1 ]; then
+            for logfile in orca.log orca-debug.log xkb.log fixture.log; do
+                if [ -f "$LINUXDROP_SMOKE_ROOT/$logfile" ]; then
+                    printf "%s\n" "$logfile" >&2
+                    tail -n 60 "$LINUXDROP_SMOKE_ROOT/$logfile" >&2
+                fi
+            done
+        fi
         if [ "${LINUXDROP_SMOKE_COMPLETION:-0}" = 1 ]; then nautilus --quit 2>/dev/null || true; fi
         kill ${orca_pid:-} ${shell_pid:-} ${logind_pid:-} "$fixture_pid" 2>/dev/null || true
+        # Let Orca restore its private keymap before stopping its X server.
+        if [ -n "${orca_pid:-}" ]; then wait "$orca_pid" 2>/dev/null || true; fi
+        if [ -n "${xkb_pid:-}" ]; then kill "$xkb_pid" 2>/dev/null || true; wait "$xkb_pid" 2>/dev/null || true; fi
     }
     trap cleanup EXIT
     if [ "${LINUXDROP_SMOKE_MOCK_LOGIND:-0}" = 1 ]; then
@@ -64,6 +77,18 @@ dbus-run-session -- bash -c '
     fi
     if [ "${LINUXDROP_SMOKE_ORCA:-0}" = 1 ]; then
         gsettings set org.gnome.desktop.interface toolkit-accessibility true
+        # Orca 46 uses xkbcomp/ DISPLAY even with its GTK backend on Wayland.
+        # Always isolate this keymap; never borrow the callers live X display.
+        Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp -nolisten unix \
+            3> "$LINUXDROP_SMOKE_ROOT/xkb-display" > "$LINUXDROP_SMOKE_ROOT/xkb.log" 2>&1 &
+        xkb_pid=$!
+        for attempt in {1..50}; do
+            [ ! -s "$LINUXDROP_SMOKE_ROOT/xkb-display" ] || break
+            kill -0 "$xkb_pid"
+            sleep 0.1
+        done
+        test -s "$LINUXDROP_SMOKE_ROOT/xkb-display"
+        orca_display=":$(cat "$LINUXDROP_SMOKE_ROOT/xkb-display")"
     fi
     gnome-shell --headless --wayland --no-x11 --wayland-display=linuxdrop-bubble-smoke --virtual-monitor="${LINUXDROP_SMOKE_MONITOR:-1440x900}" > "$LINUXDROP_SMOKE_ROOT/shell.log" 2>&1 &
     shell_pid=$!
@@ -75,7 +100,7 @@ dbus-run-session -- bash -c '
             [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || break
             sleep 0.1
         done
-        GDK_BACKEND=wayland orca --user-prefs "$LINUXDROP_SMOKE_ROOT/orca" --enable=speech --disable=braille --debug-file "$LINUXDROP_SMOKE_ROOT/orca-debug.log" > "$LINUXDROP_SMOKE_ROOT/orca.log" 2>&1 &
+        DISPLAY="$orca_display" GDK_BACKEND=wayland orca --user-prefs "$LINUXDROP_SMOKE_ROOT/orca" --enable=speech --disable=braille --debug-file "$LINUXDROP_SMOKE_ROOT/orca-debug.log" > "$LINUXDROP_SMOKE_ROOT/orca.log" 2>&1 &
         orca_pid=$!
     fi
     for attempt in {1..30}; do

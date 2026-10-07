@@ -35,3 +35,24 @@ The scenario prints the actual speech-generation evidence and is wired into the
 Ubuntu native-desktop CI job. No audio-device or Braille-hardware assessment is
 claimed. GNOME 46 is the verified screen-reader version; the separate existing
 native controls matrix covers other configured Shell versions.
+
+
+## Headless CI startup correction
+
+The Ubuntu job in Native desktop run 37677720529 failed before navigation:
+Orca never became ready. Locally reproducing the same private Wayland/logind
+setup with DISPLAY unset exposed Orca 46's xkbcomp initialization raising
+`KeyError: DISPLAY`. The former local run inherited an available X display.
+
+The runner now always starts a separate Xvfb keymap server for Orca, obtains its
+allocated display through `-displayfd`, and passes that display only to Orca.
+TCP and filesystem Unix listeners are disabled; Linux's abstract local socket
+works without changing WSLg's shared socket directory. GNOME Shell and Orca's GTK
+backend remain on the private Wayland compositor, and the test still checks
+actual speech, Tab/Enter/Space/Escape, request identity/SAS and 43% progress.
+Orca exits before its keymap server is removed. Failure output includes the
+bounded Orca/fixture startup logs. CI explicitly installs Xvfb/xkbcomp support.
+
+The corrected fixture passes with DISPLAY unset, German 800x600 at 1.5 text
+scale and mock logind. This is local reproduction/fix evidence; the new remote
+CI result is pending. Fedora 44/GNOME 50 native controls passed in the cited run.
