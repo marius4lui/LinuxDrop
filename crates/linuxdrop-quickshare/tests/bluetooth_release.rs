@@ -6,8 +6,8 @@ mod scanner;
 use bluez::{Adapter, Advertising, State};
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };

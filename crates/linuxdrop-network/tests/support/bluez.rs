@@ -1,16 +1,11 @@
 //! Runs only against an explicitly isolated D-Bus mock, never real radios.
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
-use zbus::{
-    Connection,
-    zvariant::{OwnedObjectPath, OwnedValue},
-};
+use zbus::Connection;
+
+use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
 #[derive(Default)]
 pub struct State {

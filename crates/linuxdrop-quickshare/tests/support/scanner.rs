@@ -1,7 +1,7 @@
 //! Test-only BlueZ scan acknowledgements; no real adapter is accessed.
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use tokio::sync::Notify;
 

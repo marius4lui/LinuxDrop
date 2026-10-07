@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use btleplug::api::{
     AddressType, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter,
 };
@@ -10,7 +10,7 @@ use futures::stream::StreamExt;
 use tokio::sync::broadcast::Sender;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::{uuid, Uuid};
+use uuid::{Uuid, uuid};
 
 const SERVICE_UUID_SHARING: Uuid = uuid!("0000fe2c-0000-1000-8000-00805f9b34fb");
 
