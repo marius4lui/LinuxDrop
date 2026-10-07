@@ -65,14 +65,15 @@ jobs:
           cat dist/BOOTED_SERVICE.json
           sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 python3 tests/integration/netd_polkit.py > dist/POLKIT_AUTHORIZATION.json
           cat dist/POLKIT_AUTHORIZATION.json
-          sudo apt-get remove -y linuxdrop
-          test ! -e /usr/lib/systemd/system/linuxdrop-netd.service
+          sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 python3 tests/integration/package_lifecycle.py dist/linuxdrop_*.deb > dist/PACKAGE_LIFECYCLE.json
+          cat dist/PACKAGE_LIFECYCLE.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linuxdrop-ubuntu-24.04
           path: |
             dist/BOOTED_SERVICE.json
             dist/POLKIT_AUTHORIZATION.json
+            dist/PACKAGE_LIFECYCLE.json
             dist/*.deb
             dist/*_source.tar.gz
             dist/SHA256SUMS

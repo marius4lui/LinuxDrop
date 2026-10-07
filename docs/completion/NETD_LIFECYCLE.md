@@ -42,9 +42,10 @@ Remaining code/evidence requirements:
   no-agent and wrong/correct password cases after fixing the mechanism action-owner
   annotation; see [authorization evidence](../acceptance/POLKIT_AUTHORIZATION_2026-10-07.md).
   Actual user-service invocation and remote sessions (including concurrent local
-  login of the same UID) now pass the installed `.35` probe. A real `.34` to `.35`
-  package upgrade also passed. Graphical authentication-agent behavior, booted
-  package removal/reinstallation and the refreshed remote CI result remain open.
+  login of the same UID) pass again on installed `.36`. Booted Ubuntu upgrades,
+  ordinary package removal and reinstallation now pass, preserving the service
+  UID and journal. Graphical authentication-agent behavior, other distro package
+  lifecycles and the refreshed remote CI user-service result remain open.
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.

@@ -46,3 +46,25 @@ script/report does not change its binaries.
 The Linux CI package smoke step now runs the same installed-service probe before
 removing the DEB and publishes its JSON report with the package artifact. This is
 local acceptance plus a CI definition; the new remote execution remains pending.
+
+## Follow-up: installed package .36
+
+Package `0.1.0+review.20261007.36`, production commit `a00eab7`, upgrades `.35`
+successfully in the same booted Ubuntu environment. Its installed systemd probe
+and all eight real PAM/Polkit scenarios pass; all four installed executable
+hashes match the release build. Authorization scope and the separate remote CI
+issue are described in [the Polkit report](POLKIT_AUTHORIZATION_2026-10-07.md).
+
+The new root/marker-gated `tests/integration/package_lifecycle.py` then performs
+actual package removal and reinstallation. Removal stops the helper and removes
+its socket, service file and executables. The recovery journal and dedicated UID
+remain intact. Reinstallation restores the same version, after which the actual
+systemd identity, restart and malformed-journal recovery probes pass again.
+The probe refuses a nonempty lease journal or running user daemon and reinstalls
+in finally even if a removal assertion fails. CI now publishes its JSON report.
+
+DEB SHA-256:
+`2fad53bf1eadcb9509196c3a3a2a56f9ec9b14657be4c94846bf6771fa4f1b13`.
+This closes ordinary Ubuntu removal/reinstallation without active transfers.
+Physical-radio removal during transfers and other distro package-manager
+lifecycles remain separate acceptance.
