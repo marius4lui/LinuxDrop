@@ -70,6 +70,29 @@ now emits only a fixed execution stage, exception class and safe systemd result
 properties on probe failure, so the remote environment difference can be located
 without exposing terminal contents. The remote user-service result remains open.
 
+Run `37649457228` identifies the failure before the daemon executable starts:
+`ExecMainStatus=218` (`CAPABILITIES`), with systemd retrying the failed user unit.
+The unit included `ProtectKernelModules=yes`, which removes CAP_SYS_MODULE from
+the bounding set, plus mount-namespace directives. The
+[systemd 255 execution documentation](https://raw.githubusercontent.com/systemd/systemd/v255/man/systemd.exec.xml)
+documents these privilege requirements. Their behavior in an unprivileged user
+manager differs from the dedicated system helper; the successful WSL run did not
+prove portability of those directives.
+
+The user unit now uses NoNewPrivileges and seccomp restrictions, including a
+module-system-call denylist and native ABI restriction, without requiring
+capability or mount-namespace setup. It shares the desktop's file view so a
+selected file under `/tmp` remains usable. The system helper retains its existing
+capabilities, private temporary directory and filesystem/kernel protections.
+No host security policy or global user-namespace setting is changed.
+
+The installed-unit correction passes the real local matrix. The actual daemon
+PID has zero effective, permitted and ambient capabilities, NoNewPrivs=1 and
+seccomp mode 2. A desktop-created temporary file passes through the D-Bus
+PrepareSend/DiscardDraft path. The real administrator challenge still works and
+both remote-session denials remain effective. A fresh remote run is required
+to close the runner-specific failure; the previous failing runs stay recorded.
+
 Graphical authentication-agent behavior and physical adapter mutation remain
 separate acceptance work. These probes use real services and authorization but
 an intentionally nonexistent radio, so they do not establish hardware support.

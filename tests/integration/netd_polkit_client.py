@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import shlex
+import tempfile
 from pathlib import Path
 
 agent = None
@@ -53,6 +54,22 @@ try:
         cgroup = Path(f'/proc/{subject_pid}/cgroup').read_text()
         assert 'user@' in cgroup and 'linuxdropd.service' in cgroup and 'session-' not in cgroup, 'Daemon must run as a real user service'
         assert Path(f'/proc/{subject_pid}').stat().st_uid == os.getuid()
+        status = dict(line.split(':', 1) for line in Path(f'/proc/{subject_pid}/status').read_text().splitlines())
+        assert all(int(status[field].strip(), 16) == 0 for field in ('CapEff', 'CapPrm', 'CapAmb'))
+        assert status['NoNewPrivs'].strip() == '1' and status['Seccomp'].strip() == '2'
+        stage = 'desktop temporary-file handoff'
+        with tempfile.TemporaryDirectory(prefix='linuxdrop-send-', dir='/tmp') as folder:
+            source = Path(folder) / 'selected file.txt'
+            source.write_text('File selected by the desktop user.\n')
+            prepared = subprocess.check_output(['busctl', '--user', '--timeout=10', 'call',
+                'io.github.marius4lui.LinuxDrop', '/io/github/marius4lui/LinuxDrop',
+                'io.github.marius4lui.LinuxDrop.Manager1', 'PrepareSend', 'as', '1', str(source)], text=True, timeout=15)
+            signature, draft = shlex.split(prepared)
+            assert signature == 's' and draft
+            subprocess.run(['busctl', '--user', '--timeout=10', 'call',
+                'io.github.marius4lui.LinuxDrop', '/io/github/marius4lui/LinuxDrop',
+                'io.github.marius4lui.LinuxDrop.Manager1', 'DiscardDraft', 's', draft],
+                check=True, capture_output=True, timeout=15)
     if '--agent' in sys.argv:
         stage = 'agent registration'
         read_fd, write_fd = os.pipe()

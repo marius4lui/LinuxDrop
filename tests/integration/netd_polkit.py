@@ -132,6 +132,7 @@ try:
     prompts, session, message = scenario('user-service', 'seat0', active_vt, True, daemon=True)
     assert prompts > 0 and message == 'radio not found', 'Installed user-service authorization failed'
     checks.append('installed linuxdropd user service passes D-Bus diagnostic through real Polkit authentication')
+    checks.append('user service has no effective/permitted/ambient capabilities, retains seccomp/no-new-privileges and opens desktop-selected temporary files')
     prompts, session, message = scenario('remote', None, 0, True, remote=True)
     assert prompts == 0 and 'local desktop session' in message.lower()
     checks.append('real remote PAM login rejected before authentication')

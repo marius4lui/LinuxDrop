@@ -12,11 +12,11 @@ Restart=on-failure
 RestartSec=3
 TimeoutStopSec=150
 NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
+# This user service must start without a privileged user namespace and must see
+# the same selected files as the desktop, including paths under /tmp. Keep
+# capability/mount-namespace hardening on the separate system helper instead.
+SystemCallFilter=~@module
+SystemCallArchitectures=native
 RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
