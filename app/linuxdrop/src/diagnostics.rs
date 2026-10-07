@@ -49,6 +49,9 @@ pub fn add_actions(ui: &Rc<Ui>, group: &adw::PreferencesGroup) -> Vec<(gtk::Widg
         });
         button.set_tooltip_text(Some(&tr(title)));
         button.set_widget_name(&format!("diagnostic:{action}"));
+        if action == "export" {
+            export_button_state(&button, ui.diagnostics_exporting.get());
+        }
         button.update_property(&[gtk::accessible::Property::Label(&tr(title))]);
         button.set_valign(gtk::Align::Center);
         row.add_suffix(&button);
@@ -157,14 +160,63 @@ pub fn report_dialog(ui: &Rc<Ui>, title: &str, report: &Value) {
     dialog.present(Some(&ui.window));
 }
 
+fn export_button_state(button: &gtk::Button, busy: bool) {
+    button.set_sensitive(!busy);
+    button.set_tooltip_text(Some(&tr(if busy {
+        "Saving diagnostic report…"
+    } else {
+        "Save diagnostic report"
+    })));
+}
+
+fn export_busy(ui: &Ui, busy: bool) {
+    ui.diagnostics_exporting.set(busy);
+    fn visit(widget: &gtk::Widget, busy: bool) {
+        if widget.widget_name() == "diagnostic:export" {
+            if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                export_button_state(button, busy);
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            visit(&widget, busy);
+            child = widget.next_sibling();
+        }
+    }
+    visit(ui.settings_body.upcast_ref(), busy);
+}
+
+struct ExportGuard(Rc<Ui>);
+impl Drop for ExportGuard {
+    fn drop(&mut self) {
+        export_busy(&self.0, false);
+    }
+}
+
 fn export(ui: &Rc<Ui>) {
-    let Some(proxy) = ui.proxy.borrow().clone() else {
+    if ui.diagnostics_exporting.get() {
+        return;
+    }
+    let Some(proxy) = ui
+        .proxy
+        .borrow()
+        .clone()
+        .filter(|proxy| ui.service_is_ready() && proxy.g_name_owner().is_some())
+    else {
         ui.toast("The sharing service is not connected yet");
         return;
     };
+    let generation = ui.service_generation();
+    let owner = proxy.g_name_owner();
+    export_busy(ui, true);
     let ui = ui.clone();
     glib::MainContext::default().spawn_local(async move {
-        let report = match ipc::json(&proxy, "ExportDiagnostics").await {
+        let _guard = ExportGuard(ui.clone());
+        let result = ipc::json(&proxy, "ExportDiagnostics").await;
+        if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+            return;
+        }
+        let report = match result {
             Ok(report) => report,
             Err(error) => {
                 ui.toast(&error);
@@ -177,7 +229,14 @@ fn export(ui: &Rc<Ui>) {
             .build();
         let file = match picker.save_future(Some(&ui.window)).await {
             Ok(file) => file,
-            Err(_) => return,
+            Err(error) => {
+                if !error.matches(gtk::DialogError::Dismissed)
+                    && !error.matches(gtk::DialogError::Cancelled)
+                {
+                    ui.toast(&error.to_string());
+                }
+                return;
+            }
         };
         let bytes = serde_json::to_vec_pretty(&report).unwrap_or_default();
         match file

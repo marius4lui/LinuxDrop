@@ -23,9 +23,9 @@ items retain their remaining acceptance scope even where code now exists.
 
 - [x] Show individual invalid files and reasons, preserve valid selections, permit zero-byte files; asynchronous metadata validation.
 - [x] Reconnect signal subscription on every proxy; owner-change invalidation, dirty snapshot retry and epoch/revision handling. GTK replacement is covered by an actual private-bus owner change; Shell by controlled replies in native GNOME.
-- [ ] Stable peer/protocol selection across updates; favorites, custom labels, protocol preferences and soft-block controls using daemon contract.
+- [x] Stable peer/protocol selection across updates; favorites, custom labels, protocol preferences and soft-block controls using daemon contract. Current source and native evidence are consolidated in [settings/export review](../acceptance/UI_DIAGNOSTIC_EXPORT_2026-10-07.md).
 - [x] Per-request destination and partial file acceptance using daemon contract.
-- [ ] Full settings inventory from final schema: language/close behavior, receive policy/subfolders, public duration, protocol ports/modes, adapters/controllers, network filters, notifications/privacy/sound, limits/history, diagnosis/restart/reset/export.
+- [x] Full settings inventory from final schema: all 47 user-facing fields have controls, plus diagnosis/restart/reset/export actions. Schema inventory and native write/search/retry evidence are in the settings/export review; physical policy acceptance remains separate.
 - [x] Settings search survives immediate refreshes, includes desktop/diagnostic rows and translated option/category names; categories and advanced grouping remain available. No-results recovery resets both filters.
 - [x] Desired/effective settings differences and backend apply errors visible: persistent applying/error/offline status in Settings, per-service details and recovery; native German 480x600 acceptance.
 - [ ] Icon-only actions have translated accessible names; selected states/progress exposed; keyboard navigation/actions documented.
@@ -34,8 +34,8 @@ items retain their remaining acceptance scope even where code now exists.
 - [x] Adaptive wide-window navigation and targeted 480x600 and wide rendering.
 - [ ] Fractional rendering acceptance.
 - [x] Portal-origin file acceptance validated with a real document-portal export and descriptor handoff; revocation/closed-client lifetime and daemon access tested. Installed Flatpak chooser, descriptor transfer, registered MIME opening and folder-reveal portal actions now pass; default/per-request folder persistence and actual HTTPS receive now pass across portal/daemon restart. The sandbox Notch preferences action now routes through the host; its acceptance scope is recorded separately below.
-- [ ] Assess folder/GVfs import safely; the original plan explicitly deferred these beyond regular local files, so any added import requires clear staging/cancel semantics rather than silent rejection.
-- [ ] Redigierte Diagnose als Datei speichern; reset/restart dialogs explain active transfer impact.
+- [x] Folder/GVfs scope assessed against the binding plan: regular local files remain the supported input; individual rejection guidance preserves valid files and explains archive/download alternatives. No implicit recursive or remote staging.
+- [x] Redacted diagnostic file export implemented with single-operation feedback, retry and stale-owner protection; reset/restart dialogs explain active-transfer/link impact. Native pending/failure coverage and source-reviewed chooser/write path are distinguished in the settings/export review.
 - [x] Targeted native tests cover the reviewed draft, protocol, focus, settings and incoming decision regressions.
 
 ## Acceptance still requiring external environment or hardware

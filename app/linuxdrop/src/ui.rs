@@ -57,6 +57,7 @@ pub struct Ui {
     pub settings_writes: RefCell<HashMap<String, settings::WriteState>>,
     pub settings_rendering: Cell<bool>,
     pub settings_resetting: Cell<bool>,
+    pub diagnostics_exporting: Cell<bool>,
     rendered_settings: RefCell<Value>,
     revision: RefCell<String>,
     rendered_peers: RefCell<Value>,
@@ -434,6 +435,7 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         settings_writes: RefCell::new(HashMap::new()),
         settings_rendering: Cell::new(false),
         settings_resetting: Cell::new(false),
+        diagnostics_exporting: Cell::new(false),
         rendered_settings: RefCell::new(Value::Null),
         revision: RefCell::new(String::new()),
         rendered_peers: RefCell::new(Value::Null),
@@ -1113,7 +1115,7 @@ impl Ui {
                         }
                         Ok(info) if info.file_type() != gio::FileType::Regular => {
                             FileCheck::Invalid(tr(
-                                "Select regular files; folders need to be imported first",
+                                "Choose files; create an archive before sharing a folder",
                             ))
                         }
                         Ok(info)

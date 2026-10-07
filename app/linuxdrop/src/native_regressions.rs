@@ -180,6 +180,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let preference_calls = Rc::new(Cell::new(0));
     let fail_next_setting = Rc::new(Cell::new(false));
     let setting_calls = Rc::new(Cell::new(0));
+    let pending_report = Rc::new(RefCell::new(None::<gio::DBusMethodInvocation>));
     let hold_snapshot = Rc::new(Cell::new(false));
     let malformed_next_snapshot = Rc::new(Cell::new(false));
     let pending_snapshots = Rc::new(RefCell::new(Vec::<(
@@ -200,6 +201,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let preference_count = preference_calls.clone();
     let fail_setting = fail_next_setting.clone();
     let setting_count = setting_calls.clone();
+    let report = pending_report.clone();
     let hold = hold_snapshot.clone();
     let malformed = malformed_next_snapshot.clone();
     let pending = pending_snapshots.clone();
@@ -207,6 +209,13 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         .register_object(ipc::PATH, &info.interfaces()[0])
         .method_call(
             move |_, _, _, _, method, parameters, invocation| match method {
+                "ExportDiagnostics" => {
+                    assert!(
+                        report.borrow().is_none(),
+                        "Only one diagnostic export may be pending"
+                    );
+                    *report.borrow_mut() = Some(invocation);
+                }
                 "GetSnapshot" => {
                     let mut wire = wire_fixture(&state.borrow());
                     linuxdrop_ipc::Snapshot::from_value(&wire)
@@ -1070,6 +1079,22 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         ui.add_files(vec![gio::File::for_path(&first)]);
         settle().await;
         let draft = ui.files.borrow().clone();
+        let export = find(&ui.settings_body, "diagnostic:export").unwrap().downcast::<gtk::Button>().unwrap();
+        export.emit_clicked();
+        export.emit_clicked();
+        settle().await;
+        assert!(ui.diagnostics_exporting.get() && !export.is_sensitive());
+        assert!(pending_report.borrow().is_some());
+        let config = ui.settings.borrow().clone();
+        settings::render(&ui, &config);
+        let export = find(&ui.settings_body, "diagnostic:export").unwrap().downcast::<gtk::Button>().unwrap();
+        assert!(!export.is_sensitive(), "Rebuilt settings retain pending export feedback");
+        pending_report.borrow_mut().take().unwrap().return_dbus_error("io.github.marius4lui.Error", "Export unavailable");
+        settle().await;
+        assert!(!ui.diagnostics_exporting.get() && export.is_sensitive(), "Failed export must allow retry");
+        export.emit_clicked();
+        settle().await;
+        assert!(pending_report.borrow().is_some());
         ui.share_link();
         let old_link_confirmation = ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
         old_link_confirmation.emit_by_name::<()>("response", &[&"create"]);
@@ -1124,6 +1149,9 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert_eq!(ui.snapshot.borrow()["epoch"], "replacement-owner", "Late old snapshots cannot restore stale state");
         assert!(find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").is_none());
         assert_eq!(*ui.files.borrow(), draft, "Owner replacement preserves local file drafts");
+        pending_report.borrow_mut().take().unwrap().return_value(Some(&(json!({"version":"test","platform":"linux","backends":[],"radios":[],"active_transfers":0,"redacted":true,"omitted":[]}).to_string(),).to_variant()));
+        settle().await;
+        assert!(!ui.diagnostics_exporting.get(), "A late old-owner report must not leave a save dialog open");
         pending_offer.borrow_mut().take().unwrap().return_value(Some(&(json!({"url":"http://127.0.0.1:53317","pin":"1234","expires_in":60,"encrypted":false}).to_string(),).to_variant()));
         settle().await;
         assert!(!ui.creating_link.get() && ui.share_link.is_sensitive());
