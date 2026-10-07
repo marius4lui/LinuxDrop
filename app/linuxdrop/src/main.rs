@@ -4,6 +4,7 @@ mod i18n;
 mod incoming;
 mod ipc;
 mod settings;
+mod shortcuts;
 mod ui;
 
 use adw::prelude::*;

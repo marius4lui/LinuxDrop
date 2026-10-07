@@ -65,6 +65,15 @@ pub fn tr(message: &str) -> String {
         return message.to_owned();
     }
     match message {
+        "Keyboard shortcuts" => "Tastenkürzel",
+        "Select files" => "Dateien auswählen",
+        "Send view" => "Sendeansicht",
+        "Move between controls" => "Zwischen Bedienelementen wechseln",
+        "Move back between controls" => "Zum vorherigen Bedienelement wechseln",
+        "Activate the focused control" => "Ausgewähltes Bedienelement aktivieren",
+        "Close a dialog or the Notch" => "Dialog oder Notch schließen",
+        "Close application windows" => "App-Fenster schließen",
+        "Closing follows your close-behavior setting. Configure the desktop Notch shortcut in Notch preferences. Sending and accepting always require an explicit action." => "Beim Schließen gilt deine Einstellung zum Fensterverhalten. Das Desktop-Tastenkürzel für die Notch legst du in den Notch-Einstellungen fest. Senden und Annehmen bestätigst du immer ausdrücklich.",
         "Language" => "Sprache",
         "Details" => "Details",
         "Show sharing service details" => "Status der Freigabedienste anzeigen",

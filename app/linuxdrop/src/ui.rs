@@ -186,6 +186,13 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&adw::WindowTitle::new("LinuxDrop", "")));
+    let shortcuts = gtk::Button::from_icon_name("input-keyboard-symbolic");
+    shortcuts.set_widget_name("keyboard-shortcuts");
+    shortcuts.set_tooltip_text(Some(&tr("Keyboard shortcuts")));
+    shortcuts.update_property(&[gtk::accessible::Property::Label(&tr("Keyboard shortcuts"))]);
+    shortcuts.set_action_name(Some("win.shortcuts"));
+    header.pack_start(&shortcuts);
+    crate::shortcuts::install(app, &window);
     let status = gtk::Button::with_label(&tr("Connecting…"));
     status.add_css_class("flat");
     status.add_css_class("status-chip");
@@ -254,10 +261,14 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
     let manage = gtk::Button::from_icon_name("system-users-symbolic");
     manage.add_css_class("flat");
     manage.set_tooltip_text(Some(&tr("Manage devices")));
+    manage.update_property(&[gtk::accessible::Property::Label(&tr("Manage devices"))]);
     heading.append(&manage);
     let refresh = gtk::Button::from_icon_name("view-refresh-symbolic");
     refresh.add_css_class("flat");
     refresh.set_tooltip_text(Some(&tr("Refresh nearby devices")));
+    refresh.update_property(&[gtk::accessible::Property::Label(&tr(
+        "Refresh nearby devices",
+    ))]);
     heading.append(&refresh);
     body.append(&heading);
     let peers = gtk::Box::new(gtk::Orientation::Vertical, 8);

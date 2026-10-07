@@ -123,6 +123,15 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     this._actionPending = false;
                     current.state = 'pin_required'; this._render();
                     check(this._detail.text === t('Enter PIN') && find(this._body, 'Enter PIN'), 'PIN state must explain the next action in the header and body');
+                    current.state = 'completed';
+                    current.saved_paths = ['/tmp/LinuxDrop received/photo.png'];
+                    this._snapshot.transfers.reverse(); this._render();
+                    check(this._selectedTransfer === current.id && this._title.text.includes(current.peer_name), 'Completion and reordered snapshots must preserve the chosen peer');
+                    check(find(this._body, 'Open folder') && find(this._body, 'Done') && !find(this._body, 'Cancel'), 'Completed receive exposes the folder and dismissal without stale cancellation');
+                    const completedDone = find(this._body, 'Done'); completedDone.grab_key_focus();
+                    this._snapshot.transfers.reverse(); this._render();
+                    check(this._selectedTransfer === current.id && global.stage.get_key_focus() === find(this._body, 'Done'), 'Other transfer ordering must not move completion focus or selection');
+                    delete current.saved_paths;
                     current.state = 'failed';
                     current.error = 'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.';
                     this._render();

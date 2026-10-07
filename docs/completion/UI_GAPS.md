@@ -29,7 +29,13 @@ items retain their remaining acceptance scope even where code now exists.
 - [x] Settings search survives immediate refreshes, includes desktop/diagnostic rows and translated option/category names; categories and advanced grouping remain available. No-results recovery resets both filters.
 - [x] Desired/effective settings differences and backend apply errors visible: persistent applying/error/offline status in Settings, per-service details and recovery; native German 480x600 acceptance.
 - [ ] Icon-only actions have translated accessible names; selected states/progress exposed; keyboard navigation/actions documented.
+  Explicit names and native shortcut help are implemented; [keyboard evidence](../acceptance/UI_KEYBOARD_2026-10-07.md)
+  records the source review, compact native guide and page navigation. Full
+  accessibility traversal remains to be verified.
 - [ ] Notch multiple-transfer selection remains stable; completion/error/open-folder actions; summary does not randomly change peer.
+  Native GNOME now verifies completed selection/focus across reordered snapshots
+  and the available completion actions. Actual Shell folder-handler launch remains
+  outside this fixture; see the keyboard evidence above.
 - [x] Primary/pointer/fixed monitor policy, pinned interaction, layout-change dismissal and fallback; configurable drag dwell and optional shortcut with actual conflict refusal. Native settings and controlled-layout evidence: [Notch shortcut acceptance](../acceptance/NOTCH_SHORTCUT_2026-10-07.md). Physical monitor hotplug remains below.
 - [x] Adaptive wide-window navigation and targeted 480x600 and wide rendering.
 - [ ] Fractional rendering acceptance.

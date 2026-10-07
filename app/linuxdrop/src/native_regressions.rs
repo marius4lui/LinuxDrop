@@ -137,6 +137,10 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     // The test backend exposes accessible properties without a screen reader.
     std::env::set_var("GTK_A11Y", "test");
     adw::init().unwrap();
+    // Capture settled native layouts, not a partly transparent dialog frame.
+    gtk::Settings::default()
+        .unwrap()
+        .set_gtk_enable_animations(false);
     let provider = gtk::CssProvider::new();
     provider.load_from_string(include_str!("../resources/style.css"));
     gtk::style_context_add_provider_for_display(
@@ -358,6 +362,23 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         let ui = build(&app, "send", vec![]);
         settle().await;
         ui.window.set_default_size(480, 600);
+        settle().await;
+        let help = find(&ui.window, "keyboard-shortcuts").unwrap();
+        assert!(help.grab_focus());
+        help.downcast::<gtk::Button>().unwrap().emit_clicked();
+        settle().await;
+        let dialog = ui.window.visible_dialog().expect("Keyboard help opens natively");
+        assert_eq!(dialog.title(), tr("Keyboard shortcuts"));
+        capture(&ui, "keyboard-shortcuts.png");
+        assert!(dialog.width() <= ui.window.width(), "Shortcut help fits a compact window");
+        gtk::prelude::WidgetExt::activate_action(&ui.window, "win.shortcuts", None).unwrap();
+        assert_eq!(ui.window.visible_dialog().unwrap(), dialog, "Repeated shortcuts do not stack dialogs");
+        dialog.close();
+        settle().await;
+        assert!(!app.accels_for_action("win.page::transfers").is_empty());
+        gtk::prelude::WidgetExt::activate_action(&ui.window, "win.page", Some(&"transfers".to_variant())).unwrap();
+        assert_eq!(ui.stack.visible_child_name().as_deref(), Some("transfers"));
+        gtk::prelude::WidgetExt::activate_action(&ui.window, "win.page", Some(&"send".to_variant())).unwrap();
         settle().await;
         capture(&ui, "send-compact-review.png");
         assert!(ui.toasts.measure(gtk::Orientation::Horizontal, -1).0 <= ui.window.width(),
