@@ -17,7 +17,7 @@ Quick Share:
 - Runtime Bluetooth setting, receive size/count policy, no unsolicited controller power-on.
 - Dedicated explicitly selected disconnected interface for Wi-Fi upgrades; no first-radio choice or active connection disruption. Temporary connection names use the LinuxDrop namespace. Errors omit argument lists containing network passwords.
 - NetworkManager upgrades now use lease-scoped volatile D-Bus profiles bound to the creating client, plus an exclusive transfer semaphore and ownership-checked asynchronous cleanup. The old fixed profile names and `nmcli` password arguments are removed.
-- Added Google wire fields `ip_v6_address=6`, `pin=8`, `device_name=9`; device-name offers route through LinuxDrop's leased supplicant P2P connector. IPv6 credential routing and complete role negotiation remain explicit completion work; a decoded field is not advertised as working transport support.
+- Added Google wire fields `ip_v6_address=6`, `pin=8`, `device_name=9`; device-name offers route through LinuxDrop's leased supplicant P2P connector. IPv6 credential routing now uses the leased interface; complete role negotiation and IPv6-only supplicant group activation remain explicit completion work.
 - Per-session random inbound IDs (LAN, GATT, L2CAP); daemon transfer ID retained on outbound failures.
 - Explicit SAS consent in both directions; hidden-mode offers are rejected by the adapter.
 - Private per-session staging, exclusive file creation, name/count/size checks, exact end-of-file checks, receive publication through LinuxDrop ReceiveStore.
@@ -134,3 +134,11 @@ ServiceAddress and WIFI_LAN address_candidates fields are now implemented for
 both upgrade offers and received candidates; legacy fields remain compatible.
 Only actually bound non-link-local LAN addresses are offered for upgrades.
 Direct/hotspot IPv6 credentials and full P2P negotiation are still distinct work.
+
+
+Direct/hotspot upgrade clients now parse IPv6 link-local credentials and ordered
+hotspot ServiceAddress candidates. Host listeners and all client attempts bind the
+leased interface, with local scope IDs for link-local addresses. Temporary NM
+profiles permit IPv6-only joins and select link-local mode when the offered
+addresses need no RA; normal routes/DNS remain isolated. Complete supplicant
+P2P role negotiation and its IPv4-required DHCP completion are still open.

@@ -203,3 +203,52 @@ fn wifi_lan_wire_candidates_replace_legacy_and_preserve_ip_family_order() {
         assert!(lan_policy::upgrade_candidates(&offer).is_err(), "{invalid}");
     }
 }
+
+#[test]
+fn direct_and_hotspot_candidates_keep_ipv6_and_validate_legacy_fallback() {
+    use rqs_lib::location_nearby_connections::{
+        ServiceAddress,
+        bandwidth_upgrade_negotiation_frame::upgrade_path_info::{
+            WifiDirectCredentials, WifiHotspotCredentials,
+        },
+    };
+    let mut direct = WifiDirectCredentials {
+        ip_v6_address: Some(lan_policy::address_bytes("fe80::1234".parse().unwrap())),
+        gateway: Some("192.168.49.1".into()),
+        port: Some(54321),
+        ..Default::default()
+    };
+    assert_eq!(
+        rqs_lib::hdl::direct_candidates(&direct).unwrap(),
+        vec![
+            "[fe80::1234]:54321".parse().unwrap(),
+            "192.168.49.1:54321".parse().unwrap()
+        ]
+    );
+    direct.gateway = Some("0.0.0.0".into());
+    assert_eq!(rqs_lib::hdl::direct_candidates(&direct).unwrap().len(), 1);
+    direct.ip_v6_address = Some(vec![1, 2, 3]);
+    assert!(rqs_lib::hdl::direct_candidates(&direct).is_err());
+    let mut hotspot = WifiHotspotCredentials {
+        gateway: Some("invalid-ignored-legacy".into()),
+        port: Some(-1),
+        address_candidates: vec![ServiceAddress {
+            ip_address: Some(lan_policy::address_bytes("fe80::beef".parse().unwrap())),
+            port: Some(54321),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(
+        rqs_lib::hdl::hotspot_candidates(&hotspot).unwrap(),
+        vec!["[fe80::beef]:54321".parse().unwrap()]
+    );
+    hotspot.address_candidates[0].port = Some(0);
+    assert!(rqs_lib::hdl::hotspot_candidates(&hotspot).is_err());
+    hotspot.address_candidates.clear();
+    hotspot.gateway = Some("192.168.49.1".into());
+    hotspot.port = Some(54321);
+    assert_eq!(
+        rqs_lib::hdl::hotspot_candidates(&hotspot).unwrap(),
+        vec!["192.168.49.1:54321".parse().unwrap()]
+    );
+}

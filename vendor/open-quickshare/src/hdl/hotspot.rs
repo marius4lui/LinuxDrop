@@ -2,7 +2,7 @@
 use linuxdrop_network::{P2pConnector, nm};
 use rand::Rng;
 use std::{
-    net::Ipv4Addr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, OnceLock, RwLock},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -33,6 +33,7 @@ pub struct HotspotGuard {
     pub password: String,
     pub gateway: Ipv4Addr,
     pub frequency: i32,
+    pub interface: String,
     _network: nm::Guard,
 }
 impl std::fmt::Debug for HotspotGuard {
@@ -44,7 +45,6 @@ impl std::fmt::Debug for HotspotGuard {
     }
 }
 pub struct JoinGuard {
-    pub address: Ipv4Addr,
     pub interface: String,
     _network: Option<nm::Guard>,
     p2p: Option<(Arc<dyn P2pConnector>, OwnedSemaphorePermit)>,
@@ -68,12 +68,29 @@ impl Drop for JoinGuard {
         }
     }
 }
-pub async fn join_wifi(ssid: &str, password: &str) -> anyhow::Result<JoinGuard> {
+pub async fn join_wifi(
+    ssid: &str,
+    password: &str,
+    candidates: &[SocketAddr],
+) -> anyhow::Result<JoinGuard> {
     let lease = lease()?;
     let interface = lease.interface.clone();
-    let network = nm::connect(lease, ssid.into(), password.into(), false, exclusive()).await?;
+    let link_local = candidates
+        .iter()
+        .any(|candidate| matches!(candidate.ip(), IpAddr::V6(ip) if ip.is_unicast_link_local()))
+        && !candidates.iter().any(
+            |candidate| matches!(candidate.ip(), IpAddr::V6(ip) if !ip.is_unicast_link_local()),
+        );
+    let network = nm::connect_with_ipv6(
+        lease,
+        ssid.into(),
+        password.into(),
+        false,
+        exclusive(),
+        link_local,
+    )
+    .await?;
     Ok(JoinGuard {
-        address: network.address,
         interface,
         _network: Some(network),
         p2p: None,
@@ -89,7 +106,6 @@ pub async fn join_p2p(peer_name: &str, pin: &str, frequency: u32) -> anyhow::Res
         .try_acquire_owned()
         .map_err(|_| anyhow::anyhow!("Dedicated adapter is already in use"))?;
     let mut guard = JoinGuard {
-        address: Ipv4Addr::UNSPECIFIED,
         interface: String::new(),
         _network: None,
         p2p: Some((connector.clone(), permit)),
@@ -97,12 +113,12 @@ pub async fn join_p2p(peer_name: &str, pin: &str, frequency: u32) -> anyhow::Res
     let connected = connector
         .connect(peer_name.into(), pin.into(), frequency)
         .await?;
-    guard.address = connected.ipv4_address;
     guard.interface = connected.interface;
     Ok(guard)
 }
 pub async fn start_hotspot() -> anyhow::Result<HotspotGuard> {
     let lease = lease()?;
+    let interface = lease.interface.clone();
     let (ssid, password) = {
         let mut rng = rand::rng();
         let suffix: String = (0..4)
@@ -117,8 +133,133 @@ pub async fn start_hotspot() -> anyhow::Result<HotspotGuard> {
     Ok(HotspotGuard {
         ssid,
         password,
-        gateway: network.address,
+        gateway: network
+            .address
+            .ok_or_else(|| anyhow::anyhow!("Hosted network has no IPv4 gateway"))?,
+        interface: interface.clone(),
         frequency: network.frequency,
         _network: network,
     })
+}
+
+/// Enumerate only the lease's interface, independently of the ordinary LAN policy.
+pub fn leased_interfaces(
+    interface: &str,
+) -> anyhow::Result<Vec<linuxdrop_network::InterfaceAddress>> {
+    if interface.is_empty() {
+        anyhow::bail!("Missing leased network interface");
+    }
+    let policy = linuxdrop_network::TransferPolicy {
+        allowed_interfaces: vec![interface.into()],
+        ..Default::default()
+    };
+    Ok(linuxdrop_network::interfaces(&policy, false)?
+        .into_iter()
+        .filter(|local| local.name == interface)
+        .collect())
+}
+pub async fn listen_hosted(
+    guard: &HotspotGuard,
+) -> anyhow::Result<crate::lan_policy::LanListeners> {
+    let interfaces = leased_interfaces(&guard.interface)?
+        .into_iter()
+        .filter(|local| local.address.is_ipv6() || local.address == IpAddr::V4(guard.gateway))
+        .collect();
+    crate::lan_policy::LanListeners::new_on(HOTSPOT_TCP_PORT, interfaces).await
+}
+pub fn hosted_candidates(
+    listener: &crate::lan_policy::LanListeners,
+) -> Vec<crate::location_nearby_connections::ServiceAddress> {
+    let mut interfaces = listener.subscribe().borrow().interfaces.clone();
+    interfaces.sort_by_key(|local| (local.address.is_ipv4(), local.address));
+    interfaces
+        .into_iter()
+        .filter(|local| crate::lan_policy::valid_unicast(local.address))
+        .map(|local| crate::location_nearby_connections::ServiceAddress {
+            ip_address: Some(crate::lan_policy::address_bytes(local.address)),
+            port: Some(listener.port().into()),
+        })
+        .collect()
+}
+fn network_address(ip: IpAddr, port: i32) -> anyhow::Result<SocketAddr> {
+    let port = u16::try_from(port)?;
+    if port == 0 || !crate::lan_policy::valid_unicast(ip) || ip.is_loopback() {
+        anyhow::bail!("Invalid dedicated-network candidate");
+    }
+    Ok(SocketAddr::new(ip, port))
+}
+pub fn direct_candidates(
+    credentials: &crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::WifiDirectCredentials,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut result = Vec::new();
+    if !credentials.ip_v6_address().is_empty() {
+        let ip = crate::lan_policy::decode_ip(credentials.ip_v6_address())?;
+        if !matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local()) {
+            anyhow::bail!("Wi-Fi Direct IPv6 address must be link-local");
+        }
+        result.push(network_address(ip, credentials.port())?);
+    }
+    if let Ok(ip) = credentials.gateway().parse::<Ipv4Addr>() {
+        if !ip.is_unspecified() {
+            result.push(network_address(ip.into(), credentials.port())?);
+        }
+    }
+    if result.is_empty() {
+        anyhow::bail!("Wi-Fi Direct has no usable address");
+    }
+    Ok(result)
+}
+pub fn hotspot_candidates(
+    credentials: &crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::WifiHotspotCredentials,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    if credentials.address_candidates.len() > 64 {
+        anyhow::bail!("Too many hotspot address candidates");
+    }
+    if credentials.address_candidates.is_empty() {
+        return Ok(vec![network_address(
+            credentials.gateway().parse()?,
+            credentials.port(),
+        )?]);
+    }
+    credentials
+        .address_candidates
+        .iter()
+        .map(|candidate| {
+            network_address(
+                crate::lan_policy::decode_ip(candidate.ip_address())?,
+                candidate.port(),
+            )
+        })
+        .collect()
+}
+/// Bind every attempt to the joined interface and scope remote link-local
+/// addresses using that interface's local index, never a remote-supplied index.
+pub async fn connect_joined(
+    interface: &str,
+    candidates: &[SocketAddr],
+) -> anyhow::Result<tokio::net::TcpStream> {
+    if candidates.is_empty() || candidates.len() > 64 {
+        anyhow::bail!("Invalid dedicated-network candidate count");
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            let locals = leased_interfaces(interface)?;
+            for offered in candidates.iter().take(64) {
+                network_address(offered.ip(), offered.port().into())?;
+                for local in locals.iter().filter(|local| local.contains(offered.ip())) {
+                    if matches!(offered, SocketAddr::V6(v6) if v6.scope_id() != 0 && v6.scope_id() != local.index) { continue; }
+                    let peer = crate::lan_policy::scoped_address(local, offered.ip(), offered.port());
+                    let attempt = async {
+                        let socket = if peer.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+                        socket.bind_device(Some(interface.as_bytes()))?;
+                        socket.bind(crate::lan_policy::scoped_address(local, local.address, 0))?;
+                        socket.connect(peer).await
+                    };
+                    if let Ok(Ok(stream)) = tokio::time::timeout(std::time::Duration::from_millis(800), attempt).await { return Ok(stream); }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }).await.map_err(|_| anyhow::anyhow!("Dedicated-network candidates timed out"))?
 }

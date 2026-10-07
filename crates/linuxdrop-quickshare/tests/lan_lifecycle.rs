@@ -141,6 +141,43 @@ async fn running_engine_follows_real_address_and_link_changes() {
     );
     let ipv6: SocketAddr = format!("[fd42:1234::1]:{port}").parse().unwrap();
     assert!(lan_policy::connect(ipv6).await.is_ok());
+    assert!(
+        rqs_lib::hdl::connect_joined("ld-test0", &[ipv6])
+            .await
+            .is_ok()
+    );
+    ip(&[
+        "-6",
+        "addr",
+        "add",
+        "fe80::1234/64",
+        "dev",
+        "ld-test0",
+        "nodad",
+    ]);
+    let dedicated = LanListeners::new_on(0, rqs_lib::hdl::leased_interfaces("ld-test0").unwrap())
+        .await
+        .unwrap();
+    let link_local: SocketAddr = format!("[fe80::1234]:{}", dedicated.port())
+        .parse()
+        .unwrap();
+    let client = rqs_lib::hdl::connect_joined("ld-test0", &[link_local])
+        .await
+        .unwrap();
+    let (server, _) = dedicated.accept().await.unwrap();
+    assert!(matches!(client.peer_addr().unwrap(), SocketAddr::V6(ip) if ip.scope_id() != 0));
+    assert!(matches!(server.local_addr().unwrap(), SocketAddr::V6(ip) if ip.scope_id() != 0));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(150),
+            rqs_lib::hdl::connect_joined("lo", &[link_local])
+        )
+        .await
+        .is_err()
+    );
+    let advertised = rqs_lib::hdl::hosted_candidates(&dedicated);
+    assert!(advertised.iter().any(|candidate| candidate.ip_address()
+        == lan_policy::address_bytes("fe80::1234".parse().unwrap())));
     let offer = lan_policy::upgrade_offer(&[ipv6]).unwrap();
     let candidates = lan_policy::upgrade_candidates(&offer).unwrap();
     assert!(lan_policy::connect_candidates(&candidates).await.is_ok());

@@ -1214,6 +1214,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                                         c.frequency(),
                                         c.device_name().to_owned(),
                                         c.pin().to_owned(),
+                                        crate::hdl::direct_candidates(c),
                                     )
                                 })
                                 .or_else(|| {
@@ -1227,11 +1228,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                                                 c.frequency(),
                                                 String::new(),
                                                 String::new(),
+                                                crate::hdl::hotspot_candidates(c),
                                             )
                                         })
                                 });
-                            let Some((ssid, password, gateway, port, freq, device_name, pin)) =
-                                creds
+                            let Some((
+                                ssid,
+                                password,
+                                gateway,
+                                port,
+                                freq,
+                                device_name,
+                                pin,
+                                candidates,
+                            )) = creds
                             else {
                                 info!(
                                     "BWU(send): {medium:?} offer carried no credentials; staying on BLE"
@@ -1243,8 +1253,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                             );
                             #[cfg(all(feature = "experimental", target_os = "linux"))]
                             {
-                                let Some(port) = u16::try_from(port).ok().filter(|port| *port > 0)
-                                else {
+                                let Ok(candidates) = candidates else {
                                     return Ok(false);
                                 };
                                 let p2p = if ssid.is_empty() && !device_name.is_empty() {
@@ -1257,7 +1266,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                                     None
                                 };
                                 return self
-                                    .join_and_upgrade(&ssid, &password, &gateway, port, p2p)
+                                    .join_and_upgrade(&ssid, &password, &candidates, p2p)
                                     .await;
                             }
                             #[cfg(not(all(feature = "experimental", target_os = "linux")))]
@@ -1325,14 +1334,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         &mut self,
         ssid: &str,
         password: &str,
-        gateway: &str,
-        port: u16,
+        candidates: &[std::net::SocketAddr],
         p2p: Option<(&str, &str, u32)>,
     ) -> Result<bool, anyhow::Error> {
         let joined = if let Some((name, pin, frequency)) = p2p {
             crate::hdl::join_p2p(name, pin, frequency).await
         } else {
-            crate::hdl::join_wifi(ssid, password).await
+            crate::hdl::join_wifi(ssid, password, candidates).await
         };
         let guard = match joined {
             Ok(g) => g,
@@ -1341,35 +1349,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                 return Ok(false);
             }
         };
-        let gw: std::net::Ipv4Addr = match gateway.parse::<std::net::Ipv4Addr>() {
-            Ok(ip) if !ip.is_unspecified() && !ip.is_loopback() && !ip.is_multicast() => ip,
-            _ => {
-                warn!("BWU(send): unusable gateway '{gateway}'; staying on BLE");
+        let tcp = match crate::hdl::connect_joined(&guard.interface, candidates).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                warn!("BWU(send): dedicated-network connection failed ({error}); staying on BLE");
                 return Ok(false);
             }
         };
-        // The phone's listener may lag DHCP by a moment; retry briefly.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let tcp = loop {
-            match tokio::time::timeout(Duration::from_secs(5), async {
-                let socket = tokio::net::TcpSocket::new_v4()?;
-                socket.bind_device(Some(guard.interface.as_bytes()))?;
-                socket.bind((guard.address, 0).into())?;
-                socket.connect((gw, port).into()).await
-            })
-            .await
-            {
-                Ok(Ok(s)) => break s,
-                _ if tokio::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(700)).await;
-                }
-                _ => {
-                    warn!("BWU(send): couldn't reach {gw}:{port} on '{ssid}'; staying on BLE");
-                    return Ok(false);
-                }
-            }
-        };
-        info!("BWU(send): connected to the phone at {gw}:{port} over '{ssid}'");
         self.join_guard = Some(guard);
         self.finish_upgrade_over(tcp).await
     }
@@ -1478,9 +1464,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                 return Ok(false);
             }
         };
-        let listener =
-            tokio::net::TcpListener::bind((guard.gateway, crate::hdl::HOTSPOT_TCP_PORT)).await?;
-        let port = listener.local_addr()?.port();
+        let listener = crate::hdl::listen_hosted(&guard).await?;
+        let port = listener.port();
+        let address_candidates = crate::hdl::hosted_candidates(&listener);
         info!(
             "BWU(send): hosting '{}' as {:?} (gateway {}:{port}); waiting for the phone to join",
             guard.ssid, medium, guard.gateway
@@ -1498,6 +1484,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                 port: Some(port as i32),
                 frequency: Some(guard.frequency),
                 gateway: Some(guard.gateway.to_string()),
+                ip_v6_address: address_candidates.iter().find_map(|candidate| {
+                    let ip = crate::lan_policy::decode_ip(candidate.ip_address()).ok()?;
+                    matches!(ip, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local())
+                        .then(|| candidate.ip_address().to_vec())
+                }),
                 ..Default::default()
             });
         } else {
@@ -1507,6 +1498,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                 port: Some(port as i32),
                 gateway: Some(guard.gateway.to_string()),
                 frequency: Some(guard.frequency),
+                address_candidates,
             });
         }
         self.encrypt_and_send(&Self::bwu_frame(

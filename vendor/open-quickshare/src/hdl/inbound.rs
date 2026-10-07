@@ -2224,14 +2224,14 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             Err(e) => {
                 warn!("BWU: couldn't host a hotspot ({e}); staying on BLE");
                 // Only fall back to the LAN offer if we actually have a LAN.
-                self.bwu_try_hotspot = crate::utils::local_ipv4().is_none();
+                self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
                 self.schedule_bwu_retry();
                 return Ok(());
             }
         };
-        let listener =
-            tokio::net::TcpListener::bind((guard.gateway, crate::hdl::HOTSPOT_TCP_PORT)).await?;
-        let port = listener.local_addr()?.port();
+        let listener = crate::hdl::listen_hosted(&guard).await?;
+        let port = listener.port();
+        let address_candidates = crate::hdl::hosted_candidates(&listener);
         info!(
             "BWU: hosting hotspot '{}' (gateway {}:{port}) for the sender to join",
             guard.ssid, guard.gateway
@@ -2245,6 +2245,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                 port: Some(port as i32),
                 gateway: Some(guard.gateway.to_string()),
                 frequency: Some(guard.frequency),
+                address_candidates,
             }),
             supports_client_introduction_ack: Some(true),
             ..Default::default()
@@ -2268,7 +2269,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                     }
                     Err(e) => {
                         warn!("BWU: accept on the hotspot failed ({e}); staying on BLE");
-                        self.bwu_try_hotspot = crate::utils::local_ipv4().is_none();
+                        self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
                         self.schedule_bwu_retry();
                         return Ok(());
                     }
@@ -2287,7 +2288,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                         .unwrap_or(false);
                     if is_upgrade_failure {
                         warn!("BWU: sender couldn't join our hotspot (UPGRADE_FAILURE); staying on BLE");
-                        self.bwu_try_hotspot = crate::utils::local_ipv4().is_none();
+                        self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
                         self.schedule_bwu_retry();
                         return Ok(());
                     }
@@ -2297,7 +2298,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     warn!("BWU: sender never joined our hotspot; staying on BLE");
-                    self.bwu_try_hotspot = crate::utils::local_ipv4().is_none();
+                    self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
                     self.schedule_bwu_retry();
                     return Ok(());
                 }

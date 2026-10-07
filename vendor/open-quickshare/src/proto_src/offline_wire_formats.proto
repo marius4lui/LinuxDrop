@@ -285,6 +285,8 @@ message BandwidthUpgradeNegotiationFrame {
       optional string gateway = 4 [default = "0.0.0.0"];
       // This field can be a band or frequency
       optional int32 frequency = 5 [default = -1];
+      // Ordered scoped IPv6 and IPv4 candidates replace gateway/port.
+      repeated ServiceAddress address_candidates = 6;
     }
 
     // Accompanies Medium.WIFI_LAN.

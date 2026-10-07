@@ -436,3 +436,29 @@ candidate connection before link-down/recovery. The address-policy/socket test
 also passed as unprivileged Ubuntu. Workspace all-target Clippy passed. No
 physical Android or over-the-air multicast acceptance is inferred, and installed
 packages/live demo remain unchanged.
+
+
+## Direct/hotspot IPv6 transport, 2026-10-07
+
+Wi-Fi Direct's IPv6 link-local credential and hotspot ordered ServiceAddress
+candidates now feed a shared dedicated-interface connector. Hotspot lists replace
+legacy gateway/port fields; direct IPv6 precedes the IPv4 gateway. Every attempt
+binds both the local address and leased device, scopes link-local peers locally,
+rejects foreign scopes, and remains bounded/cancellable. Hosted sockets likewise
+bind the reserved interface and advertise their actual IPv6/IPv4 listeners.
+The hotspot legacy gateway stays the final IPv4 candidate.
+
+Temporary NetworkManager profiles enable IPv6 without default routes, imported
+DNS or imported routes. Joining supports IPv6-only activation, with an explicit
+link-local mode when the offered IPv6 candidates require no router advertisement;
+hosting retains an IPv4 gateway plus IPv6 link-local. IPv4 presence is now optional
+in a join guard rather than represented as a fabricated address. Profile policy
+follows the [NetworkManager IPv6 settings](https://networkmanager.dev/docs/api/latest/settings-ipv6.html).
+
+Passed: candidate validation/fallback tests, the private NetworkManager test
+(including IPv6-only and link-local profile cleanup), four network crate tests,
+and the isolated kernel network test establishing scoped link-local connections
+on the selected interface and refusing a different interface. Workspace all-target
+Clippy passed. Native P2P group-owner role negotiation and netd's IPv4-required
+DHCP completion path still need work for full IPv6-only supplicant P2P; no physical
+radio interoperability or complete Wi-Fi Direct conformance is claimed here.

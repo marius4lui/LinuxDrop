@@ -25,6 +25,7 @@ struct State {
     settings: Option<Settings>,
     active: bool,
     wait_for_address: bool,
+    ipv6_only: bool,
     device_state: u32,
     activations: u32,
     deactivations: u32,
@@ -166,7 +167,15 @@ impl Device {
     }
     #[zbus(property)]
     fn ip4_config(&self) -> OwnedObjectPath {
-        path(IP)
+        if self.0.lock().unwrap().ipv6_only {
+            path("/")
+        } else {
+            path(IP)
+        }
+    }
+    #[zbus(property)]
+    fn ip6_config(&self) -> OwnedObjectPath {
+        path("/org/freedesktop/NetworkManager/IP6Config/1")
     }
 }
 struct Wireless;
@@ -183,6 +192,14 @@ impl Ip {
     #[zbus(property)]
     fn address_data(&self) -> Vec<HashMap<String, OwnedValue>> {
         vec![HashMap::from([("address".into(), string("192.168.88.2"))])]
+    }
+}
+struct Ip6;
+#[zbus::interface(name = "org.freedesktop.NetworkManager.IP6Config")]
+impl Ip6 {
+    #[zbus(property)]
+    fn address_data(&self) -> Vec<HashMap<String, OwnedValue>> {
+        vec![HashMap::from([("address".into(), string("fe80::1234"))])]
     }
 }
 struct AccessPoint;
@@ -252,6 +269,8 @@ async fn volatile_profiles_are_owned_serialized_and_removed_on_cancel() {
         .unwrap()
         .serve_at(IP, Ip)
         .unwrap()
+        .serve_at("/org/freedesktop/NetworkManager/IP6Config/1", Ip6)
+        .unwrap()
         .serve_at(AP, AccessPoint)
         .unwrap()
         .serve_at(ACTIVE, Active(state.clone()))
@@ -269,7 +288,7 @@ async fn volatile_profiles_are_owned_serialized_and_removed_on_cancel() {
     )
     .await
     .unwrap();
-    assert_eq!(guard.address.to_string(), "192.168.88.2");
+    assert_eq!(guard.address.unwrap().to_string(), "192.168.88.2");
     assert_eq!(guard.frequency, 2437);
     assert!(nm::connect(
         lease(),
@@ -342,4 +361,59 @@ async fn volatile_profiles_are_owned_serialized_and_removed_on_cancel() {
     assert_eq!(state.lock().unwrap().activations, 2);
     assert_eq!(state.lock().unwrap().deletions, 0);
     assert!(state.lock().unwrap().settings.is_some());
+
+    // A joined network can activate with IPv6 only. It still cannot replace
+    // host routes or DNS, and the exclusive lease lasts through cleanup.
+    {
+        let mut state = state.lock().unwrap();
+        state.settings = None;
+        state.device_state = 30;
+        state.wait_for_address = false;
+        state.ipv6_only = true;
+    }
+    let guard = nm::connect(
+        lease(),
+        "ipv6-network".into(),
+        "test-password".into(),
+        false,
+        semaphore.clone(),
+    )
+    .await
+    .unwrap();
+    assert!(guard.address.is_none());
+    {
+        let state = state.lock().unwrap();
+        let settings = state.settings.as_ref().unwrap();
+        assert_eq!(
+            <&str>::try_from(&settings["ipv6"]["method"]).unwrap(),
+            "auto"
+        );
+        for key in ["never-default", "ignore-auto-dns", "ignore-auto-routes"] {
+            assert!(bool::try_from(&settings["ipv6"][key]).unwrap());
+        }
+        assert!(bool::try_from(&settings["ipv4"]["may-fail"]).unwrap());
+    }
+    assert_eq!(semaphore.available_permits(), 0);
+    drop(guard);
+    wait_for(|| semaphore.available_permits() == 1).await;
+    assert!(!state.lock().unwrap().active);
+    let guard = nm::connect_with_ipv6(
+        lease(),
+        "ipv6-link-local".into(),
+        "test-password".into(),
+        false,
+        semaphore.clone(),
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(guard.address.is_none());
+    assert_eq!(
+        <&str>::try_from(&state.lock().unwrap().settings.as_ref().unwrap()["ipv6"]["method"])
+            .unwrap(),
+        "link-local"
+    );
+    drop(guard);
+    wait_for(|| semaphore.available_permits() == 1).await;
+    assert!(!state.lock().unwrap().active);
 }

@@ -1,7 +1,12 @@
 //! Temporary NetworkManager profiles belonging to an existing netd radio lease.
 //! Passwords are sent over D-Bus, never placed in process arguments or logs.
 use anyhow::{bail, Context, Result};
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use zbus::{
     zvariant::{OwnedObjectPath, OwnedValue, Value},
@@ -48,7 +53,7 @@ impl Lease {
 
 /// The permit stays held until asynchronous cleanup finishes.
 pub struct Guard {
-    pub address: Ipv4Addr,
+    pub address: Option<Ipv4Addr>,
     pub frequency: i32,
     lease: Lease,
     permit: Option<OwnedSemaphorePermit>,
@@ -74,6 +79,7 @@ fn profile<'a>(
     ssid: &'a str,
     password: &'a str,
     host: bool,
+    ipv6_link_local: bool,
 ) -> Result<Settings<'a>> {
     lease.validate()?;
     if ssid.is_empty()
@@ -108,6 +114,7 @@ fn profile<'a>(
     ]);
     let ipv4 = HashMap::from([
         ("method", Value::from(if host { "shared" } else { "auto" })),
+        ("may-fail", Value::from(!host)),
         ("never-default", Value::from(true)),
         ("ignore-auto-dns", Value::from(true)),
         ("ignore-auto-routes", Value::from(true)),
@@ -117,7 +124,23 @@ fn profile<'a>(
         ("802-11-wireless", wifi),
         ("802-11-wireless-security", security),
         ("ipv4", ipv4),
-        ("ipv6", HashMap::from([("method", Value::from("disabled"))])),
+        (
+            "ipv6",
+            HashMap::from([
+                (
+                    "method",
+                    Value::from(if host || ipv6_link_local {
+                        "link-local"
+                    } else {
+                        "auto"
+                    }),
+                ),
+                ("never-default", Value::from(true)),
+                ("ignore-auto-dns", Value::from(true)),
+                ("ignore-auto-routes", Value::from(true)),
+                ("may-fail", Value::from(true)),
+            ]),
+        ),
     ]))
 }
 
@@ -131,6 +154,18 @@ pub async fn connect(
     host: bool,
     semaphore: Arc<Semaphore>,
 ) -> Result<Guard> {
+    connect_with_ipv6(lease, ssid, password, host, semaphore, false).await
+}
+
+/// Link-local mode is selected only when offered IPv6 candidates require no RA.
+pub async fn connect_with_ipv6(
+    lease: Lease,
+    ssid: String,
+    password: String,
+    host: bool,
+    semaphore: Arc<Semaphore>,
+    ipv6_link_local: bool,
+) -> Result<Guard> {
     let permit = semaphore
         .try_acquire_owned()
         .context("The reserved adapter is already in use by another transfer")?;
@@ -139,7 +174,7 @@ pub async fn connect(
     let cancel_on_drop = cancel.clone().drop_guard();
     tokio::spawn(async move {
         let result = tokio::select! {
-            result=connect_inner(lease,ssid,password,host,permit)=>result,
+            result=connect_inner(lease,ssid,password,host,permit,ipv6_link_local)=>result,
             _=cancel.cancelled()=>Err(anyhow::anyhow!("Network activation cancelled")),
         };
         let _ = sender.send(result);
@@ -157,8 +192,9 @@ async fn connect_inner(
     password: String,
     host: bool,
     permit: OwnedSemaphorePermit,
+    ipv6_link_local: bool,
 ) -> Result<Guard> {
-    let settings = profile(&lease, &ssid, &password, host)?;
+    let settings = profile(&lease, &ssid, &password, host, ipv6_link_local)?;
     let bus = Connection::system().await?;
     let manager = Proxy::new(&bus, NM, ROOT, NM).await?;
     let path: OwnedObjectPath = manager
@@ -176,7 +212,7 @@ async fn connect_inner(
     }
     ensure_uuid_free(&bus, &lease).await?;
     let mut guard = Guard {
-        address: Ipv4Addr::UNSPECIFIED,
+        address: None,
         frequency: 0,
         lease: lease.clone(),
         permit: Some(permit),
@@ -204,24 +240,39 @@ async fn connect_inner(
                 bail!("NetworkManager could not activate the reserved network");
             }
             if state == 100 {
-                let ip_path: OwnedObjectPath = device.get_property("Ip4Config").await?;
-                let ip = Proxy::new(
-                    &bus,
-                    NM,
-                    ip_path,
-                    "org.freedesktop.NetworkManager.IP4Config",
-                )
-                .await?;
-                let addresses: Vec<HashMap<String, OwnedValue>> =
-                    ip.get_property("AddressData").await?;
-                for address in addresses {
-                    if let Some(value) = address
-                        .get("address")
-                        .and_then(|v| <&str>::try_from(v).ok())
-                        .and_then(|v| v.parse::<Ipv4Addr>().ok())
-                        .filter(|v| !v.is_unspecified() && !v.is_loopback() && !v.is_multicast())
-                    {
-                        return Ok::<Ipv4Addr, anyhow::Error>(value);
+                for (property, interface) in [
+                    ("Ip4Config", "org.freedesktop.NetworkManager.IP4Config"),
+                    ("Ip6Config", "org.freedesktop.NetworkManager.IP6Config"),
+                ] {
+                    if host && property == "Ip6Config" {
+                        continue;
+                    }
+                    let ip_path: OwnedObjectPath = device.get_property(property).await?;
+                    if ip_path.as_str() == "/" {
+                        continue;
+                    }
+                    let ip = Proxy::new(&bus, NM, ip_path, interface).await?;
+                    let addresses: Vec<HashMap<String, OwnedValue>> =
+                        ip.get_property("AddressData").await?;
+                    for address in addresses {
+                        if let Some(value) = address
+                            .get("address")
+                            .and_then(|v| <&str>::try_from(v).ok())
+                            .and_then(|v| v.parse::<IpAddr>().ok())
+                            .filter(|v| {
+                                !v.is_unspecified() && !v.is_loopback() && !v.is_multicast()
+                            })
+                        {
+                            match value {
+                                IpAddr::V4(ip) if !ip.is_broadcast() => {
+                                    return Ok::<_, anyhow::Error>(Some(ip))
+                                }
+                                IpAddr::V6(ip) if !host && ip.to_ipv4_mapped().is_none() => {
+                                    return Ok(None)
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
             }
@@ -390,7 +441,7 @@ mod tests {
             connection_uuid: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
         };
         for host in [false, true] {
-            let config = profile(&lease, "DIRECT-test", "12345678", host).unwrap();
+            let config = profile(&lease, "DIRECT-test", "12345678", host, false).unwrap();
             assert_eq!(
                 <&str>::try_from(&config["connection"]["id"]).unwrap(),
                 lease.name()
@@ -399,6 +450,6 @@ mod tests {
             assert!(bool::try_from(&config["ipv4"]["never-default"]).unwrap());
             assert!(bool::try_from(&config["ipv4"]["ignore-auto-dns"]).unwrap());
         }
-        assert!(profile(&lease, "bad", "short", false).is_err());
+        assert!(profile(&lease, "bad", "short", false, false).is_err());
     }
 }
