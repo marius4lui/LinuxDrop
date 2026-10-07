@@ -28,6 +28,8 @@ const de = {
     'Hide in full screen': 'Bei Vollbild verbergen', 'Keep videos and presentations unobstructed': 'Videos und Präsentationen nicht verdecken',
     'Animate transitions': 'Übergänge animieren', 'Also respects the desktop animation setting': 'Berücksichtigt auch die Animationseinstellungen des Desktops',
     'Position and behavior': 'Position und Verhalten', 'Monitor': 'Bildschirm',
+    'Fixed monitor index': 'Fester Bildschirmindex',
+    'Only used for Fixed monitor. 0 is the first display; −1 or an unavailable display uses the primary monitor.': 'Gilt nur bei festgelegtem Bildschirm. 0 ist der erste Bildschirm; bei −1 oder einem nicht verfügbaren Bildschirm wird der Hauptbildschirm verwendet.',
     '−1 follows the primary monitor; otherwise use a monitor index': '−1 verwendet den Hauptbildschirm; sonst den Bildschirmindex angeben',
     'Top spacing': 'Abstand nach oben', 'Logical pixels below the panel': 'Logische Pixel unter der oberen Leiste',
     'Close after inactivity': 'Nach Inaktivität schließen', 'Seconds; 0 keeps the expanded menu open': 'Sekunden; 0 lässt das aufgeklappte Menü offen',

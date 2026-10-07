@@ -114,6 +114,8 @@ export default class LinuxDropExtension extends Extension {
         this._notch.connect('notify::hover', () => this._scheduleCollapse());
         Main.layoutManager.addChrome(this._notch, {affectsInputRegion: true, trackFullscreen: true});
         this._connect(global.stage, 'captured-event', (_, event) => this._dismissFromEvent(event));
+        this._connect(global.stage, 'notify::key-focus', () => this._ensureFocusVisible());
+        this._body.connect('notify::allocation', () => this._ensureFocusVisible());
         this._connect(Main.layoutManager, 'monitors-changed', () => this._position());
         this._connect(St.ThemeContext.get_for_stage(global.stage), 'notify::scale-factor', () => this._position());
         this._connect(Main.sessionMode, 'updated', () => this._visibility());
@@ -382,6 +384,18 @@ export default class LinuxDropExtension extends Extension {
             if (!this._notch.hover && (!focus || !this._notch.contains(focus))) this._setExpanded(false);
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _ensureFocusVisible() {
+        const focus = global.stage.get_key_focus();
+        if (!this._expanded || !focus || !this._body.contains(focus) || !focus.has_allocation()) return;
+        const [, top] = focus.get_transformed_position();
+        const [, height] = focus.get_transformed_size();
+        const [, viewportTop] = this._scroll.get_transformed_position();
+        const [, viewportHeight] = this._scroll.get_transformed_size();
+        const adjustment = this._scroll.vadjustment;
+        if (top < viewportTop) adjustment.value += top - viewportTop;
+        else if (top + height > viewportTop + viewportHeight) adjustment.value += top + height - viewportTop - viewportHeight;
     }
 
     _position() {

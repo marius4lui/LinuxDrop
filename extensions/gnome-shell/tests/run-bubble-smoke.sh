@@ -43,7 +43,12 @@ dbus-run-session -- bash -c '
     for attempt in {1..15}; do
         sleep 1
         if grep -q LINUXDROP_SMOKE_FAILED "$LINUXDROP_SMOKE_ROOT/shell.log"; then cat "$LINUXDROP_SMOKE_ROOT/shell.log"; exit 1; fi
-        if grep -q LINUXDROP_SMOKE_PASSED "$LINUXDROP_SMOKE_ROOT/shell.log"; then grep LINUXDROP_SMOKE_PASSED "$LINUXDROP_SMOKE_ROOT/shell.log"; exit 0; fi
+        if grep -q LINUXDROP_SMOKE_PASSED "$LINUXDROP_SMOKE_ROOT/shell.log"; then
+            grep LINUXDROP_SMOKE_PASSED "$LINUXDROP_SMOKE_ROOT/shell.log"
+            extension="$XDG_DATA_HOME/gnome-shell/extensions/linuxdrop@marius4lui.github.io"
+            GI_TYPELIB_PATH="/usr/lib/gnome-shell/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}" LD_LIBRARY_PATH="/usr/lib/gnome-shell${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" gjs -m "$extension/tests/prefs-smoke.js" "$extension"
+            exit 0
+        fi
     done
     cat "$LINUXDROP_SMOKE_ROOT/shell.log"
     exit 1

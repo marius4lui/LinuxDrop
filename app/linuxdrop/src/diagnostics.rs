@@ -48,6 +48,8 @@ pub fn add_actions(ui: &Rc<Ui>, group: &adw::PreferencesGroup) -> Vec<(gtk::Widg
             _ => "go-next-symbolic",
         });
         button.set_tooltip_text(Some(&tr(title)));
+        button.set_widget_name(&format!("diagnostic:{action}"));
+        button.update_property(&[gtk::accessible::Property::Label(&tr(title))]);
         button.set_valign(gtk::Align::Center);
         row.add_suffix(&button);
         row.set_activatable_widget(Some(&button));

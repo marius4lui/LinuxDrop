@@ -1,6 +1,7 @@
 // Injected only into the isolated test copy by run-bubble-smoke.sh.
 GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
     const check = (condition, message) => { if (!condition) throw new Error(message); };
+    const settle = () => new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => { resolve(); return GLib.SOURCE_REMOVE; }));
     const later = callback => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
         Promise.resolve().then(callback).catch(error => console.error(`LINUXDROP_SMOKE_FAILED: ${error.message}\n${error.stack}`));
         return GLib.SOURCE_REMOVE;
@@ -32,6 +33,19 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                 finally { output.close(null); }
                 console.log(`LINUXDROP_SMOKE_CAPTURED: ${capture}`);
             }
+            this._scroll.set_style('max-height: 120px;');
+            await settle();
+            const details = find(this._body, 'Details'); details.grab_key_focus();
+            await settle();
+            const [, actionY] = details.get_transformed_position();
+            const [, scrollY] = this._scroll.get_transformed_position();
+            check(actionY >= scrollY && actionY + details.height <= scrollY + this._scroll.height + 1, 'Keyboard-focused action must scroll fully into view');
+            const first = find(this._body, 'Previous transfer'); first.grab_key_focus();
+            await settle();
+            const [, firstY] = first.get_transformed_position();
+            check(firstY >= scrollY && firstY + first.height <= scrollY + this._scroll.height + 1, 'Keyboard navigation must also scroll back to the transfer chooser');
+            this._position();
+            await settle();
             let next = find(this._body, 'Next transfer'); next.grab_key_focus(); next.emit('clicked', 1);
             check(this._selectedTransfer === 'other-transfer' && global.stage.get_key_focus() === find(this._body, 'Next transfer'), 'Next must preserve keyboard focus on the rebuilt chooser');
             const previous = find(this._body, 'Previous transfer'); previous.grab_key_focus(); previous.emit('clicked', 1);
@@ -63,7 +77,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     check(!find(this._body, 'Cancel') && find(this._body, 'Open LinuxDrop'), 'Offline state must replace stale transfer actions');
                     this._setExpanded(false);
                     check(!this._notch.visible && global.stage.get_key_focus() === this._panelButton, 'Close must hide and restore panel focus');
-                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, native scroll, verification, chooser, progress, busy, helper failure, offline, focus');
+                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, PIN, progress, busy, helper failure, offline, focus');
                 });
             });
         });

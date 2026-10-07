@@ -190,3 +190,26 @@ Rendered evidence is in `ui/completion/completed-received-files.png`,
 External application/file-manager launch, actual screen-reader traversal and
 physical mixed-DPI acceptance are not inferred from these checks. The live demo
 and installed packages were not changed.
+
+
+## 2026-10-07: settings search recovery and constrained keyboard navigation
+
+Two Astra/high agents owned the GTK and Shell surfaces separately. Settings
+search now retains every edit immediately during a settings refresh, searches
+translated option labels and category names, and tolerates additional whitespace.
+A no-results state explains how to recover; Show all settings clears search and
+category together and restores input focus. Settings and diagnostic icon actions
+have explicit translated accessibility labels.
+
+The Shell now scrolls a focused action into its viewport, including when a short
+viewport previously left the Details button entirely offscreen. The fixed-monitor
+index is enabled only in fixed mode, explains zero-based indexing and fallback,
+and follows external changes to the monitor mode.
+
+Passed: isolated native GTK regression in German at 480x600; real GNOME 46 bubble
+and GTK preferences tests in English and German at 150% text; workspace all-target
+Clippy. The keyboard scrolling regression failed before its fix and passed after.
+Root reviewed captures `ui/completion/settings-search-empty.png` and
+`ui/completion/shell-focus-de150.png`. Real screen-reader traversal and physical
+mixed-DPI hotplug remain unverified. Installed packages and the live demo were
+not changed.

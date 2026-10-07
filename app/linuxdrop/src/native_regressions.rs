@@ -273,15 +273,56 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         settings::render(&ui, &config);
         assert!(find(&ui.settings_body, "setting:localsend.require_pin").unwrap().is_sensitive());
         let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
-        search.set_text("Device");
+        search.set_text(&tr("Device name"));
         search.grab_focus();
-        glib::timeout_future(Duration::from_millis(300)).await;
+        // Rebuild immediately, before SearchEntry's delayed search-changed signal.
+        assert_eq!(*ui.settings_query.borrow(), tr("Device name"));
         settings::render(&ui, &config);
         settle().await;
         let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
-        assert_eq!(search.text(), "Device");
+        assert_eq!(search.text(), tr("Device name"));
         let focused = gtk::prelude::GtkWindowExt::focus(&ui.window).unwrap();
         assert!(focused == search.clone().upcast::<gtk::Widget>() || focused.is_ancestor(&search), "Search keeps keyboard focus across a settings resync");
+        search.set_text(&format!("  {}   {}  ", tr("Dark"), tr("Appearance")));
+        assert!(find(&ui.settings_body, "setting:general.appearance").unwrap().is_visible(),
+            "Search must include choice labels and tolerate extra whitespace");
+        assert!(!find(&ui.settings_body, "setting:general.device_name").unwrap().is_visible());
+        let no_results = find(&ui.settings_body, "settings:no-results").unwrap();
+        assert!(!no_results.is_visible());
+        search.set_text(&tr("About and diagnostics"));
+        let diagnostic = find(&ui.settings_body, "diagnostic:export").unwrap();
+        assert!(diagnostic.is_visible(), "A category search must reveal its diagnostic actions");
+        for (action, title) in [
+            ("export", "Save diagnostic report"),
+            ("defaults", "Show default settings"),
+            ("restart", "Restart sharing backends"),
+            ("reset", "Restore default settings"),
+            ("recovery", "Recovery status"),
+        ] {
+            let button = find(&ui.settings_body, &format!("diagnostic:{action}")).unwrap();
+            let name = std::ffi::CString::new(tr(title)).unwrap();
+            // GTK's test backend inspects the actual exposed accessible label.
+            let mismatch: Option<glib::GString> = unsafe {
+                glib::translate::from_glib_full(gtk::ffi::gtk_test_accessible_check_property(
+                    button.as_ptr().cast(), gtk::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL, name.as_ptr(),
+                ))
+            };
+            assert!(mismatch.is_none(), "Diagnostic action {action} needs its translated accessible name: {mismatch:?}");
+        }
+        let category = find(&ui.settings_body, "setting:category").unwrap().downcast::<gtk::DropDown>().unwrap();
+        category.set_selected(1);
+        assert!(no_results.is_visible(), "A category/search mismatch must explain the empty result");
+        settle().await;
+        capture(&ui, "settings-no-results-review.png");
+        find(&ui.settings_body, "settings:clear-filters").unwrap().downcast::<gtk::Button>().unwrap().emit_clicked();
+        assert_eq!(search.text(), "");
+        assert_eq!(category.selected(), 0);
+        assert!(!no_results.is_visible());
+        assert!(find(&ui.settings_body, "setting:general.device_name").unwrap().is_visible());
+        assert!(diagnostic.is_visible());
+        let focused = gtk::prelude::GtkWindowExt::focus(&ui.window).unwrap();
+        assert!(focused == search.clone().upcast::<gtk::Widget>() || focused.is_ancestor(&search),
+            "Clearing filters must return keyboard focus to search");
         ui.stack.set_visible_child_name("send");
         ui.window.set_default_size(1100, 760);
         settle().await;

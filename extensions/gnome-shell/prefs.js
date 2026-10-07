@@ -23,10 +23,14 @@ export default class LinuxDropPreferences extends ExtensionPreferences {
         page.add(position);
         const modes = ['primary', 'pointer', 'fixed'];
         const monitorMode = new Adw.ComboRow({title: t('Open bubble on'), model: Gtk.StringList.new(['Primary monitor', 'Pointer monitor', 'Fixed monitor'].map(t)), selected: Math.max(0, modes.indexOf(settings.get_string('monitor-mode')))});
-        monitorMode.connect('notify::selected', () => settings.set_string('monitor-mode', modes[monitorMode.selected]));
+        monitorMode.connect('notify::selected', () => {
+            const mode = modes[monitorMode.selected];
+            if (mode && mode !== settings.get_string('monitor-mode')) settings.set_string('monitor-mode', mode);
+        });
         position.add(monitorMode);
+        let fixedMonitorRow;
         for (const [key, title, subtitle, lower, upper] of [
-            ['monitor', 'Monitor', '−1 follows the primary monitor; otherwise use a monitor index', -1, 32],
+            ['monitor', 'Fixed monitor index', 'Only used for Fixed monitor. 0 is the first display; −1 or an unavailable display uses the primary monitor.', -1, 32],
             ['top-offset', 'Top spacing', 'Logical pixels below the panel', 0, 200],
             ['auto-collapse', 'Close after inactivity', 'Seconds; 0 keeps the expanded menu open', 0, 120],
             ['drag-hover-delay', 'Drag hover delay', 'Milliseconds before the open bubble accepts file drops', 100, 2000],
@@ -34,7 +38,16 @@ export default class LinuxDropPreferences extends ExtensionPreferences {
             const row = new Adw.SpinRow({title: t(title), subtitle: t(subtitle), adjustment: new Gtk.Adjustment({lower, upper, step_increment: 1, page_increment: 10})});
             settings.bind(key, row, 'value', Gio.SettingsBindFlags.DEFAULT);
             position.add(row);
+            if (key === 'monitor') fixedMonitorRow = row;
         }
+        const syncMonitorMode = () => {
+            const mode = settings.get_string('monitor-mode');
+            monitorMode.selected = Math.max(0, modes.indexOf(mode));
+            fixedMonitorRow.sensitive = mode === 'fixed';
+        };
+        syncMonitorMode();
+        const monitorChanged = settings.connect('changed::monitor-mode', syncMonitorMode);
+        window.connect('close-request', () => { settings.disconnect(monitorChanged); return false; });
         const info = new Adw.PreferencesGroup({title: t('Files and privacy'), description: t('Click the LinuxDrop icon in the top panel first. Then choose Drop files or drag files over the open bubble. Click outside or press Escape to close. Requests and progress never open it automatically.')});
         page.add(info);
         window.add(page);

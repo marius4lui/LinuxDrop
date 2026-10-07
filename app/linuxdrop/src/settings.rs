@@ -51,6 +51,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         .placeholder_text(tr("Search settings"))
         .build();
     search.set_widget_name("setting:search");
+    search.update_property(&[gtk::accessible::Property::Label(&tr("Search settings"))]);
     search.set_text(&ui.settings_query.borrow());
     ui.settings_body.append(&search);
     let category = gtk::DropDown::from_strings(&[&tr("All categories")]);
@@ -547,6 +548,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     let button = gtk::Button::from_icon_name("folder-open-symbolic");
                     button.set_valign(gtk::Align::Center);
                     button.set_tooltip_text(Some(&tr(field.detail)));
+                    button.update_property(&[gtk::accessible::Property::Label(&tr(field.title))]);
                     row.add_suffix(&button);
                     row.set_activatable_widget(Some(&button));
                     let weak = Rc::downgrade(ui);
@@ -589,10 +591,14 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
             };
             widget.set_widget_name(&format!("setting:{draft_key}"));
             group.add(&widget);
-            rows.push((
-                widget,
-                format!("{} {} {}", tr(title), tr(field.title), tr(field.detail)).to_lowercase(),
-            ));
+            let mut terms = format!("{} {} {}", tr(title), tr(field.title), tr(field.detail));
+            if let Kind::Choice(choices) = &field.kind {
+                for (_, name) in *choices {
+                    terms.push(' ');
+                    terms.push_str(&tr(name));
+                }
+            }
+            rows.push((widget, terms.to_lowercase()));
         }
         if !rows.is_empty() {
             if *section == "transfers" {
@@ -602,6 +608,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     .build();
                 let button = gtk::Button::from_icon_name("user-trash-symbolic");
                 button.set_tooltip_text(Some(&tr("Clear transfer history")));
+                button.update_property(&[gtk::accessible::Property::Label(&tr(
+                    "Clear transfer history",
+                ))]);
                 button.set_valign(gtk::Align::Center);
                 row.add_suffix(&button);
                 row.set_activatable_widget(Some(&button));
@@ -636,6 +645,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         .build();
     let button = gtk::Button::from_icon_name("preferences-system-symbolic");
     button.set_tooltip_text(Some(&tr("Notch preferences")));
+    button.update_property(&[gtk::accessible::Property::Label(&tr("Notch preferences"))]);
     button.set_valign(gtk::Align::Center);
     open.add_suffix(&button);
     open.set_activatable_widget(Some(&button));
@@ -689,6 +699,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         .build();
     let button = gtk::Button::from_icon_name("edit-copy-symbolic");
     button.set_tooltip_text(Some(&tr("Copy diagnostic report")));
+    button.update_property(&[gtk::accessible::Property::Label(&tr(
+        "Copy diagnostic report",
+    ))]);
     button.set_valign(gtk::Align::Center);
     row.add_suffix(&button);
     row.set_activatable_widget(Some(&button));
@@ -729,6 +742,30 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         ),
     ]);
     search_groups.push((diagnostics, diagnostic_rows));
+    let empty = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    empty.set_widget_name("settings:no-results");
+    empty.set_margin_top(24);
+    empty.append(&label("No matching settings", "hero-subtitle"));
+    let guidance = label(
+        "Try another term or clear the search and category.",
+        "compact-note",
+    );
+    guidance.set_wrap(true);
+    empty.append(&guidance);
+    let reset = gtk::Button::with_label(&tr("Show all settings"));
+    reset.set_widget_name("settings:clear-filters");
+    reset.set_halign(gtk::Align::Center);
+    let search_weak = search.downgrade();
+    let category_weak = category.downgrade();
+    reset.connect_clicked(move |_| {
+        if let (Some(search), Some(category)) = (search_weak.upgrade(), category_weak.upgrade()) {
+            category.set_selected(0);
+            search.set_text("");
+            search.grab_focus();
+        }
+    });
+    empty.append(&reset);
+    ui.settings_body.append(&empty);
     let names: Vec<String> = std::iter::once(tr("All categories"))
         .chain(
             search_groups
@@ -744,32 +781,44 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
         let groups = groups.clone();
         let search = search.downgrade();
         let category = category.downgrade();
+        let empty = empty.downgrade();
         let weak = Rc::downgrade(ui);
         Rc::new(move || {
             let (Some(search), Some(category)) = (search.upgrade(), category.upgrade()) else {
                 return;
             };
             let query = search.text().to_lowercase();
+            let terms: Vec<&str> = query.split_whitespace().collect();
             let selected = category.selected();
             if let Some(ui) = weak.upgrade() {
                 *ui.settings_query.borrow_mut() = search.text().to_string();
                 ui.settings_category.set(selected);
             }
+            let mut any_visible = false;
             for (index, (group, rows)) in groups.iter().enumerate() {
                 let mut visible = false;
+                let category_text = group.title().to_lowercase();
                 for (row, text) in rows {
-                    let matches =
-                        text.contains(&query) && (selected == 0 || selected == index as u32 + 1);
+                    let matches = terms
+                        .iter()
+                        .all(|term| text.contains(term) || category_text.contains(term))
+                        && (selected == 0 || selected == index as u32 + 1);
                     row.set_visible(matches);
                     visible |= matches;
                 }
                 group.set_visible(visible);
+                any_visible |= visible;
+            }
+            if let Some(empty) = empty.upgrade() {
+                empty.set_visible(!any_visible);
             }
         })
     };
     filter();
     let filter_copy = filter.clone();
-    search.connect_search_changed(move |_| filter_copy());
+    // Persist each edit synchronously: a settings response may rebuild this
+    // entry before SearchEntry's delayed search-changed signal is emitted.
+    search.connect_changed(move |_| filter_copy());
     category.connect_selected_notify(move |_| filter());
     if let Some(name) = focus_name {
         crate::ui::restore_focus(&ui.settings_body, &name);
