@@ -130,6 +130,14 @@ with tempfile.TemporaryDirectory(prefix='linuxdrop-file-selection-') as temporar
             actual = {name for name in labels if name.startswith('Remove file: ')}
             return actual == expected and '3 files ready \u00b7 choose a device' in labels
         wait(draft_ready)
+        frame = next(item for item in nodes(app) if item.getRoleName() == 'frame')
+        frame_x, _, frame_width, _ = frame.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+        for caption in ('Add more files', 'Send files', 'Share with a link'):
+            action = next(item for item in nodes(app) if item.name == caption and item.getRoleName() == 'button')
+            x, _, width, _ = action.queryComponent().getExtents(pyatspi.DESKTOP_COORDS)
+            assert x >= frame_x and x + width <= frame_x + frame_width, (
+                f'{caption} extends outside the actual application window: '
+                f'{x}+{width}, frame {frame_x}+{frame_width}')
         for name in filenames:
             assert (root / name).read_text() == 'test bytes'
         assert not (root / 'INJECTION').exists()

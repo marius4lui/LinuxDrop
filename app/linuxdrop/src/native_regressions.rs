@@ -111,7 +111,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         "settings":{"general":{"device_name":"Native review","appearance":"dark","language":"system","close_behavior":"background","autostart":false},"visibility":{"mode":"hidden"},"receive":{"directory":"/tmp","ask_directory":true,"collision_policy":"rename"},"localsend":{"enabled":false,"pin":"","require_pin":false}},
         "hardware":{"radios":[],"bluetooth":[]},"backends":[],
         "peers":[{"id":"pixel","name":"Pixel test fixture","platform":"android","available":true,"protocols":["localsend","quickshare"]}],
-        "transfers":[{"id":"progress","peer_id":"pixel","peer_name":"Pixel test fixture","protocol":"localsend","direction":"outgoing","state":"transferring","total_bytes":100,"transferred_bytes":10,"files":[{"name":"progress.txt","size":100,"transferred":10}]}]
+        "transfers":[{"id":"progress","peer_id":"pixel","peer_name":"Pixel test fixture","protocol":"localsend","direction":"outgoing","state":"transferring","total_bytes":100,"transferred_bytes":10,"files":[{"name":format!("{}.txt", "unbrokenfilename".repeat(40)),"size":100,"transferred":10}]}]
     })));
     let sent_protocol = Rc::new(RefCell::new(String::new()));
     let accepted_options = Rc::new(RefCell::new(Value::Null));
@@ -276,6 +276,8 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         ui.window.set_default_size(480, 600);
         settle().await;
         capture(&ui, "send-compact-review.png");
+        assert!(ui.toasts.measure(gtk::Orientation::Horizontal, -1).0 <= ui.window.width(),
+            "A long filename on an inactive transfer page must not widen the send view");
         assert!(
             ui.peers.compute_bounds(&ui.window).unwrap().y() < 480.0,
             "Nearby must be visible before the bottom actions at 480x600"
@@ -315,6 +317,15 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         gtk_settings.set_property("gtk-xft-dpi", original_dpi);
         ui.stack.set_visible_child_name("send");
         settle().await;
+        let file_summary = find(&ui.transfers, "transfer:progress:Files").unwrap().downcast::<gtk::Label>().unwrap();
+        let line_height = file_summary.create_pango_layout(Some("Ag")).pixel_size().1;
+        assert!(file_summary.measure(gtk::Orientation::Vertical, 300).1 <= line_height * 2 + 2,
+            "A transfer summary must leave its actions reachable even for long unbroken filenames");
+        assert_eq!(file_summary.tooltip_text().as_deref(), snapshot.borrow()["transfers"][0]["files"][0]["name"].as_str());
+        ui.stack.set_visible_child_name("transfers");
+        settle().await;
+        capture(&ui, "transfers-long-filename.png");
+        ui.stack.set_visible_child_name("send");
         *ui.selected.borrow_mut() = Some("pixel".into());
         ui.render_peers();
         ui.protocol.set_selected(2);

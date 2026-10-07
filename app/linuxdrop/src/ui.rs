@@ -72,10 +72,15 @@ enum FileCheck {
 }
 
 pub fn label(text: &str, class: &str) -> gtk::Label {
+    literal_label(&tr(text), class)
+}
+
+fn literal_label(text: &str, class: &str) -> gtk::Label {
     let widget = gtk::Label::builder()
-        .label(tr(text))
+        .label(text)
         .xalign(0.0)
         .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .build();
     if !class.is_empty() {
         widget.add_css_class(class);
@@ -1364,7 +1369,7 @@ impl Ui {
                 .as_str()
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| text(&peer, "name"));
-            details.append(&label(display_name, "heading"));
+            details.append(&literal_label(display_name, "heading"));
             if peer["favorite"].as_bool().unwrap_or(false) {
                 row.prepend(&gtk::Image::from_icon_name("starred-symbolic"));
             }
@@ -1598,7 +1603,13 @@ impl Ui {
             card.append(&heading);
             let files = array(transfer, "files");
             let names: Vec<&str> = files.iter().map(|f| text(f, "name")).collect();
-            card.append(&label(&names.join(", "), "compact-note"));
+            let full_names = names.join(", ");
+            let summary = literal_label(&full_names, "compact-note");
+            summary.set_widget_name(&format!("transfer:{}:Files", text(transfer, "id")));
+            summary.set_lines(2);
+            summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+            summary.set_tooltip_text(Some(&full_names));
+            card.append(&summary);
             let total = transfer["total_bytes"].as_u64().unwrap_or(0);
             let done = transfer["transferred_bytes"].as_u64().unwrap_or(0);
             let status = match state {

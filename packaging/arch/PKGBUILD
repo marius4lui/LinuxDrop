@@ -1,7 +1,7 @@
 # Build from a reviewed LinuxDrop source checkout including vendored protocol cores.
 pkgname=linuxdrop
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Nearby file sharing for Linux'
 arch=('x86_64' 'aarch64')
 url='https://github.com/marius4lui/LinuxDrop'
