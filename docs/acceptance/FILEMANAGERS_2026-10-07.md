@@ -54,3 +54,19 @@ source fix. Do not infer visual completion from the AT-SPI selection assertions.
 
 The private root has no FUSE device, so its portal mount warning is expected;
 this test uses local files and does not claim a Flatpak/document-portal journey.
+
+## Packaged follow-up
+
+Ubuntu review `.13` includes the new Thunar descriptor and localized Nautilus
+provider, verified byte-for-byte against the tested source. The release build,
+four executable library checks, desktop/schema validation and actual packaged
+daemon private-network D-Bus/HTTPS scenario pass. No live installation changed.
+
+- Source base: `be256f80907f803cdda9a9d8d62470ebb01089cb`
+- DEB SHA256: `cbb597b589bff964dd56cad838ae53c1514f97c48bb063512bd7e58d5f4666fa`
+- Matching source SHA256: `4b6e292819bf921983d982fc9b1beb0a9483f5c8f1fb7b14d1f033746873000d`
+- Report: `dist/BUILD_REPORT_0.1.0+review.20261007.13.json`
+
+Fedora/Arch artifacts still require their next native rebuild to include the new
+integration and recent GTK scaling changes; the file-manager test staged only
+the integration resources into the isolated installed Fedora revision 3 root.
