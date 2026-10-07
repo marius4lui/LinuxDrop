@@ -1446,10 +1446,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         } else {
             UpMedium::WifiHotspot
         };
-        let guard = match crate::hdl::start_hotspot().await {
+        let hosted = if wifi_direct {
+            crate::hdl::start_direct_group().await
+        } else {
+            crate::hdl::start_hotspot().await
+        };
+        let guard = match hosted {
             Ok(g) => g,
             Err(e) => {
-                warn!("BWU(send): couldn't host a hotspot ({e}); staying on BLE");
+                warn!("BWU(send): couldn't host {medium:?} ({e}); staying on BLE");
                 let failure = UpgradePathInfo {
                     medium: Some(medium.into()),
                     ..Default::default()

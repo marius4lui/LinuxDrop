@@ -537,3 +537,33 @@ identical on retry). The private kernel LAN lifecycle test also checks duplicate
 discovery rejection and normal acknowledged shutdown. Workspace all-target Clippy
 passed. Physical Bluetooth recovery and prolonged resource-bound acceptance remain
 separate; installed packages and the live demo were not changed.
+
+
+## Autonomous Wi-Fi Direct group owner, 2026-10-07
+
+The sender's WIFI_DIRECT host path now requests an actual temporary autonomous
+P2P group through the leased-radio helper instead of labelling an ordinary NM
+hotspot as Wi-Fi Direct. The helper requires P2P-GO capability and an allowed
+non-DFS initiating channel; supplicant supplies the actual SSID, passphrase and
+frequency. Credentials are not written to the lease journal and Debug omits them.
+The group identity is journaled before network setup. A bounded DHCP server owns
+only that group interface, selects a private /24 without existing-route overlap,
+and supplies neither a default gateway nor DNS. Host readiness waits briefly for
+IPv6 link-local DAD; listener binding still uses only the owned group interface.
+A dead GO DHCP server revokes its lease rather than using the client-only IPv6
+fallback. The Quick Share guard retains the dedicated-radio permit and requests
+cleanup on cancellation or transfer completion.
+
+Passed: seven netd and four network default unit tests; a private supplicant bus
+contract verifies GroupAdd arguments, actual credentials, wrong-channel cleanup,
+refusal to disconnect an existing interface and GroupStarted racing cancellation.
+A separate verified kernel network namespace performs a real DHCP exchange over
+veth, avoids an occupied subnet, observes usable IPv6 and verifies that the client
+receives no router/DNS options. All-target Clippy passed for the app, network,
+netd, daemon and Quick Share. These tests do not emulate over-the-air negotiation.
+Full medium-role/device-name authentication negotiation, supplicant owner-loss
+recovery and physical Android acceptance remain open; no complete Wi-Fi Direct
+conformance or installed-package acceptance is claimed. Live demo unchanged.
+
+Primary protocol references: [supplicant D-Bus GroupAdd/GroupStarted API](https://w1.fi/wpa_supplicant/devel/dbus.html)
+and [Nearby offline wire formats](https://github.com/google/nearby/blob/main/connections/implementation/proto/offline_wire_formats.proto).

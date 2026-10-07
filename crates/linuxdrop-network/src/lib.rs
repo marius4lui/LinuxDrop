@@ -6,7 +6,16 @@ pub struct P2pConnection {
     pub ipv4_address: Option<Ipv4Addr>,
     pub ipv6_address: Option<Ipv6Addr>,
 }
+pub struct P2pHosted {
+    pub interface: String,
+    pub ssid: String,
+    pub password: String,
+    pub frequency: u16,
+    pub ipv4_address: Ipv4Addr,
+    pub ipv6_address: Option<Ipv6Addr>,
+}
 pub trait P2pConnector: Send + Sync {
+    fn host(&self) -> futures_util::future::BoxFuture<'_, Result<P2pHosted>>;
     fn connect(
         &self,
         peer_name: String,

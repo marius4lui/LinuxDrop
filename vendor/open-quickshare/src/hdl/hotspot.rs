@@ -34,7 +34,8 @@ pub struct HotspotGuard {
     pub gateway: Ipv4Addr,
     pub frequency: i32,
     pub interface: String,
-    _network: nm::Guard,
+    _network: Option<nm::Guard>,
+    _p2p: Option<JoinGuard>,
 }
 impl std::fmt::Debug for HotspotGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,6 +117,34 @@ pub async fn join_p2p(peer_name: &str, pin: &str, frequency: u32) -> anyhow::Res
     guard.interface = connected.interface;
     Ok(guard)
 }
+/// Create an autonomous P2P group on the reserved radio. Keep the permit and
+/// cleanup guard alive from before the first await through transfer completion.
+pub async fn start_direct_group() -> anyhow::Result<HotspotGuard> {
+    let connector = P2P_CONNECTOR
+        .read()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("P2P helper is unavailable"))?;
+    let permit = exclusive()
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("Dedicated adapter is already in use"))?;
+    let mut ownership = JoinGuard {
+        interface: String::new(),
+        _network: None,
+        p2p: Some((connector.clone(), permit)),
+    };
+    let hosted = connector.host().await?;
+    ownership.interface = hosted.interface.clone();
+    Ok(HotspotGuard {
+        ssid: hosted.ssid,
+        password: hosted.password,
+        gateway: hosted.ipv4_address,
+        frequency: hosted.frequency.into(),
+        interface: hosted.interface,
+        _network: None,
+        _p2p: Some(ownership),
+    })
+}
 pub async fn start_hotspot() -> anyhow::Result<HotspotGuard> {
     let lease = lease()?;
     let interface = lease.interface.clone();
@@ -138,7 +167,8 @@ pub async fn start_hotspot() -> anyhow::Result<HotspotGuard> {
             .ok_or_else(|| anyhow::anyhow!("Hosted network has no IPv4 gateway"))?,
         interface: interface.clone(),
         frequency: network.frequency,
-        _network: network,
+        _network: Some(network),
+        _p2p: None,
     })
 }
 

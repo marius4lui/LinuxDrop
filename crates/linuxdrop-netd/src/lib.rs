@@ -4,6 +4,9 @@ pub const SOCKET_PATH: &str = "/run/linuxdrop/netd.sock";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    HostP2p {
+        lease_id: String,
+    },
     CancelP2p {
         lease_id: String,
     },
@@ -87,9 +90,17 @@ pub struct RecoveryIssue {
     pub ownership_verified: bool,
     pub detail: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
+    P2pHosted {
+        interface: String,
+        ssid: String,
+        password: String,
+        frequency: u16,
+        ipv4_address: std::net::Ipv4Addr,
+        ipv6_address: Option<std::net::Ipv6Addr>,
+    },
     P2pJoined {
         interface: String,
         ipv4_address: Option<std::net::Ipv4Addr>,
@@ -114,6 +125,59 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::P2pHosted {
+                interface,
+                frequency,
+                ipv4_address,
+                ipv6_address,
+                ..
+            } => f
+                .debug_struct("P2pHosted")
+                .field("interface", interface)
+                .field("frequency", frequency)
+                .field("ipv4_address", ipv4_address)
+                .field("ipv6_address", ipv6_address)
+                .finish_non_exhaustive(),
+            Self::P2pJoined {
+                interface,
+                ipv4_address,
+                ipv6_address,
+            } => f
+                .debug_struct("P2pJoined")
+                .field("interface", interface)
+                .field("ipv4_address", ipv4_address)
+                .field("ipv6_address", ipv6_address)
+                .finish(),
+            Self::Diagnostic { report } => f
+                .debug_struct("Diagnostic")
+                .field("report", report)
+                .finish(),
+            Self::Recovery {
+                issues,
+                recent_errors,
+            } => f
+                .debug_struct("Recovery")
+                .field("issues", issues)
+                .field("recent_errors", recent_errors)
+                .finish(),
+            Self::Acquired { lease } => f.debug_struct("Acquired").field("lease", lease).finish(),
+            Self::Ok => f.write_str("Ok"),
+            Self::State {
+                leases,
+                recovery_errors,
+            } => f
+                .debug_struct("State")
+                .field("leases", leases)
+                .field("recovery_errors", recovery_errors)
+                .finish(),
+            Self::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+        }
+    }
 }
 
 #[cfg(unix)]

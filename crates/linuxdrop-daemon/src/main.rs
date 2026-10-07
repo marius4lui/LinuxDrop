@@ -269,7 +269,10 @@ impl HelperP2p {
         let client = self.clone();
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_on_drop = cancel.clone().drop_guard();
-        let joining = matches!(&request, linuxdrop_netd::Request::JoinP2p { .. });
+        let joining = matches!(
+            &request,
+            linuxdrop_netd::Request::JoinP2p { .. } | linuxdrop_netd::Request::HostP2p { .. }
+        );
         let (sender, receiver) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let pending = client.request_inner(request);
@@ -326,6 +329,34 @@ impl HelperP2p {
     }
 }
 impl linuxdrop_network::P2pConnector for HelperP2p {
+    fn host(&self) -> futures_util::future::BoxFuture<'_, Result<linuxdrop_network::P2pHosted>> {
+        Box::pin(async move {
+            match self
+                .request(linuxdrop_netd::Request::HostP2p {
+                    lease_id: self.lease_id.clone(),
+                })
+                .await?
+            {
+                linuxdrop_netd::Response::P2pHosted {
+                    interface,
+                    ssid,
+                    password,
+                    frequency,
+                    ipv4_address,
+                    ipv6_address,
+                } => Ok(linuxdrop_network::P2pHosted {
+                    interface,
+                    ssid,
+                    password,
+                    frequency,
+                    ipv4_address,
+                    ipv6_address,
+                }),
+                linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
+                _ => anyhow::bail!("Unexpected P2P group-owner response"),
+            }
+        })
+    }
     fn connect(
         &self,
         peer_name: String,

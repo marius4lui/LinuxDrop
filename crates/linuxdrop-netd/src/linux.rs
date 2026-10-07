@@ -142,7 +142,7 @@ pub async fn run() -> io::Result<()> {
                 // DHCP is optional on a group with an assigned IPv6 link-local
                 // address. Its exit must not tear down an active IPv6 transfer.
                 let ipv6_survives = dead
-                    && lease.p2p_group.is_some()
+                    && lease.p2p_group.as_ref().is_some_and(|group| group.peer_object != "/")
                     && p2p_addresses(&lease).await.is_ok_and(|a| a.ipv6.is_some());
                 if ipv6_survives {
                     state.children.remove(&lease.id);
@@ -393,7 +393,8 @@ async fn join_p2p(
     lease_id: String,
     peer_name: String,
     pin: String,
-    frequency: u32,
+    mut frequency: u32,
+    host: bool,
 ) -> Result<Response, String> {
     // Inventory and supplicant/DHCP I/O may take seconds. Other leased radios
     // and read-only status requests must remain serviceable throughout.
@@ -420,6 +421,23 @@ async fn join_p2p(
         .ok_or("radio disappeared")?;
     if radio.protected || radio.rfkill {
         return Err("radio became active or blocked".into());
+    }
+    if host {
+        if !radio.modes.iter().any(|mode| mode == "P2P-GO") {
+            return Err("Adapter does not support P2P group-owner mode".into());
+        }
+        frequency = [5180, 2437, 5745, 2412]
+            .into_iter()
+            .chain(radio.channels.iter().map(|channel| channel.frequency_mhz))
+            .find(|frequency| {
+                radio.channels.iter().any(|channel| {
+                    channel.frequency_mhz == *frequency
+                        && !channel.disabled
+                        && !channel.no_ir
+                        && !channel.radar
+                })
+            })
+            .ok_or("No permitted P2P group-owner channel")?;
     }
     if frequency != 0
         && !radio.channels.iter().any(|channel| {
@@ -450,15 +468,27 @@ async fn join_p2p(
         cancel: cancel.clone(),
     };
     drop(state);
-    let group = linuxdrop_network::p2p::connect_wps(
-        &lease.interface,
-        &peer_name,
-        &pin,
-        frequency,
-        cancel.clone(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let (group, credentials) = if host {
+        let hosted =
+            linuxdrop_network::p2p::create_group(&lease.interface, frequency, cancel.clone())
+                .await
+                .map_err(|e| e.to_string())?;
+        (
+            hosted.group,
+            Some((hosted.ssid, hosted.password, hosted.frequency)),
+        )
+    } else {
+        let group = linuxdrop_network::p2p::connect_wps(
+            &lease.interface,
+            &peer_name,
+            &pin,
+            frequency,
+            cancel.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        (group, None)
+    };
     let interface = group.identity.interface.clone();
     run_command(
         "/usr/sbin/ip",
@@ -483,25 +513,41 @@ async fn join_p2p(
     group.into_journaled();
     drop(state);
     let network = tokio::select! {
-        result = start_p2p_network(&lease) => result,
+        result = async {
+            if host { start_p2p_host_network(&lease).await }
+            else { start_p2p_network(&lease).await }
+        } => result,
         _ = cancel.cancelled() => Err("P2P radio lease ended during address acquisition".into()),
     };
     let mut state = shared.lock().await;
     let lease_exists = state.leases.contains_key(&lease_id);
     let still_owned = lease_exists && !cancel.is_cancelled();
     match network {
-        Ok((child, addresses)) if still_owned => {
+        Ok((child, addresses)) if still_owned && (!host || addresses.ipv4.is_some()) => {
             if let Some(child) = child {
                 state.children.insert(lease_id.clone(), child);
             }
             state.pending_p2p.remove(&lease_id);
             drop(state);
             drop(operation);
-            Ok(Response::P2pJoined {
-                interface,
-                ipv4_address: addresses.ipv4,
-                ipv6_address: addresses.ipv6,
-            })
+            if let Some((ssid, password, frequency)) = credentials {
+                Ok(Response::P2pHosted {
+                    interface,
+                    ssid,
+                    password,
+                    frequency,
+                    ipv4_address: addresses
+                        .ipv4
+                        .ok_or("P2P group owner lost its IPv4 address")?,
+                    ipv6_address: addresses.ipv6,
+                })
+            } else {
+                Ok(Response::P2pJoined {
+                    interface,
+                    ipv4_address: addresses.ipv4,
+                    ipv6_address: addresses.ipv6,
+                })
+            }
         }
         result => {
             // A successful DHCP child is kill-on-drop if the radio lease ended.
@@ -583,6 +629,12 @@ async fn apply(
         }
         return Ok(Response::Diagnostic { report });
     }
+    if let Request::HostP2p { lease_id } = request {
+        if !owned.contains(&lease_id) {
+            return Err("lease does not belong to this connection".into());
+        }
+        return join_p2p(shared, lease_id, String::new(), String::new(), 0, true).await;
+    }
     if let Request::JoinP2p {
         lease_id,
         peer_name,
@@ -593,13 +645,13 @@ async fn apply(
         if !owned.contains(&lease_id) {
             return Err("lease does not belong to this connection".into());
         }
-        return join_p2p(shared, lease_id, peer_name, pin, frequency).await;
+        return join_p2p(shared, lease_id, peer_name, pin, frequency, false).await;
     }
     let mut state = shared.lock().await;
     let awdl = matches!(request, Request::AcquireAwdl { .. });
     match request {
         Request::Diagnose { .. } => unreachable!(),
-        Request::JoinP2p { .. } => unreachable!(),
+        Request::JoinP2p { .. } | Request::HostP2p { .. } => unreachable!(),
         Request::CancelP2p { lease_id } => {
             // The original connection is busy awaiting JoinP2p. A separately
             // authorized connection of the same uid may only cancel its pending
@@ -1084,7 +1136,9 @@ async fn restore_p2p(lease: &Lease) -> Result<(), String> {
         .map_err(|_| "P2P disconnect timed out".to_owned())?
         .map_err(|e| e.to_string())?;
     }
-    let _ = std::fs::remove_file(format!("/run/linuxdrop/{}.ipv4.json", lease.id));
+    for suffix in ["ipv4.json", "dhcp.conf", "dhcp.leases", "dhcp.pid"] {
+        let _ = std::fs::remove_file(format!("/run/linuxdrop/{}.{suffix}", lease.id));
+    }
     Ok(())
 }
 
@@ -1221,6 +1275,134 @@ async fn start_p2p_network(
     }
 }
 
+fn p2p_subnet(routes: &[serde_json::Value]) -> Result<std::net::Ipv4Addr, String> {
+    use std::net::Ipv4Addr;
+    let mut occupied = Vec::new();
+    for route in routes {
+        let Some(destination) = route["dst"].as_str() else {
+            continue;
+        };
+        if destination == "default" {
+            continue;
+        }
+        let (address, prefix) = destination.split_once('/').unwrap_or((destination, "32"));
+        let address: Ipv4Addr = address.parse().map_err(|_| "Unrecognized IPv4 route")?;
+        let prefix: u32 = prefix.parse().map_err(|_| "Invalid IPv4 route prefix")?;
+        if prefix > 32 {
+            return Err("Invalid IPv4 route prefix".into());
+        }
+        if prefix > 0 {
+            occupied.push((u32::from(address), prefix));
+        }
+    }
+    let candidates = std::iter::once(Ipv4Addr::new(192, 168, 49, 1))
+        .chain((200..=254).map(|subnet| Ipv4Addr::new(192, 168, subnet, 1)))
+        .chain((200..=254).map(|subnet| Ipv4Addr::new(172, 31, subnet, 1)));
+    candidates
+        .into_iter()
+        .find(|candidate| {
+            !occupied.iter().any(|(address, prefix)| {
+                let mask = u32::MAX << (32 - (*prefix).min(24));
+                u32::from(*candidate) & mask == *address & mask
+            })
+        })
+        .ok_or_else(|| "No conflict-free private subnet for the P2P group".into())
+}
+
+fn p2p_dhcp_config(interface: &str, lease: &str, gateway: std::net::Ipv4Addr) -> String {
+    let [a, b, c, _] = gateway.octets();
+    // Deliberately no router, DNS, domain or host settings: this group carries
+    // the explicit transfer only, not the peer's ordinary Internet traffic.
+    format!("start {a}.{b}.{c}.2\nend {a}.{b}.{c}.33\ninterface {interface}\nmax_leases 32\nlease_file /run/linuxdrop/{lease}.dhcp.leases\npidfile /run/linuxdrop/{lease}.dhcp.pid\noption subnet 255.255.255.0\noption lease 600\nauto_time 30\n")
+}
+
+async fn start_p2p_host_network(
+    lease: &Lease,
+) -> Result<(Option<tokio::process::Child>, P2pAddresses), String> {
+    use std::io::Write;
+    let group = lease.p2p_group.as_ref().ok_or("P2P group missing")?;
+    p2p_addresses(lease).await?; // Verify the exact newly marked group first.
+    let output = timeout(
+        Duration::from_secs(3),
+        Command::new("/usr/sbin/ip")
+            .args(["-j", "-4", "route", "show", "table", "all"])
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "Route inspection timed out")?
+    .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("Could not inspect existing network routes".into());
+    }
+    let routes: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    let gateway = p2p_subnet(&routes)?;
+    run_command(
+        "/usr/sbin/ip",
+        &["link", "set", "dev", &group.interface, "up"],
+        3,
+    )
+    .await?;
+    run_command(
+        "/usr/sbin/ip",
+        &[
+            "-4",
+            "address",
+            "add",
+            &format!("{gateway}/24"),
+            "dev",
+            &group.interface,
+        ],
+        3,
+    )
+    .await?;
+    let config_path = format!("/run/linuxdrop/{}.dhcp.conf", lease.id);
+    let mut config = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&config_path)
+        .map_err(|e| e.to_string())?;
+    config
+        .write_all(p2p_dhcp_config(&group.interface, &lease.id, gateway).as_bytes())
+        .map_err(|e| e.to_string())?;
+    config.sync_all().map_err(|e| e.to_string())?;
+    drop(config);
+    let mut child = Command::new("/usr/bin/busybox")
+        .args(["udhcpd", "-f", "-I", &gateway.to_string(), &config_path])
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    // Catch bind/configuration errors before publishing any credentials.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    if !matches!(child.try_wait(), Ok(None)) {
+        return Err("P2P DHCP server could not start".into());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let addresses = loop {
+        let addresses = p2p_addresses(lease).await?;
+        if addresses.ipv6.is_some() || tokio::time::Instant::now() >= deadline {
+            break addresses;
+        }
+        if !matches!(child.try_wait(), Ok(None)) {
+            return Err("P2P DHCP server stopped during address setup".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    if addresses.ipv4 != Some(gateway) {
+        return Err("P2P group owner address changed".into());
+    }
+    Ok((Some(child), addresses))
+}
+
 fn persist(state: &State) -> io::Result<()> {
     use std::io::Write;
     let data = serde_json::to_vec(&state.leases.values().collect::<Vec<_>>())?;
@@ -1305,6 +1487,35 @@ async fn restore_connection(lease: &Lease) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hosted_subnet_avoids_specific_and_aggregate_routes() {
+        use serde_json::json;
+        use std::net::Ipv4Addr;
+        assert_eq!(
+            p2p_subnet(&[json!({"dst":"default"})]).unwrap(),
+            Ipv4Addr::new(192, 168, 49, 1)
+        );
+        assert_eq!(
+            p2p_subnet(&[json!({"dst":"192.168.49.12/32"})]).unwrap(),
+            Ipv4Addr::new(192, 168, 200, 1)
+        );
+        assert_eq!(
+            p2p_subnet(&[json!({"dst":"192.168.0.0/16"})]).unwrap(),
+            Ipv4Addr::new(172, 31, 200, 1)
+        );
+        assert!(p2p_subnet(&[
+            json!({"dst":"192.168.0.0/16"}),
+            json!({"dst":"172.16.0.0/12"})
+        ])
+        .is_err());
+        assert!(p2p_subnet(&[json!({"dst":"broken/24"})]).is_err());
+        let config = p2p_dhcp_config("p2p-wlan2-0", "lease", Ipv4Addr::new(192, 168, 49, 1));
+        assert!(config.contains("interface p2p-wlan2-0\n"));
+        assert!(config.contains("start 192.168.49.2\nend 192.168.49.33\n"));
+        assert!(
+            !config.contains("router") && !config.contains("dns") && !config.contains("domain")
+        );
+    }
     fn direct_lease() -> Lease {
         Lease {
             id: "a".repeat(32),
@@ -1553,6 +1764,100 @@ mod tests {
         assert!(p2p_addresses(&lease).await.is_err());
         assert!(start_p2p_network(&lease).await.is_err());
         run_command("/usr/sbin/ip", &["link", "del", interface], 3)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private network namespace; use run-p2p-host-network.sh"]
+    async fn group_owner_serves_dhcp_without_router_or_dns() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+            Ok("1")
+        );
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        let mut lease = direct_lease();
+        lease.id = uuid::Uuid::new_v4().simple().to_string();
+        lease.p2p_group = Some(linuxdrop_network::p2p::GroupIdentity {
+            interface: "ld-go0".into(),
+            interface_object: "/test".into(),
+            group_object: "/group".into(),
+            parent_interface: "wlan2".into(),
+            peer_object: "/".into(),
+        });
+        run_command(
+            "/usr/sbin/ip",
+            &[
+                "link", "add", "ld-go0", "type", "veth", "peer", "name", "ld-peer0",
+            ],
+            3,
+        )
+        .await
+        .unwrap();
+        run_command(
+            "/usr/sbin/ip",
+            &[
+                "link",
+                "set",
+                "ld-go0",
+                "alias",
+                &format!("linuxdrop:p2p:{}", lease.id),
+            ],
+            3,
+        )
+        .await
+        .unwrap();
+        run_command("/usr/sbin/ip", &["link", "set", "ld-peer0", "up"], 3)
+            .await
+            .unwrap();
+        run_command(
+            "/usr/sbin/ip",
+            &["route", "add", "blackhole", "192.168.49.0/24"],
+            3,
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all("/run/linuxdrop").unwrap();
+        let (server, addresses) = start_p2p_host_network(&lease).await.unwrap();
+        assert_eq!(addresses.ipv4, Some("192.168.200.1".parse().unwrap()));
+        assert!(
+            addresses.ipv6.is_some(),
+            "group owner must wait for usable link-local IPv6"
+        );
+        let hook = format!("/run/linuxdrop/{}.test-hook", lease.id);
+        let result = format!("/run/linuxdrop/{}.test-result", lease.id);
+        std::fs::write(&hook, format!("#!/bin/sh\ncase \"$1\" in bound|renew) printf '%s\\n' \"$ip\" \"$subnet\" \"${{router-unset}}\" \"${{dns-unset}}\" > {result};; esac\n")).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        run_command(
+            "/usr/bin/busybox",
+            &[
+                "udhcpc", "-f", "-n", "-q", "-i", "ld-peer0", "-s", &hook, "-t", "3", "-T", "1",
+            ],
+            8,
+        )
+        .await
+        .unwrap();
+        let assigned = std::fs::read_to_string(&result).unwrap();
+        let fields: Vec<_> = assigned.lines().collect();
+        assert!(fields[0].starts_with("192.168.200."));
+        assert_eq!(&fields[1..], &["255.255.255.0", "unset", "unset"]);
+        let mut server = server.unwrap();
+        server.kill().await.unwrap();
+        server.wait().await.unwrap();
+        for suffix in [
+            "dhcp.conf",
+            "dhcp.leases",
+            "dhcp.pid",
+            "test-hook",
+            "test-result",
+        ] {
+            let _ = std::fs::remove_file(format!("/run/linuxdrop/{}.{suffix}", lease.id));
+        }
+        run_command("/usr/sbin/ip", &["link", "del", "ld-go0"], 3)
             .await
             .unwrap();
     }

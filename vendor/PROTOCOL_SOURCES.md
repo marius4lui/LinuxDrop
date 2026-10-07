@@ -155,3 +155,10 @@ and reach the daemon's shutdown receipt. Ordinary operational errors remain
 recoverable when cleanup succeeds. Receiver advertisement removal awaits every
 handle concurrently; active discovery replacement is rejected before it can
 orphan its old cancellation token.
+
+
+2026-10-07 local Quick Share integration: the outbound WIFI_DIRECT host path
+uses LinuxDrop's leased supplicant P2P group-owner operation, retaining its cleanup
+and exclusivity guard. Ordinary WIFI_HOTSPOT hosting continues through NM. The
+advertised direct SSID/passphrase/channel come from the actual running group.
+No additional upstream code was imported for this change.
