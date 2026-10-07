@@ -211,6 +211,11 @@ pub async fn start_with_budget(
                     Err(_) => break,
                 },
                 message = messages.recv() => match message {
+                    Ok(ChannelMessage {msg:Message::BluetoothServiceReady {component},..}) => {
+                        bluetooth_errors.remove(&component);
+                        let snapshot = lan_state.borrow().clone();
+                        events.send(BackendEvent::StateChanged(network_status(&snapshot, &bluetooth, config.ble, &bluetooth_errors, scanner_paused))).await.ok();
+                    }
                     Ok(ChannelMessage {msg:Message::BluetoothScannerReady {adapter, paused},..}) => {
                         bluetooth = Ok(adapter);
                         scanner_paused = paused;

@@ -23,6 +23,7 @@ pub struct MessageClient {
 // TODO: This should be separate structs
 #[derive(Debug, Clone)]
 pub enum Message {
+    BluetoothServiceReady { component: String },
     Lib { action: TransferAction },
     Client(MessageClient),
     Backend { component: String, detail: String },

@@ -274,123 +274,28 @@ impl RQS {
             result
         });
 
-        // Advertise as a discoverable QuickShare receiver over BLE (0xFEF3) so a
-        // phone that drops off Wi-Fi during its browse phase (the Pixel "AirDrop
-        // update" behaviour) can still list us as a target. Uses the SAME
-        // endpoint_id as mDNS, so once selected the phone reconnects to Wi-Fi and
-        // completes the transfer over the normal Wi-Fi-LAN (mDNS + TCP) path.
+        // Recreate receiver resources as one generation so its advertised L2CAP
+        // port always belongs to the current listener. Migrated Wi-Fi sessions
+        // are owned by the supervisor, not a short-lived radio generation.
         #[cfg(all(feature = "experimental", target_os = "linux"))]
         if self.ble_enabled {
-            // The BLE advertiser is always spawned; it self-gates on the live
-            // visibility watch (off while Invisible, on otherwise) so the
-            // "Hidden from everyone" toggle takes effect immediately and a
-            // start-Invisible session can still become visible without a restart.
-            {
-                let rx_endpoint_id: [u8; 4] = endpoint_id[..4].try_into()?;
-                let rx_device_name = DEVICE_NAME.read().unwrap().clone();
-
-                // L2CAP CoC listener: phones that support it connect straight
-                // to this PSM and skip GATT service discovery -- the slow part
-                // of every BLE connect. `PACKET_BLE_L2CAP=off` disables it.
-                let l2cap = if std::env::var("PACKET_BLE_L2CAP")
-                    .map(|v| v.eq_ignore_ascii_case("off"))
-                    .unwrap_or(false)
-                {
-                    info!("L2capServer: disabled by PACKET_BLE_L2CAP=off");
-                    None
-                } else {
-                    match crate::hdl::L2capServer::bind().await {
-                        Ok((server, psm)) => {
-                            info!("L2capServer: listening on PSM {psm}");
-                            Some((server, psm))
-                        }
-                        Err(e) => {
-                            warn!("Couldn't start the L2CAP server ({e}); phones will use GATT");
-                            None
-                        }
-                    }
-                };
-                let l2cap_psm = l2cap.as_ref().map(|(_, psm)| *psm);
-
-                // Same advertisement bytes are used for the BLE advert and served
-                // over GATT slot 0, so the phone reads a consistent endpoint.
-                let advert = crate::hdl::receiver_service_data(
-                    rx_endpoint_id,
+            let endpoint = endpoint_id[..4].try_into()?;
+            let name = DEVICE_NAME.read().unwrap().clone();
+            let status = self.message_sender.clone();
+            let visibility = self.visibility_receiver.clone();
+            let ctk = ctoken.clone();
+            tracker.spawn("bluetooth-receiver", async move {
+                crate::hdl::supervise_receiver(
+                    endpoint,
                     crate::utils::DeviceType::Laptop as u8,
-                    &rx_device_name,
-                    l2cap_psm,
-                );
-
-                if let Some((server, _)) = l2cap {
-                    let l2cap_advert = advert.clone();
-                    let l2cap_sender = self.message_sender.clone();
-                    let l2cap_tcp_port = service_port;
-                    let lctk = ctoken.clone();
-                    tracker.spawn("bluetooth-l2cap", async move {
-                        server
-                            .run(l2cap_advert, l2cap_sender, l2cap_tcp_port, lctk)
-                            .await;
-                        Ok(())
-                    });
-                }
-
-                // GATT server: when the phone selects us it opens a GATT connection,
-                // reads slot 0 for our advertisement, then drives the weave data
-                // socket which we bridge to the inbound handshake.
-                let gatt_advert = advert.clone();
-                let gatt_sender = self.message_sender.clone();
-                let gatt_tcp_port = service_port;
-                let gctk = ctoken.clone();
-                let status = self.message_sender.clone();
-                tracker.spawn("bluetooth-gatt", async move {
-                    match crate::hdl::ReceiverGattServer::new(
-                        gatt_advert,
-                        gatt_sender,
-                        gatt_tcp_port,
-                    )
-                    .await
-                    {
-                        Ok(srv) => {
-                            let result = srv.run(gctk).await;
-                            if let Err(e) = &result {
-                                backend_failure(&status, "bluetooth-gatt", e);
-                            }
-                            result
-                        }
-                        Err(e) => {
-                            backend_failure(&status, "bluetooth-gatt", &e);
-                            Err(e)
-                        }
-                    }
-                });
-
-                // BLE receiver advertisement (0xFEF3).
-                let ctk = ctoken.clone();
-                let adv_vis = self.visibility_receiver.clone();
-                let status = self.message_sender.clone();
-                tracker.spawn("bluetooth-receiver", async move {
-                    match crate::hdl::ReceiverAdvertiser::new(
-                        rx_endpoint_id,
-                        crate::utils::DeviceType::Laptop as u8,
-                        &rx_device_name,
-                        l2cap_psm,
-                    )
-                    .await
-                    {
-                        Ok(adv) => {
-                            let result = adv.run(adv_vis, ctk).await;
-                            if let Err(e) = &result {
-                                backend_failure(&status, "bluetooth-receiver", e);
-                            }
-                            result
-                        }
-                        Err(e) => {
-                            backend_failure(&status, "bluetooth-receiver", &e);
-                            Err(e)
-                        }
-                    }
-                });
-            }
+                    name,
+                    service_port,
+                    visibility,
+                    status,
+                    ctk,
+                )
+                .await
+            });
         }
 
         tracker.close();

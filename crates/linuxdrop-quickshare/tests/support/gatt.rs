@@ -13,6 +13,7 @@ pub struct State {
     pub fail_register: AtomicBool,
     pub hold_unregister: AtomicBool,
     pub removals: AtomicUsize,
+    pub registrations: AtomicUsize,
     pub wake: Notify,
 }
 pub struct Gatt(pub Arc<State>);
@@ -24,8 +25,15 @@ impl Gatt {
         _options: HashMap<String, OwnedValue>,
         #[zbus(header)] header: zbus::message::Header<'_>,
     ) -> zbus::fdo::Result<()> {
-        *self.0.active.lock().unwrap() =
-            Some((path.to_string(), header.sender().unwrap().to_string()));
+        {
+            let mut active = self.0.active.lock().unwrap();
+            assert!(
+                active.is_none(),
+                "Replacement GATT opened before prior cleanup"
+            );
+            *active = Some((path.to_string(), header.sender().unwrap().to_string()));
+        }
+        self.0.registrations.fetch_add(1, Ordering::SeqCst);
         loop {
             let wake = self.0.wake.notified();
             if !self.0.hold_register.load(Ordering::SeqCst) {
@@ -40,7 +48,7 @@ impl Gatt {
         }
         Ok(())
     }
-    async fn unregister_application(&self, path: OwnedObjectPath) {
+    async fn unregister_application(&self, path: OwnedObjectPath) -> zbus::fdo::Result<()> {
         self.0.removals.fetch_add(1, Ordering::SeqCst);
         loop {
             let wake = self.0.wake.notified();
@@ -49,10 +57,12 @@ impl Gatt {
             }
             wake.await;
         }
-        assert_eq!(
-            self.0.active.lock().unwrap().as_ref().unwrap().0,
-            path.as_str()
-        );
-        *self.0.active.lock().unwrap() = None;
+        let mut active = self.0.active.lock().unwrap();
+        let Some((registered, _)) = active.as_ref() else {
+            return Err(zbus::fdo::Error::UnknownObject("Already removed".into()));
+        };
+        assert_eq!(registered, path.as_str());
+        *active = None;
+        Ok(())
     }
 }

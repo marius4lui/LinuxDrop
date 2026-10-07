@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use bluer::l2cap::{Security, SecurityLevel, Socket, SocketAddr, Stream};
 use bluer::{Adapter, AddressType};
@@ -125,8 +124,10 @@ impl L2capServer {
     /// Binds an LE CoC server socket on this adapter with a kernel-assigned
     /// dynamic PSM and returns it together with that PSM.
     pub async fn bind() -> Result<(Self, u16), anyhow::Error> {
-        let adapter = crate::bluetooth_adapter().await?;
+        Self::bind_adapter(crate::bluetooth_adapter().await?).await
+    }
 
+    pub(crate) async fn bind_adapter(adapter: bluer::Adapter) -> anyhow::Result<(Self, u16)> {
         let socket = Socket::<Stream>::new_stream()?;
         // Android connects with an *insecure* L2CAP channel (no bonding), so
         // requiring encryption here would reject every phone.
@@ -159,14 +160,33 @@ impl L2capServer {
         tcp_port: u16,
         ctk: CancellationToken,
     ) {
+        let sessions = BluetoothTasks::new(&ctk);
+        let _cancel = sessions.cancellation().drop_guard();
+        if let Err(error) = self
+            .run_with_sessions(advert, sender, tcp_port, ctk, sessions.clone())
+            .await
+        {
+            warn!("{INNER_NAME}: listener stopped: {error}");
+        }
+        sessions.shutdown().await;
+    }
+
+    pub(crate) async fn run_with_sessions(
+        self,
+        advert: Vec<u8>,
+        sender: Sender<ChannelMessage>,
+        tcp_port: u16,
+        ctk: CancellationToken,
+        sessions: BluetoothTasks,
+    ) -> anyhow::Result<()> {
         info!("{INNER_NAME}: accepting Quick Share connections");
         let tasks = BluetoothTasks::new(&ctk);
         let _cancel_on_drop = tasks.cancellation().drop_guard();
-        loop {
+        let result = loop {
             tokio::select! {
                 _ = ctk.cancelled() => {
                     info!("{INNER_NAME}: tracker cancelled, returning");
-                    break;
+                    break Ok(());
                 }
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, peer)) => {
@@ -174,7 +194,7 @@ impl L2capServer {
                         let advert = advert.clone();
                         let sender = sender.clone();
                         let adapter = self.adapter.clone();
-                        let sessions = tasks.clone();
+                        let sessions = sessions.clone();
                         tasks.spawn(async move {
                             // Scanning steals airtime from the link, exactly
                             // as it does from GATT sessions.
@@ -190,17 +210,13 @@ impl L2capServer {
                             cycle_advert_when_peer_gone(adapter, Some(peer.addr)).await;
                         });
                     }
-                    Err(e) => {
-                        warn!("{INNER_NAME}: accept failed: {e}");
-                        tokio::select! {
-                            _ = ctk.cancelled() => break,
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                        }
-                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => break Err(error.into()),
                 },
             }
-        }
+        };
         tasks.shutdown().await;
+        result
     }
 }
 
@@ -241,10 +257,10 @@ async fn serve_connection(
     } else if head[0] == 0x00 {
         // u16-BE packet lengths around the command protocol.
         debug!("{INNER_NAME}: client speaks length-prefixed command packets");
-        serve_commands(stream, leftover, true, advert, sender, upgrade).await
+        serve_commands(stream, leftover, true, advert, sender, upgrade, tasks).await
     } else {
         debug!("{INNER_NAME}: client speaks bare command packets");
-        serve_commands(stream, leftover, false, advert, sender, upgrade).await
+        serve_commands(stream, leftover, false, advert, sender, upgrade, tasks).await
     }
 }
 
@@ -455,6 +471,7 @@ async fn serve_commands(
     advert: &[u8],
     sender: Sender<ChannelMessage>,
     upgrade: crate::hdl::InboundUpgrade,
+    tasks: BluetoothTasks,
 ) -> Result<(), anyhow::Error> {
     loop {
         let packet: Vec<u8> = if length_prefixed {
@@ -533,7 +550,17 @@ async fn serve_commands(
                         leftover.len()
                     );
                 }
-                run_inbound(crate::hdl::MigratableStream::L2cap(stream), sender, upgrade).await;
+                // Keep this BLE bridge in the radio generation and the inbound
+                // session in the backend group, including the bare C++ dialect.
+                let (inbound, mut bridge) = tokio::io::duplex(64 * 1024);
+                if !tasks.spawn(run_inbound(
+                    crate::hdl::MigratableStream::Ble(inbound),
+                    sender,
+                    upgrade,
+                )) {
+                    anyhow::bail!("Bluetooth session capacity exhausted or server stopping");
+                }
+                tokio::io::copy_bidirectional(&mut stream, &mut bridge).await?;
                 return Ok(());
             }
             other => anyhow::bail!("unsupported command {other}"),

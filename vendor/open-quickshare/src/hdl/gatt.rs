@@ -103,7 +103,21 @@ impl ReceiverGattServer {
         sender: Sender<ChannelMessage>,
         tcp_port: u16,
     ) -> Result<Self, anyhow::Error> {
-        let adapter = crate::bluetooth_adapter().await?;
+        Self::with_adapter(
+            crate::bluetooth_adapter().await?,
+            advertisement,
+            sender,
+            tcp_port,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_adapter(
+        adapter: bluer::Adapter,
+        advertisement: Vec<u8>,
+        sender: Sender<ChannelMessage>,
+        tcp_port: u16,
+    ) -> anyhow::Result<Self> {
         if !adapter.is_powered().await? {
             anyhow::bail!("Bluetooth is switched off");
         }
@@ -117,6 +131,18 @@ impl ReceiverGattServer {
     }
 
     pub async fn run(&self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+        let sessions = BluetoothTasks::new(&ctk);
+        let _cancel = sessions.cancellation().drop_guard();
+        let result = self.run_with_sessions(ctk, sessions.clone()).await;
+        sessions.shutdown().await;
+        result
+    }
+
+    pub(crate) async fn run_with_sessions(
+        &self,
+        ctk: CancellationToken,
+        sessions: BluetoothTasks,
+    ) -> Result<(), anyhow::Error> {
         let tasks = BluetoothTasks::new(&ctk);
         let _cancel_on_drop = tasks.cancellation().drop_guard();
         let slot0_tasks = tasks.clone();
@@ -228,11 +254,13 @@ impl ReceiverGattServer {
                                 let sender = sender.clone();
                                 let adapter = adapter.clone();
                                 let tasks = notify_tasks.clone();
+                                let inbound = sessions.clone();
                                 Box::pin(async move {
-                                    let sessions = tasks.clone();
+                                    let callbacks = tasks.clone();
                                     tasks.spawn(async move {
                                         weave_session(
-                                            notifier, chan, sender, upgrade, adapter, sessions,
+                                            notifier, chan, sender, upgrade, adapter, callbacks,
+                                            inbound,
                                         )
                                         .await;
                                     });
@@ -252,19 +280,39 @@ impl ReceiverGattServer {
             "{INNER_NAME}: registering GATT service 0x{QS_GATT_SERVICE:04X} (slot0 {} bytes + weave socket)",
             self.advertisement.len()
         );
-        let mut handle = match self.adapter.serve_gatt_application(app).await {
-            Ok(handle) => handle,
-            Err(error) => {
+        // BlueR retains ownership of an in-flight registration and its cleanup
+        // even if this deadline expires. Treat uncertainty as terminal so the
+        // supervisor never creates a duplicate application.
+        let mut handle = match tokio::time::timeout(
+            Duration::from_secs(35),
+            self.adapter.serve_gatt_application(app),
+        )
+        .await
+        {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(error)) => {
                 tasks.shutdown().await;
                 return Err(error.into());
             }
+            Err(error) => {
+                tasks.shutdown().await;
+                return Err(crate::lifecycle::cleanup_failure(error));
+            }
         };
+        if !ctk.is_cancelled() {
+            let _ = self.sender.send(ChannelMessage {
+                id: "backend".into(),
+                msg: crate::channel::Message::BluetoothServiceReady {
+                    component: "bluetooth-gatt".into(),
+                },
+            });
+        }
         ctk.cancelled().await;
         info!("{INNER_NAME}: tracker cancelled, returning");
         tasks.shutdown().await;
-        handle
-            .unregister()
+        tokio::time::timeout(Duration::from_secs(15), handle.unregister())
             .await
+            .map_err(crate::lifecycle::cleanup_failure)?
             .map_err(crate::lifecycle::cleanup_failure)?;
 
         Ok(())
@@ -281,6 +329,7 @@ async fn weave_session(
     upgrade: crate::hdl::InboundUpgrade,
     adapter: Arc<Adapter>,
     tasks: BluetoothTasks,
+    inbound: BluetoothTasks,
 ) {
     // Claim the packet stream for this session. A notification session starting
     // while another still holds it means the phone reconnected, so evict the
@@ -316,7 +365,7 @@ async fn weave_session(
     // pauses our advertisement outright.
     let _suppressor = BleScanSuppressor::new();
 
-    let peer = weave_session_inner(notifier, &mut rx, ctk, sender, upgrade, tasks.clone()).await;
+    let peer = weave_session_inner(notifier, &mut rx, ctk, sender, upgrade, inbound).await;
 
     // Hand a fresh channel back, dropping anything this connection left queued
     // along with the old one.

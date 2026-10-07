@@ -79,3 +79,43 @@ async fn stalled_clients_are_bounded_and_parent_cancellation_releases_all() {
         "Both refused and accepted requests must release owned resources"
     );
 }
+
+#[tokio::test]
+async fn receiver_generation_shutdown_preserves_migrated_payload_until_backend_shutdown() {
+    let backend = CancellationToken::new();
+    let generation = backend.child_token();
+    let bridges = BluetoothTasks::new(&generation);
+    let sessions = BluetoothTasks::new(&backend);
+    let inbound = sessions.clone();
+    let (mut peer, mut payload) = tokio::io::duplex(16);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    assert!(bridges.spawn(async move {
+        assert!(inbound.spawn(async move {
+            let mut bytes = [0; 4];
+            loop {
+                if payload.read_exact(&mut bytes).await.is_err() {
+                    break;
+                }
+                if payload.write_all(&bytes).await.is_err() {
+                    break;
+                }
+            }
+        }));
+        started.send(()).unwrap();
+        std::future::pending::<()>().await;
+    }));
+    ready.await.unwrap();
+    generation.cancel();
+    bridges.shutdown().await;
+    assert!(!bridges.spawn(async {}));
+    peer.write_all(b"file").await.unwrap();
+    let mut bytes = [0; 4];
+    tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes, b"file");
+    backend.cancel();
+    sessions.shutdown().await;
+    assert_eq!(peer.read(&mut [0]).await.unwrap(), 0);
+}

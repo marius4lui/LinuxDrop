@@ -209,3 +209,10 @@ absence before treating cleanup as complete and tolerates an already removed
 signal match. Private-bus fixtures exercise real workers through power, removal,
 owner replacement and cancellation. Broader GATT/L2CAP recovery remains separate;
 no new upstream implementation code copied.
+
+2026-10-07 local receiver supervision: coherent adapter/PSM generations across
+GATT, L2CAP and receiver advertisements; backend-owned migrated sessions;
+component readiness and bounded registration/cleanup waits with terminal
+uncertainty. BlueR keeps original-owner cleanup after deadline expiry. Private
+BlueZ and duplex lifetime fixtures cover recovery and preserved payload ownership.
+See docs/acceptance/BLUETOOTH_RECEIVER_RECOVERY_2026-10-07.md. No upstream code copied.

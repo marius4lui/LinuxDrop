@@ -3,6 +3,10 @@ mod bluetooth_tasks;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 #[doc(hidden)]
 pub use bluetooth_tasks::BluetoothTasks;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+mod receiver_lifetime;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+pub use receiver_lifetime::supervise_receiver;
 use std::collections::HashMap;
 
 use info::{InternalFileInfo, TransferMetadata};

@@ -447,7 +447,23 @@ impl ReceiverAdvertiser {
         device_name: &str,
         l2cap_psm: Option<u16>,
     ) -> Result<Self, anyhow::Error> {
-        let adapter = crate::bluetooth_adapter().await?;
+        Self::with_adapter(
+            crate::bluetooth_adapter().await?,
+            endpoint_id,
+            device_type,
+            device_name,
+            l2cap_psm,
+        )
+        .await
+    }
+
+    pub(crate) async fn with_adapter(
+        adapter: bluer::Adapter,
+        endpoint_id: [u8; 4],
+        device_type: u8,
+        device_name: &str,
+        l2cap_psm: Option<u16>,
+    ) -> anyhow::Result<Self> {
         if !adapter.is_powered().await? {
             anyhow::bail!("Bluetooth is switched off");
         }
@@ -503,9 +519,30 @@ impl ReceiverAdvertiser {
     const RETRY: Duration = Duration::from_secs(3);
     pub async fn run(
         &self,
-        mut visibility: watch::Receiver<Visibility>,
+        visibility: watch::Receiver<Visibility>,
         ctk: CancellationToken,
     ) -> Result<(), anyhow::Error> {
+        self.run_reported(visibility, ctk, None).await
+    }
+
+    pub(crate) async fn run_reported(
+        &self,
+        mut visibility: watch::Receiver<Visibility>,
+        ctk: CancellationToken,
+        status: Option<tokio::sync::broadcast::Sender<crate::channel::ChannelMessage>>,
+    ) -> Result<(), anyhow::Error> {
+        let ready = || {
+            if !ctk.is_cancelled()
+                && let Some(status) = &status
+            {
+                let _ = status.send(crate::channel::ChannelMessage {
+                    id: "backend".into(),
+                    msg: crate::channel::Message::BluetoothServiceReady {
+                        component: "bluetooth-receiver".into(),
+                    },
+                });
+            }
+        };
         info!(
             "{RX_INNER_NAME}: advertising QuickShare receiver (0x{QS_SERVICE_UUID:04X}, mode={}, instances=[{}], {}-byte slot-0 advertisement) on adapter {} ({})",
             self.mode,
@@ -527,6 +564,7 @@ impl ReceiverAdvertiser {
             // cancelled). This also covers starting up Invisible: nothing is
             // advertised until visibility flips.
             while *visibility.borrow_and_update() == Visibility::Invisible {
+                ready();
                 info!("{RX_INNER_NAME}: visibility is Invisible; advertisement off");
                 tokio::select! {
                     _ = ctk.cancelled() => {
@@ -567,6 +605,7 @@ impl ReceiverAdvertiser {
             };
 
             // Hold the registration until there's a reason to replace it.
+            ready();
             let held_since = tokio::time::Instant::now();
             loop {
                 tokio::select! {
