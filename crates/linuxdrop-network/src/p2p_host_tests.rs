@@ -18,6 +18,9 @@ struct State {
     wps_reject: bool,
     name_changed: bool,
     name_empty: bool,
+    disconnect_gate: Option<Arc<tokio::sync::Semaphore>>,
+    disconnect_started: Arc<tokio::sync::Notify>,
+    disconnect_reject: bool,
 }
 type Shared = Arc<Mutex<State>>;
 fn path(value: &str) -> OwnedObjectPath {
@@ -167,9 +170,27 @@ impl Device {
             started(bus).await;
         }
     }
-    fn disconnect(&self) {
+    async fn disconnect(&self) -> zbus::fdo::Result<()> {
         assert!(!self.parent);
-        self.state.lock().unwrap().disconnected += 1;
+        let (gate, started) = {
+            let state = self.state.lock().unwrap();
+            (
+                state.disconnect_gate.clone(),
+                state.disconnect_started.clone(),
+            )
+        };
+        started.notify_one();
+        if let Some(gate) = gate {
+            gate.acquire_owned().await.unwrap().forget();
+        }
+        let mut state = self.state.lock().unwrap();
+        if state.disconnect_reject {
+            return Err(zbus::fdo::Error::Failed(
+                "fixture disconnect rejected".into(),
+            ));
+        }
+        state.disconnected += 1;
+        Ok(())
     }
 }
 fn verify(identity: &GroupIdentity) -> Result<()> {
@@ -490,4 +511,106 @@ async fn device_name_host_uses_owned_go_and_cleans_up_failed_wps() {
     }
     // Invalid/changing names never start WPS, and no shared identity is written.
     assert_eq!(state.lock().unwrap().wps_started, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly isolated dbus-run-session"]
+async fn failed_group_creation_and_drop_wait_for_cleanup_receipts() {
+    assert_eq!(
+        std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+        Ok("1")
+    );
+    let state = Shared::default();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let started = {
+        let mut state = state.lock().unwrap();
+        state.wrong_channel = true;
+        state.disconnect_gate = Some(gate.clone());
+        state.disconnect_started.clone()
+    };
+    let _service = serve(state.clone(), Arc::new(tokio::sync::Notify::new())).await;
+    let connection = Connection::session().await.unwrap();
+    let client = connection.clone();
+    let mut worker = tokio::spawn(async move {
+        create_group_inner(client, "testwifi0", 5180, CancellationToken::new(), verify).await
+    });
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut worker)
+            .await
+            .is_err(),
+        "Creation failure must not return while its dropped group is still disconnecting"
+    );
+    gate.add_permits(1);
+    let error = worker.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("unapproved frequency"));
+    assert_eq!(state.lock().unwrap().disconnected, 1);
+
+    state.lock().unwrap().wrong_channel = false;
+    let hosted = create_group_inner(
+        connection.clone(),
+        "testwifi0",
+        5180,
+        CancellationToken::new(),
+        verify,
+    )
+    .await
+    .unwrap();
+    let receipt = hosted.group.settlement();
+    let abandoned = tokio::spawn(receipt.clone().wait());
+    abandoned.abort();
+    let _ = abandoned.await;
+    drop(hosted);
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    let mut waiting = Box::pin(receipt.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut waiting)
+            .await
+            .is_err()
+    );
+    gate.add_permits(1);
+    waiting.await.unwrap();
+    assert_eq!(state.lock().unwrap().disconnected, 2);
+
+    // Durable handoff settles this guard without issuing a disconnect; the
+    // journal owner is then responsible for teardown.
+    let hosted = create_group_inner(
+        connection.clone(),
+        "testwifi0",
+        5180,
+        CancellationToken::new(),
+        verify,
+    )
+    .await
+    .unwrap();
+    let receipt = hosted.group.settlement();
+    hosted.group.into_journaled();
+    tokio::time::timeout(Duration::from_secs(1), receipt.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.lock().unwrap().disconnected, 2);
+
+    {
+        let mut state = state.lock().unwrap();
+        state.disconnect_gate = None;
+        state.disconnect_reject = true;
+        state.wrong_channel = true;
+    }
+    let error = create_group_inner(
+        connection,
+        "testwifi0",
+        5180,
+        CancellationToken::new(),
+        verify,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("fixture disconnect rejected"));
+    assert!(error.to_string().contains("cleanup failed"));
+    assert_eq!(state.lock().unwrap().disconnected, 2);
 }

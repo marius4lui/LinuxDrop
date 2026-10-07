@@ -35,11 +35,54 @@ pub struct Group {
     connection: Connection,
     armed: bool,
     verify: fn(&GroupIdentity) -> Result<()>,
+    settled: tokio::sync::watch::Sender<Option<std::result::Result<(), String>>>,
 }
+
+/// Completes only once the guard has finished cleanup or transferred ownership
+/// to netd's durable journal. Dropping a waiter never cancels the cleanup task.
+#[derive(Clone)]
+pub struct GroupSettlement {
+    receiver: tokio::sync::watch::Receiver<Option<std::result::Result<(), String>>>,
+}
+impl GroupSettlement {
+    pub async fn wait(mut self) -> Result<()> {
+        loop {
+            if let Some(result) = self.receiver.borrow().clone() {
+                return result.map_err(anyhow::Error::msg);
+            }
+            self.receiver
+                .changed()
+                .await
+                .context("P2P group cleanup stopped without acknowledgement")?;
+        }
+    }
+}
+
 impl Group {
+    fn new(
+        identity: GroupIdentity,
+        connection: Connection,
+        verify: fn(&GroupIdentity) -> Result<()>,
+    ) -> Self {
+        let (settled, _) = tokio::sync::watch::channel(None);
+        Self {
+            identity,
+            connection,
+            armed: true,
+            verify,
+            settled,
+        }
+    }
+    pub fn settlement(&self) -> GroupSettlement {
+        GroupSettlement {
+            receiver: self.settled.subscribe(),
+        }
+    }
+
     /// Called only after netd durably journals the identity for crash recovery.
     pub fn into_journaled(mut self) -> GroupIdentity {
         self.armed = false;
+        self.settled.send_replace(Some(Ok(())));
         self.identity.clone()
     }
 }
@@ -51,14 +94,21 @@ impl Drop for Group {
         let connection = self.connection.clone();
         let identity = self.identity.clone();
         let verify = self.verify;
+        let settled = self.settled.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = tokio::time::timeout(
+                let result = tokio::time::timeout(
                     Duration::from_secs(10),
                     disconnect_checked(&connection, &identity, verify),
                 )
-                .await;
+                .await
+                .context("P2P group cleanup timed out")
+                .and_then(|result| result)
+                .map_err(|error| format!("{error:#}"));
+                settled.send_replace(Some(result));
             });
+        } else {
+            settled.send_replace(Some(Err("P2P group cleanup has no active runtime".into())));
         }
     }
 }
@@ -167,6 +217,7 @@ async fn connect_on(
     let mut find = HashMap::new();
     find.insert("Timeout", Value::from(20i32));
     find.insert("DiscoveryType", Value::from("start_with_full"));
+    let mut settlement = None;
     let operation = async {
         device.call::<_, _, ()>("Find", &(find,)).await?;
         let peer = tokio::time::timeout(Duration::from_secs(20), async {
@@ -254,12 +305,8 @@ async fn connect_on(
             service_owner: destination.clone(),
             bus_guid: bus_guid.clone(),
         };
-        let guard = Group {
-            identity,
-            connection: connection.clone(),
-            armed: true,
-            verify,
-        };
+        let guard = Group::new(identity, connection.clone(), verify);
+        settlement = Some(guard.settlement());
         verify(&guard.identity)?;
         Ok::<_, anyhow::Error>(guard)
     };
@@ -307,6 +354,14 @@ async fn connect_on(
                     .await;
                 }
             }
+        }
+    }
+    if result.is_err() {
+        if let Some(settlement) = settlement {
+            settlement
+                .wait()
+                .await
+                .context("P2P client cleanup failed")?;
         }
     }
     result
@@ -419,6 +474,7 @@ async fn create_group_authenticated(
     })
     .await
     .context("Supplicant setup timed out")??;
+    let mut settlement = None;
     let operation = async {
         let args: HashMap<&str, Value<'_>> = [
             ("persistent", Value::from(false)),
@@ -443,12 +499,8 @@ async fn create_group_authenticated(
         .await?;
         // Own cleanup before reading any further properties, including invalid
         // credentials or an unexpected operating channel.
-        let group = Group {
-            identity,
-            connection: connection.clone(),
-            armed: true,
-            verify,
-        };
+        let group = Group::new(identity, connection.clone(), verify);
+        settlement = Some(group.settlement());
         verify(&group.identity)?;
         let details = Proxy::new(
             &connection,
@@ -561,6 +613,14 @@ async fn create_group_authenticated(
                     }
                 }
             }
+        }
+    }
+    if result.is_err() {
+        if let Some(settlement) = settlement {
+            settlement
+                .wait()
+                .await
+                .context("P2P group-owner cleanup failed")?;
         }
     }
     result
