@@ -61,6 +61,17 @@ impl std::fmt::Display for GroupCleanupFailure {
 }
 impl std::error::Error for GroupCleanupFailure {}
 
+/// Formation may still own a radio even though no trustworthy group identity
+/// was obtained. The caller must retain its durable reservation.
+#[derive(Debug)]
+pub struct FormationUncertain(String);
+impl std::fmt::Display for FormationUncertain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "P2P formation recovery required: {}", self.0)
+    }
+}
+impl std::error::Error for FormationUncertain {}
+
 impl GroupSettlement {
     pub async fn wait(mut self) -> Result<()> {
         loop {
@@ -182,7 +193,9 @@ pub async fn connect_wps(
         let result = connect_inner(interface, peer_name, pin, frequency, cancel).await;
         let _ = sender.send(result); // An abandoned result drops the group guard.
     });
-    let result = receiver.await.context("P2P connection worker stopped")?;
+    let result = receiver
+        .await
+        .map_err(|_| FormationUncertain("P2P connection worker stopped".into()))?;
     cancel_on_drop.disarm();
     result
 }
@@ -245,6 +258,7 @@ async fn connect_on(
     find.insert("Timeout", Value::from(20i32));
     find.insert("DiscoveryType", Value::from("start_with_full"));
     let mut settlement = None;
+    let mut submitted = false;
     let operation = async {
         device.call::<_, _, ()>("Find", &(find,)).await?;
         let peer = tokio::time::timeout(Duration::from_secs(20), async {
@@ -295,6 +309,7 @@ async fn connect_on(
         if frequency != 0 {
             args.insert("frequency", Value::from(frequency as i32));
         }
+        submitted = true;
         let _: String = device.call("Connect", &(args,)).await?;
         let signal = tokio::time::timeout(Duration::from_secs(45), started.next())
             .await
@@ -348,47 +363,24 @@ async fn connect_on(
         device.call::<_, _, ()>("StopFind", &()),
     )
     .await;
-    let mut late_cleanup = Ok(());
-    if result.is_err() {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            device.call::<_, _, ()>("Cancel", &()),
-        )
-        .await;
-        if let Ok(Some(signal)) =
-            tokio::time::timeout(Duration::from_millis(250), started.next()).await
-        {
-            if let Ok((properties,)) = signal
-                .body()
-                .deserialize::<(HashMap<String, OwnedValue>,)>()
-            {
-                if let Ok(Ok(identity)) = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    started_identity(
-                        &connection,
-                        &destination,
-                        &interface,
-                        &existing,
-                        properties,
-                        "client",
-                    ),
-                )
-                .await
-                {
-                    late_cleanup = disconnect_acknowledged(&connection, &identity, verify).await;
-                }
-            }
-        }
-    }
     if result.is_err() {
         if let Some(settlement) = settlement {
             settlement
                 .wait()
                 .await
                 .context("P2P client cleanup failed")?;
+        } else if submitted {
+            cancel_formation(
+                &device,
+                &mut started,
+                &existing,
+                &interface,
+                "client",
+                verify,
+            )
+            .await?;
         }
     }
-    late_cleanup?;
     result
 }
 
@@ -441,7 +433,9 @@ pub async fn create_group_with_auth(
         .await;
         let _ = sender.send(result);
     });
-    let result = receiver.await.context("P2P group owner worker stopped")?;
+    let result = receiver
+        .await
+        .map_err(|_| FormationUncertain("P2P group owner worker stopped".into()))?;
     cancel_on_drop.disarm();
     result
 }
@@ -500,6 +494,7 @@ async fn create_group_authenticated(
     .await
     .context("Supplicant setup timed out")??;
     let mut settlement = None;
+    let mut submitted = false;
     let operation = async {
         let args: HashMap<&str, Value<'_>> = [
             ("persistent", Value::from(false)),
@@ -507,6 +502,7 @@ async fn create_group_authenticated(
         ]
         .into_iter()
         .collect();
+        submitted = true;
         device.call::<_, _, ()>("GroupAdd", &(args,)).await?;
         let signal = started
             .next()
@@ -601,50 +597,87 @@ async fn create_group_authenticated(
         _ = cancel.cancelled() => Err(anyhow::anyhow!("P2P group creation cancelled")),
         result = tokio::time::timeout(Duration::from_secs(45), operation) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("P2P group creation timed out"))),
     };
-    let mut late_cleanup = Ok(());
-    if result.is_err() {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            device.call::<_, _, ()>("Cancel", &()),
-        )
-        .await;
-        // GroupStarted can race cancellation after GroupAdd has succeeded.
-        // Drain that exact new group rather than leaving an unjournaled VIF.
-        if let Ok(Some(signal)) =
-            tokio::time::timeout(Duration::from_millis(250), started.next()).await
-        {
-            if let Ok((properties,)) = signal
-                .body()
-                .deserialize::<(HashMap<String, OwnedValue>,)>()
-            {
-                if let Ok(Ok(identity)) = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    started_identity(
-                        &connection,
-                        &destination,
-                        interface,
-                        &existing,
-                        properties,
-                        "GO",
-                    ),
-                )
-                .await
-                {
-                    late_cleanup = disconnect_acknowledged(&connection, &identity, verify).await;
-                }
-            }
-        }
-    }
     if result.is_err() {
         if let Some(settlement) = settlement {
             settlement
                 .wait()
                 .await
                 .context("P2P group-owner cleanup failed")?;
+        } else if submitted {
+            cancel_formation(&device, &mut started, &existing, interface, "GO", verify).await?;
         }
     }
-    late_cleanup?;
     result
+}
+
+// Cancel stops formation; it does not remove an already formed group. A late
+// signal must be identified and disconnected, or the original owner's fresh
+// inventory must confirm no new interface remains. Silence alone is no receipt.
+async fn cancel_formation(
+    device: &Proxy<'_>,
+    started: &mut zbus::proxy::SignalStream<'_>,
+    existing: &[OwnedObjectPath],
+    interface: &str,
+    role: &str,
+    verify: fn(&GroupIdentity) -> Result<()>,
+) -> Result<()> {
+    let connection = device.connection();
+    let destination = device.destination().to_string();
+    let cancelled = tokio::time::timeout(
+        Duration::from_secs(5),
+        device.call::<_, _, ()>("Cancel", &()),
+    )
+    .await
+    .context("P2P cancellation timed out")
+    .and_then(|result| result.map_err(Into::into));
+    let cleanup = async {
+        match tokio::time::timeout(Duration::from_millis(250), started.next()).await {
+            Ok(Some(signal)) => {
+                let (properties,): (HashMap<String, OwnedValue>,) = signal.body().deserialize()?;
+                let identity = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    started_identity(
+                        connection,
+                        &destination,
+                        interface,
+                        existing,
+                        properties,
+                        role,
+                    ),
+                )
+                .await
+                .context("Late P2P identity lookup timed out")??;
+                // A known resource has its own typed recovery error.
+                disconnect_acknowledged(connection, &identity, verify).await?;
+            }
+            Ok(None) => bail!("Supplicant signal stream ended before formation settled"),
+            Err(_) => cancelled?,
+        }
+        let root = zbus::proxy::Builder::<Proxy<'_>>::new(connection)
+            .destination(destination.as_str())?
+            .path("/fi/w1/wpa_supplicant1")?
+            .interface(SERVICE)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await?;
+        let current: Vec<OwnedObjectPath> = root.get_property("Interfaces").await?;
+        anyhow::ensure!(
+            current.iter().all(|path| existing.contains(path)),
+            "Supplicant retains an unidentified new interface after cancellation"
+        );
+        Ok::<(), anyhow::Error>(())
+    };
+    let result = tokio::time::timeout(Duration::from_secs(17), cleanup)
+        .await
+        .context("P2P formation cleanup timed out")
+        .and_then(|result| result);
+    result.map_err(|error| {
+        if error.downcast_ref::<GroupCleanupFailure>().is_some() {
+            error
+        } else {
+            FormationUncertain(format!("{error:#}")).into()
+        }
+    })
 }
 
 async fn started_identity(

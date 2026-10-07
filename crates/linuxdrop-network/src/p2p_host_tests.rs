@@ -23,6 +23,9 @@ struct State {
     disconnect_reject: bool,
     group_present: bool,
     retain_after_disconnect: bool,
+    malformed_started: bool,
+    cancel_reject: bool,
+    cancel_silent: bool,
 }
 type Shared = Arc<Mutex<State>>;
 fn path(value: &str) -> OwnedObjectPath {
@@ -109,13 +112,19 @@ struct Device {
     added: Arc<tokio::sync::Notify>,
 }
 async fn started(bus: &Connection) {
-    let properties: HashMap<&str, Value<'_>> = [
+    emit_started(bus, false).await;
+}
+async fn emit_started(bus: &Connection, malformed: bool) {
+    let mut properties: HashMap<&str, Value<'_>> = [
         ("role", Value::from("GO")),
         ("interface_object", Value::from(path(VIF))),
         ("group_object", Value::from(path(GROUP))),
     ]
     .into_iter()
     .collect();
+    if malformed {
+        properties.remove("interface_object");
+    }
     bus.emit_signal(None::<&str>, PARENT, DEVICE, "GroupStarted", &(properties,))
         .await
         .unwrap();
@@ -161,19 +170,31 @@ impl Device {
         let delay = self.state.lock().unwrap().delay;
         if !delay {
             self.state.lock().unwrap().group_present = true;
-            started(bus).await;
+            let malformed = self.state.lock().unwrap().malformed_started;
+            emit_started(bus, malformed).await;
         }
     }
-    async fn cancel(&self, #[zbus(connection)] bus: &Connection) {
-        let delay = {
+    async fn cancel(&self, #[zbus(connection)] bus: &Connection) -> zbus::fdo::Result<()> {
+        let (delay, malformed, silent, reject) = {
             let mut state = self.state.lock().unwrap();
             state.cancelled += 1;
-            state.delay
+            (
+                state.delay,
+                state.malformed_started,
+                state.cancel_silent,
+                state.cancel_reject,
+            )
         };
-        if delay {
-            self.state.lock().unwrap().group_present = true;
-            started(bus).await;
+        if reject {
+            return Err(zbus::fdo::Error::Failed(
+                "fixture cancellation rejected".into(),
+            ));
         }
+        if delay && !silent {
+            self.state.lock().unwrap().group_present = true;
+            emit_started(bus, malformed).await;
+        }
+        Ok(())
     }
     async fn disconnect(&self) -> zbus::fdo::Result<()> {
         assert!(!self.parent);
@@ -331,7 +352,7 @@ async fn autonomous_group_credentials_cleanup_and_cancellation_race() {
     cancel.cancel();
     assert!(worker.await.unwrap().is_err());
     wait_disconnect(&state, 3).await;
-    assert_eq!(state.lock().unwrap().cancelled, 3);
+    assert_eq!(state.lock().unwrap().cancelled, 2);
     let connection = Connection::session().await.unwrap();
     state.lock().unwrap().delay = false;
     let hosted = create_group_inner(
@@ -396,7 +417,7 @@ async fn autonomous_group_credentials_cleanup_and_cancellation_race() {
     assert!(error.to_string().contains("owner changed"), "{error:#}");
     assert_eq!(
         state.lock().unwrap().cancelled,
-        3,
+        2,
         "must not cancel the replacement instance"
     );
     assert_eq!(replacement_state.lock().unwrap().cancelled, 1);
@@ -664,4 +685,64 @@ async fn disconnect_reply_does_not_settle_before_interface_removal() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly isolated dbus-run-session"]
+async fn unknown_formation_is_never_a_successful_cleanup_receipt() {
+    assert_eq!(
+        std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        std::env::var("DBUS_SYSTEM_BUS_ADDRESS"),
+        std::env::var("DBUS_SESSION_BUS_ADDRESS")
+    );
+    let state = Shared::default();
+    let added = Arc::new(tokio::sync::Notify::new());
+    let _service = serve(state.clone(), added.clone()).await;
+    // Malformed initial signal, malformed signal racing Cancel, rejected Cancel,
+    // and successful Cancel with no group: only the last has a safe receipt.
+    for (delay, malformed, rejected, silent, uncertain) in [
+        (false, true, false, false, true),
+        (true, true, false, false, true),
+        (true, false, true, true, true),
+        (true, false, false, true, false),
+    ] {
+        *state.lock().unwrap() = State {
+            delay,
+            malformed_started: malformed,
+            cancel_reject: rejected,
+            cancel_silent: silent,
+            ..Default::default()
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(1), added.notified()).await;
+        let connection = Connection::session().await.unwrap();
+        let cancel = CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let worker = tokio::spawn(async move {
+            create_group_inner(connection, "testwifi0", 5180, worker_cancel, verify).await
+        });
+        tokio::time::timeout(Duration::from_secs(3), added.notified())
+            .await
+            .unwrap();
+        if delay {
+            cancel.cancel();
+        }
+        let error = tokio::time::timeout(Duration::from_secs(3), worker)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("fixture must not produce a usable group");
+        assert_eq!(
+            error.downcast_ref::<FormationUncertain>().is_some(),
+            uncertain,
+            "{error:#}"
+        );
+        assert_eq!(
+            state.lock().unwrap().disconnected,
+            0,
+            "never guess a group to delete"
+        );
+    }
 }

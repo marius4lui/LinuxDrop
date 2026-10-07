@@ -63,6 +63,7 @@ pub(super) async fn acquire_radio(
         kind: LeaseKind::Monitor,
         connection_uuid: None,
         p2p_group: None,
+        p2p_pending: false,
         direct_capabilities: Default::default(),
         allowed_frequencies: radio
             .channels
@@ -324,6 +325,7 @@ pub(super) async fn reserve_radio(
         kind: LeaseKind::DirectWifi,
         connection_uuid: Some(uuid::Uuid::new_v4().to_string()),
         p2p_group: None,
+        p2p_pending: false,
         direct_capabilities: direct_capabilities(&radio.modes, &radio.channels),
     };
     state.leases.insert(id.clone(), lease.clone());

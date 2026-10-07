@@ -64,6 +64,9 @@ pub struct Lease {
     pub connection_uuid: Option<String>,
     #[serde(default)]
     pub p2p_group: Option<linuxdrop_network::p2p::GroupIdentity>,
+    /// Persisted before formation; cleared only after proven settlement.
+    #[serde(default)]
+    pub p2p_pending: bool,
     #[serde(default)]
     pub direct_capabilities: linuxdrop_network::DirectWifiCapabilities,
 }

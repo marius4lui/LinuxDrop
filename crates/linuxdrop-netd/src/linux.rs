@@ -31,6 +31,7 @@ mod channel;
 
 const JOURNAL: &str = "/var/lib/linuxdrop-netd/leases.json";
 const MAX_REQUEST: u64 = 4096;
+const P2P_UNCERTAIN: &str = "P2P formation outcome is unknown; radio remains reserved until verified recovery or a system reboot";
 #[derive(Default)]
 struct State {
     leases: HashMap<String, Lease>,
@@ -724,7 +725,7 @@ async fn join_p2p(
     let inv = inventory().await;
     let mut state = shared.lock().await;
     state.radio_changed();
-    let lease = state
+    let mut lease = state
         .leases
         .get(&lease_id)
         .ok_or("lease not found")?
@@ -737,6 +738,7 @@ async fn join_p2p(
     }
     if lease.kind != LeaseKind::DirectWifi
         || lease.p2p_group.is_some()
+        || lease.p2p_pending
         || state.producers.contains_key(&lease_id)
     {
         return Err("a free direct Wi-Fi lease is required".into());
@@ -775,6 +777,14 @@ async fn join_p2p(
         })
     {
         return Err("P2P frequency is not permitted by the radio regulatory policy".into());
+    }
+    // Survive a helper crash even before supplicant returns a group identity.
+    lease.p2p_pending = true;
+    state.leases.insert(lease_id.clone(), lease.clone());
+    if let Err(error) = persist(&state) {
+        lease.p2p_pending = false;
+        state.leases.insert(lease_id.clone(), lease);
+        return Err(error.to_string());
     }
     let cancel = tokio_util::sync::CancellationToken::new();
     let stop_on_drop = cancel.clone().drop_guard();
@@ -864,15 +874,26 @@ async fn perform_p2p(
         Ok(group) => group,
         Err(error) => {
             let error: linuxdrop_network::p2p::FormationError = error;
+            lease.p2p_pending = error
+                .downcast_ref::<linuxdrop_network::p2p::FormationUncertain>()
+                .is_some();
             if let Some(failed) =
                 error.downcast_ref::<linuxdrop_network::p2p::GroupCleanupFailure>()
             {
                 lease.p2p_group = Some(failed.identity.clone());
-                let mut state = shared.lock().await;
-                state.radio_changed();
+            }
+            let mut state = shared.lock().await;
+            state.radio_changed();
+            if lease.p2p_pending || lease.p2p_group.is_some() {
                 state.attached.remove(&lease_id);
-                state.leases.insert(lease_id.clone(), lease.clone());
-                persist(&state).map_err(|e| e.to_string())?;
+                state.record_recovery_error(format!("{lease_id}: {error}"));
+            }
+            state.leases.insert(lease_id.clone(), lease.clone());
+            if let Err(journal) = persist(&state) {
+                state.attached.remove(&lease_id);
+                return Err(format!(
+                    "{error}; formation journal update failed: {journal}"
+                ));
             }
             return Err(error.to_string());
         }
@@ -899,6 +920,7 @@ async fn perform_p2p(
         if cancel.is_cancelled() || !state.leases.contains_key(&lease_id) {
             return Err("P2P radio lease ended during group formation".into());
         }
+        lease.p2p_pending = false;
         lease.p2p_group = Some(group.identity.clone());
         state.leases.insert(lease_id.clone(), lease.clone());
         persist(&state).map_err(|e| e.to_string())?;
@@ -912,11 +934,10 @@ async fn perform_p2p(
         let mut state = shared.lock().await;
         state.radio_changed();
         state.attached.remove(&lease_id);
-        if settled.is_err() {
-            lease.p2p_group = Some(formed_identity);
-            state.leases.insert(lease_id.clone(), lease.clone());
-            persist(&state).map_err(|error| error.to_string())?;
-        }
+        lease.p2p_pending = false;
+        lease.p2p_group = settled.is_err().then_some(formed_identity);
+        state.leases.insert(lease_id.clone(), lease.clone());
+        persist(&state).map_err(|error| error.to_string())?;
     }
     published?;
     settled?;
@@ -1152,7 +1173,9 @@ async fn apply(
                 .values()
                 .filter(|l| l.uid == uid && !state.attached.contains(&l.id))
                 .map(|l| {
-                    let check = if l.kind == LeaseKind::DirectWifi {
+                    let check = if l.p2p_pending {
+                        Err(P2P_UNCERTAIN.to_owned())
+                    } else if l.kind == LeaseKind::DirectWifi {
                         Ok(())
                     } else {
                         verify_owned(l)
@@ -1227,11 +1250,14 @@ async fn restore(lease: &Lease) -> Result<(), String> {
 }
 
 async fn restore_p2p(lease: &Lease) -> Result<(), String> {
+    let boot =
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
+    if lease.p2p_pending && boot.trim() == lease.boot_id {
+        return Err(P2P_UNCERTAIN.into());
+    }
     let Some(group) = &lease.p2p_group else {
         return Ok(());
     };
-    let boot =
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
     let path = Path::new("/sys/class/net").join(&group.interface);
     if boot.trim() == lease.boot_id && path.exists() {
         let alias = std::fs::read_to_string(path.join("ifalias")).map_err(|e| e.to_string())?;
@@ -2149,9 +2175,44 @@ mod tests {
             kind: LeaseKind::DirectWifi,
             connection_uuid: Some("owned-uuid".into()),
             p2p_group: None,
+            p2p_pending: false,
             direct_capabilities: Default::default(),
         }
     }
+    #[tokio::test]
+    async fn uncertain_formation_survives_journal_and_blocks_radio_reuse() {
+        let mut lease = direct_lease();
+        lease.boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+            .into();
+        lease.p2p_pending = true;
+        let bytes = serde_json::to_vec(&lease).unwrap();
+        let restored: Lease = serde_json::from_slice(&bytes).unwrap();
+        let id = restored.id.clone();
+        let shared = Arc::new(Mutex::new(State::default()));
+        shared.lock().await.leases.insert(id.clone(), restored);
+        let receipt = begin_cleanup_with(
+            &shared,
+            &id,
+            |lease, _| async move { restore_p2p(&lease).await },
+            |_| Ok(()),
+        )
+        .await;
+        assert!(wait_cleanup(receipt)
+            .await
+            .unwrap_err()
+            .contains("outcome is unknown"));
+        assert!(shared.lock().await.leases[&id].p2p_pending);
+        assert!(!shared.lock().await.attached.contains(&id));
+        // An old boot cannot still have a pending kernel formation operation.
+        lease.boot_id = "previous-boot".into();
+        assert!(restore_p2p(&lease).await.is_ok());
+        let mut legacy = serde_json::to_value(&lease).unwrap();
+        legacy.as_object_mut().unwrap().remove("p2p_pending");
+        assert!(!serde_json::from_value::<Lease>(legacy).unwrap().p2p_pending);
+    }
+
     #[tokio::test]
     async fn revoked_reservation_is_recovery_only_and_cannot_change_channel() {
         let lease = direct_lease();

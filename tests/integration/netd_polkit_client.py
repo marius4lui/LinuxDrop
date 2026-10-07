@@ -15,6 +15,7 @@ daemon_started = False
 settings_path = Path.home() / '.config/linuxdrop/settings.json'
 original_settings = None
 settings_existed = False
+stage = 'session lookup'
 try:
     # Resolve the calling PID through real logind rather than trusting its env.
     session_path = shlex.split(subprocess.check_output(['busctl', 'call',
@@ -33,6 +34,7 @@ try:
     subprocess.run(['pkcheck', '--revoke-temp'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     subject_pid = os.getpid()
     if daemon_mode:
+        stage = 'user service preparation'
         active = subprocess.run(['systemctl', '--user', 'is-active', 'linuxdropd.service'], capture_output=True, text=True)
         assert active.stdout.strip() != 'active', 'Do not replace an existing user daemon'
         settings_existed = settings_path.exists()
@@ -43,13 +45,16 @@ try:
             'localsend': {'enabled': False}, 'quickshare': {'enabled': False},
             'airdrop': {'enabled': False}, 'hardware': {'auto_use_usb': False}}))
         daemon_started = True
-        subprocess.run(['systemctl', '--user', 'start', 'linuxdropd.service'], check=True, capture_output=True, timeout=15)
+        stage = 'user service start'
+        subprocess.run(['systemctl', '--user', 'start', 'linuxdropd.service'], check=True, capture_output=True, timeout=30)
+        stage = 'user service identity'
         subject_pid = int(subprocess.check_output(['systemctl', '--user', 'show', 'linuxdropd.service', '--property=MainPID', '--value'], text=True))
         assert subject_pid > 0 and subject_pid != os.getpid()
         cgroup = Path(f'/proc/{subject_pid}/cgroup').read_text()
         assert 'user@' in cgroup and 'linuxdropd.service' in cgroup and 'session-' not in cgroup, 'Daemon must run as a real user service'
         assert Path(f'/proc/{subject_pid}').stat().st_uid == os.getuid()
     if '--agent' in sys.argv:
+        stage = 'agent registration'
         read_fd, write_fd = os.pipe()
         agent = subprocess.Popen(['pkttyagent', '--process', str(subject_pid), '--notify-fd', str(write_fd)], pass_fds=(write_fd,))
         os.close(write_fd)
@@ -60,6 +65,7 @@ try:
         if agent.poll() is not None:
             raise RuntimeError('Agent could not register')
     print('LINUXDROP_AUTH_CLIENT_READY', flush=True)
+    stage = 'authorized diagnostic' if daemon_mode else 'authorized reserve'
     if daemon_mode:
         called = subprocess.run(['busctl', '--user', '--timeout=90', 'call',
             'io.github.marius4lui.LinuxDrop', '/io/github/marius4lui/LinuxDrop',
@@ -89,6 +95,16 @@ try:
                     raise RuntimeError('Oversized helper response')
         result = json.loads(response)
     print('LINUXDROP_AUTH_RESULT:' + json.dumps(result), flush=True)
+except Exception as error:
+    # Deliberately omit exception text/tracebacks and PTY buffers: only fixed
+    # stages, exception class and systemd's non-secret result properties escape.
+    diagnostic = {'stage': stage, 'exception': type(error).__name__}
+    if daemon_started:
+        diagnostic['unit'] = subprocess.run(['systemctl', '--user', 'show',
+            'linuxdropd.service', '-p', 'Result', '-p', 'ExecMainStatus', '-p', 'SubState'],
+            capture_output=True, text=True, timeout=5).stdout.strip()
+    print('LINUXDROP_AUTH_RESULT:' + json.dumps({'status': 'probe_failed', 'message': diagnostic}), flush=True)
+    sys.exit(1)
 finally:
     if agent is not None:
         agent.terminate()

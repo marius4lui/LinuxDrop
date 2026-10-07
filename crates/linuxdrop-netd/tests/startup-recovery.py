@@ -87,6 +87,28 @@ assert json.loads(journal.read_text())[0]["id"] == lease["id"]
 # Restart sees and retains the failed reservation too.
 run_helper(failed_recovery)
 
+# A durable formation intent without any group identity remains reserved across
+# actual helper process restarts, even when its parent link has no owner marker.
+pending = dict(lease, kind="direct_wifi", p2p_pending=True, connection_uuid=None)
+journal.write_text(json.dumps([pending]))
+
+def uncertain_formation(process):
+    wait_for(lambda: any("outcome is unknown" in error for error in
+        request("recovery_status")["recent_errors"]), process)
+    assert request("status")["leases"] == []
+    recovery = request("recovery_status")
+    assert len(recovery["issues"]) == 1
+    assert not recovery["issues"][0]["ownership_verified"]
+    assert "outcome is unknown" in recovery["issues"][0]["detail"]
+    assert json.loads(journal.read_text())[0]["p2p_pending"] is True
+
+run_helper(uncertain_formation)
+run_helper(uncertain_formation)
+# Simulated old-boot journal: no live formation can cross a kernel reboot.
+pending["boot_id"] = "synthetic-previous-boot"
+journal.write_text(json.dumps([pending]))
+run_helper(lambda process: wait_for(lambda: json.loads(journal.read_text()) == [], process))
+
 for malformed in [b"broken journal", json.dumps([lease, lease]).encode()]:
     journal.write_bytes(malformed)
     result = subprocess.run([binary], env=env, capture_output=True, timeout=5)

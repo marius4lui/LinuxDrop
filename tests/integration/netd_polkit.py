@@ -88,6 +88,8 @@ def scenario(name, seat, vt, agent, wrong=False, daemon=False, remote=False):
                 child.sendline('deliberately-invalid-test-password' if wrong else password)
             elif event == 3:
                 result = json.loads(child.match.group(1))
+                if result.get('status') == 'probe_failed':
+                    raise RuntimeError(f'{name}: client failed: {result["message"]}')
                 break
             else:
                 # Session metadata and systemd states are safe; never expose PTY

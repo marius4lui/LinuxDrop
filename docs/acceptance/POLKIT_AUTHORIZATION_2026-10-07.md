@@ -63,6 +63,13 @@ desktop recommendations, avoiding an unrelated display-manager installation
 during this test. A fresh remote CI result is still required; the initial failure
 is not counted as a pass.
 
+The second remote run (`37647969150`) passes the five direct-helper authorization
+cases and reaches the new user-service case, which ends before agent registration.
+The same eight-case matrix passes on the isolated Ubuntu installation. The client
+now emits only a fixed execution stage, exception class and safe systemd result
+properties on probe failure, so the remote environment difference can be located
+without exposing terminal contents. The remote user-service result remains open.
+
 Graphical authentication-agent behavior and physical adapter mutation remain
 separate acceptance work. These probes use real services and authorization but
 an intentionally nonexistent radio, so they do not establish hardware support.
