@@ -17,7 +17,9 @@ Remaining code/evidence requirements:
   See [producer retirement evidence](../acceptance/NETD_PRODUCER_SETTLEMENT_2026-10-07.md).
   Unidentified late GroupStarted events and ambiguous Cancel results still need
   explicit recovery semantics; known unmarked groups must retain strict ownership
-  checks during recovery.
+  checks during recovery. Known-group cleanup now waits for live supplicant
+  inventory removal and, in netd, kernel interface disappearance; see
+  [removal observation evidence](../acceptance/P2P_REMOVAL_OBSERVATION_2026-10-07.md).
 - Acquire/AcquireAwdl now use persistent producers and cleanup receipts outside
   State; Reserve inventory no longer holds State either. See
   [acquisition evidence](../acceptance/NETD_ACQUISITION_2026-10-07.md).

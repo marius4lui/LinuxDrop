@@ -1248,6 +1248,16 @@ async fn restore_p2p(lease: &Lease) -> Result<(), String> {
         .await
         .map_err(|_| "P2P disconnect timed out".to_owned())?
         .map_err(|e| e.to_string())?;
+        // Supplicant has retired its object; wait for the kernel VIF too. Do
+        // not free the physical-radio reservation while its link still exists.
+        timeout(Duration::from_secs(5), async {
+            while path.try_exists().map_err(|error| error.to_string())? {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| "P2P kernel interface did not disappear".to_owned())??;
     }
     for suffix in ["ipv4.json", "dhcp.conf", "dhcp.leases", "dhcp.pid"] {
         let _ = std::fs::remove_file(format!("/run/linuxdrop/{}.{suffix}", lease.id));

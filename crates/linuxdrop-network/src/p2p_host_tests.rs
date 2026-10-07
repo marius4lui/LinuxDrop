@@ -21,6 +21,8 @@ struct State {
     disconnect_gate: Option<Arc<tokio::sync::Semaphore>>,
     disconnect_started: Arc<tokio::sync::Notify>,
     disconnect_reject: bool,
+    group_present: bool,
+    retain_after_disconnect: bool,
 }
 type Shared = Arc<Mutex<State>>;
 fn path(value: &str) -> OwnedObjectPath {
@@ -36,7 +38,8 @@ impl Root {
     #[zbus(property)]
     fn interfaces(&self) -> Vec<OwnedObjectPath> {
         let mut paths = vec![path(PARENT)];
-        if self.0.lock().unwrap().existing {
+        let state = self.0.lock().unwrap();
+        if state.existing || state.group_present {
             paths.push(path(VIF));
         }
         paths
@@ -157,6 +160,7 @@ impl Device {
         self.added.notify_one();
         let delay = self.state.lock().unwrap().delay;
         if !delay {
+            self.state.lock().unwrap().group_present = true;
             started(bus).await;
         }
     }
@@ -167,6 +171,7 @@ impl Device {
             state.delay
         };
         if delay {
+            self.state.lock().unwrap().group_present = true;
             started(bus).await;
         }
     }
@@ -190,6 +195,9 @@ impl Device {
             ));
         }
         state.disconnected += 1;
+        if !state.retain_after_disconnect {
+            state.group_present = false;
+        }
         Ok(())
     }
 }
@@ -307,6 +315,7 @@ async fn autonomous_group_credentials_cleanup_and_cancellation_race() {
     {
         let mut state = state.lock().unwrap();
         state.existing = false;
+        state.group_present = false;
         state.delay = true;
     }
     // Clear any earlier Notify permit before waiting for this specific GroupAdd.
@@ -598,6 +607,7 @@ async fn failed_group_creation_and_drop_wait_for_cleanup_receipts() {
     {
         let mut state = state.lock().unwrap();
         state.disconnect_gate = None;
+        state.group_present = false;
         state.disconnect_reject = true;
         state.wrong_channel = true;
     }
@@ -616,4 +626,42 @@ async fn failed_group_creation_and_drop_wait_for_cleanup_receipts() {
     assert_eq!(recovery.identity.parent_interface, "testwifi0");
     assert!(!recovery.identity.interface_object.is_empty());
     assert_eq!(state.lock().unwrap().disconnected, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly isolated dbus-run-session"]
+async fn disconnect_reply_does_not_settle_before_interface_removal() {
+    assert_eq!(
+        std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+        Ok("1")
+    );
+    let state = Shared::default();
+    state.lock().unwrap().retain_after_disconnect = true;
+    let _service = serve(state.clone(), Arc::new(tokio::sync::Notify::new())).await;
+    let connection = Connection::session().await.unwrap();
+    let hosted = create_group_inner(
+        connection,
+        "testwifi0",
+        5180,
+        CancellationToken::new(),
+        verify,
+    )
+    .await
+    .unwrap();
+    let receipt = hosted.group.settlement();
+    drop(hosted);
+    wait_disconnect(&state, 1).await;
+    let mut receipt = Box::pin(receipt.wait());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut receipt)
+            .await
+            .is_err(),
+        "A successful Disconnect reply cannot retire a still-present group interface"
+    );
+    // No PropertiesChanged signal: the confirmation must bypass stale caches.
+    state.lock().unwrap().group_present = false;
+    tokio::time::timeout(Duration::from_secs(1), receipt)
+        .await
+        .unwrap()
+        .unwrap();
 }

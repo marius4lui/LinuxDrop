@@ -777,6 +777,29 @@ async fn disconnect_checked(
         bail!("P2P group ownership changed");
     }
     device.call::<_, _, ()>("Disconnect", &()).await?;
+    // A method reply is not the removal observation. A fresh group VIF must
+    // disappear from the same pinned owner's live inventory before settling.
+    let root = zbus::proxy::Builder::<Proxy<'_>>::new(connection)
+        .destination(identity.service_owner.as_str())?
+        .path("/fi/w1/wpa_supplicant1")?
+        .interface(SERVICE)?
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let interfaces: Vec<OwnedObjectPath> = root.get_property("Interfaces").await?;
+            if !interfaces
+                .iter()
+                .any(|object| object.as_str() == identity.interface_object)
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .context("Supplicant still reports the disconnected P2P interface")??;
     Ok(())
 }
 
