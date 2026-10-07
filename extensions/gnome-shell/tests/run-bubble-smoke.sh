@@ -20,11 +20,13 @@ glib-compile-schemas "$extension/schemas"
 python3 - "$extension/extension.js" <<'PY'
 from pathlib import Path
 import sys
+import os
 target = Path(sys.argv[1])
 source = target.read_text()
 marker = '        this._poll = GLib.timeout_add_seconds'
 assert source.count(marker) == 1
-probe = Path('extensions/gnome-shell/tests/bubble-smoke.js').read_text()
+probe_name = 'orca-smoke.js' if os.environ.get('LINUXDROP_SMOKE_ORCA') == '1' else 'bubble-smoke.js'
+probe = Path('extensions/gnome-shell/tests', probe_name).read_text()
 target.write_text(source.replace(marker, probe + '\n' + marker))
 PY
 export LINUXDROP_SMOKE_ROOT="$runroot"
@@ -34,7 +36,8 @@ dbus-run-session -- bash -c '
     fixture_pid=$!
     shell_pid=
     logind_pid=
-    trap '\''kill ${shell_pid:-} ${logind_pid:-} "$fixture_pid" 2>/dev/null || true'\'' EXIT
+    orca_pid=
+    trap '\''kill ${orca_pid:-} ${shell_pid:-} ${logind_pid:-} "$fixture_pid" 2>/dev/null || true'\'' EXIT
     if [ "${LINUXDROP_SMOKE_MOCK_LOGIND:-0}" = 1 ]; then
         export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" XDG_SESSION_ID=linuxdrop_ci
         python3 -m dbusmock --session -t logind > "$LINUXDROP_SMOKE_ROOT/logind.log" 2>&1 &
@@ -48,13 +51,28 @@ dbus-run-session -- bash -c '
     gsettings set org.gnome.desktop.interface enable-hot-corners false
     gsettings set org.gnome.desktop.notifications show-banners false
     gsettings set org.gnome.desktop.session idle-delay 0
+    if [ "${LINUXDROP_SMOKE_ORCA:-0}" = 1 ]; then
+        gsettings set org.gnome.desktop.interface toolkit-accessibility true
+    fi
     gnome-shell --headless --wayland --no-x11 --wayland-display=linuxdrop-bubble-smoke --virtual-monitor="${LINUXDROP_SMOKE_MONITOR:-1440x900}" > "$LINUXDROP_SMOKE_ROOT/shell.log" 2>&1 &
     shell_pid=$!
+    if [ "${LINUXDROP_SMOKE_ORCA:-0}" = 1 ]; then
+        for attempt in {1..50}; do
+            [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || break
+            sleep 0.1
+        done
+        GDK_BACKEND=wayland orca --user-prefs "$LINUXDROP_SMOKE_ROOT/orca" --enable=speech --disable=braille --debug-file "$LINUXDROP_SMOKE_ROOT/orca-debug.log" > "$LINUXDROP_SMOKE_ROOT/orca.log" 2>&1 &
+        orca_pid=$!
+    fi
     for attempt in {1..30}; do
         sleep 1
         if grep -q LINUXDROP_SMOKE_FAILED "$LINUXDROP_SMOKE_ROOT/shell.log"; then cat "$LINUXDROP_SMOKE_ROOT/shell.log"; exit 1; fi
         if grep -q LINUXDROP_SMOKE_PASSED "$LINUXDROP_SMOKE_ROOT/shell.log"; then
             grep -E "LINUXDROP_(SMOKE|REAL_DROP)_PASSED" "$LINUXDROP_SMOKE_ROOT/shell.log"
+            if [ "${LINUXDROP_SMOKE_ORCA:-0}" = 1 ]; then
+                grep "SPEECH: Speak" "$LINUXDROP_SMOKE_ROOT/orca-debug.log"
+                exit 0
+            fi
             extension="$XDG_DATA_HOME/gnome-shell/extensions/linuxdrop@marius4lui.github.io"
             # Shell keeps private typelibs/libraries in the distro lib directory.
             for library in /usr/lib/gnome-shell /usr/lib64/gnome-shell /usr/lib/*/gnome-shell; do

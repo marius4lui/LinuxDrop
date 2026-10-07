@@ -93,7 +93,9 @@ export default class LinuxDropExtension extends Extension {
             return Clutter.EVENT_PROPAGATE;
         });
         Main.panel.addToStatusArea('linuxdrop', this._panelButton, 0, 'right');
-        this._notch = new St.BoxLayout({vertical: true, request_mode: Clutter.RequestMode.HEIGHT_FOR_WIDTH, style_class: 'linuxdrop-notch', reactive: true, can_focus: true, track_hover: true, visible: false});
+        // Focus belongs to the header and actions. A focusable container makes
+        // St.navigate_focus stop on the container instead of traversing them.
+        this._notch = new St.BoxLayout({vertical: true, request_mode: Clutter.RequestMode.HEIGHT_FOR_WIDTH, style_class: 'linuxdrop-notch', reactive: true, can_focus: false, track_hover: true, visible: false, accessible_role: Atk.Role.DIALOG, accessible_name: 'LinuxDrop'});
         this._header = new St.Button({style_class: 'linuxdrop-notch-header', can_focus: true, accessible_name: t('Close LinuxDrop'), x_expand: true});
         const row = new St.BoxLayout({style_class: 'linuxdrop-notch-actions', x_expand: true});
         row.add_child(new St.Icon({icon_name: 'document-send-symbolic', style_class: 'linuxdrop-notch-icon'}));

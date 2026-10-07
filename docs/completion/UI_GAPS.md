@@ -28,13 +28,14 @@ items retain their remaining acceptance scope even where code now exists.
 - [x] Full settings inventory from final schema: all 47 user-facing fields have controls, plus diagnosis/restart/reset/export actions. Schema inventory and native write/search/retry evidence are in the settings/export review; physical policy acceptance remains separate.
 - [x] Settings search survives immediate refreshes, includes desktop/diagnostic rows and translated option/category names; categories and advanced grouping remain available. No-results recovery resets both filters.
 - [x] Desired/effective settings differences and backend apply errors visible: persistent applying/error/offline status in Settings, per-service details and recovery; native German 480x600 acceptance.
-- [ ] Icon-only actions have translated accessible names; selected states/progress exposed; keyboard navigation/actions documented.
+- [x] Icon-only actions have translated accessible names; selected states/progress exposed; keyboard navigation/actions documented.
   Explicit names and native shortcut help are implemented; [keyboard evidence](../acceptance/UI_KEYBOARD_2026-10-07.md)
-  records the source review, compact native guide and page navigation. Full
-  accessibility traversal remains to be verified.
+  records the source review, compact native guide and page navigation.
   [Actual Orca traversal](../acceptance/ORCA_2026-10-07.md) now verifies the GTK
   device name/selected state, numeric progress, core controls and four views; it
-  found and fixed unnamed device toggles. Shell screen-reader traversal is open.
+  found and fixed unnamed device toggles. [Shell Orca traversal](../acceptance/ORCA_SHELL_2026-10-07.md)
+  additionally verifies actual keyboard navigation, spoken consent context and
+  progress; it found and fixed the outer-container focus trap.
 - [ ] Notch multiple-transfer selection remains stable; completion/error/open-folder actions; summary does not randomly change peer.
   Native GNOME now verifies completed selection/focus across reordered snapshots
   and the available completion actions. Actual Shell folder-handler launch remains
@@ -50,7 +51,7 @@ items retain their remaining acceptance scope even where code now exists.
 ## Acceptance still requiring external environment or hardware
 
 - [x] Real GTK screen-reader traversal in a private desktop session: Orca speech generation, keyboard navigation, selected device state, progress, incoming review and settings search. [Evidence and limits](../acceptance/ORCA_2026-10-07.md).
-- [ ] GNOME Shell screen-reader traversal of the panel and Notch actions.
+- [x] GNOME Shell screen-reader traversal of the panel and Notch actions on GNOME 46, including spoken peer/code/progress and real Tab/Enter/Space/Escape events. [Evidence and limits](../acceptance/ORCA_SHELL_2026-10-07.md).
 - [ ] Physical mixed-DPI monitor hotplug and suspend/resume.
 - [ ] Physical Apple/Android/USB/BLE interoperability (owned by protocol/hardware work).
 
