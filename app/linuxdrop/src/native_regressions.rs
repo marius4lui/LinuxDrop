@@ -330,6 +330,12 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         ui.render_peers();
         ui.protocol.set_selected(2);
         assert_eq!(&*ui.selected_protocol.borrow(), "quickshare");
+        let peer = find(&ui.peers, "peer:pixel").unwrap().downcast::<gtk::ToggleButton>().unwrap();
+        peer.emit_clicked();
+        assert_eq!(&*ui.selected_protocol.borrow(), "quickshare",
+            "Reactivating the selected recipient must retain the user's explicit protocol");
+        assert!(find(&ui.peers, "peer:pixel").unwrap().downcast::<gtk::ToggleButton>().unwrap().is_active(),
+            "Reactivating a recipient must keep its selection visible");
         snapshot.borrow_mut()["peers"][0]["protocols"] = json!(["quickshare", "localsend"]);
         snapshot.borrow_mut()["revision"] = json!(2);
         ui.refresh();
@@ -723,9 +729,14 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             "id":"radio-test", "name":"<b>USB & Wi-Fi</b>", "driver":"test <driver>",
             "protected":false, "rfkill":false, "active_connection":"<b>Home & guest</b>"
         }]);
+        snapshot.borrow_mut()["hardware"]["bluetooth"] = json!([{
+            "id":"hci-test", "name":"Test Bluetooth", "powered":true
+        }]);
         snapshot.borrow_mut()["revision"] = json!(321);
         ui.refresh();
         settle().await;
+        let backend_status = find(&ui.hardware, "hardware:backend:localsend:state").unwrap().downcast::<gtk::Label>().unwrap();
+        assert!(!backend_status.wraps(), "Short backend status badges must remain readable on one line");
         let adapter = find(&ui.hardware, "hardware:radios:radio-test").unwrap().downcast::<adw::ExpanderRow>().unwrap();
         assert!(!adapter.uses_markup(), "External adapter and driver names must be literal");
         adapter.set_expanded(true);
@@ -741,6 +752,31 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             };
             assert!(mismatch.is_none(), "Adapter action needs its translated name and adapter: {mismatch:?}");
         }
+        let prefer = find(&ui.hardware, "hardware:radios:radio-test:prefer").unwrap().downcast::<gtk::Button>().unwrap();
+        assert!(prefer.grab_focus());
+        fail_next_setting.set(true);
+        prefer.emit_clicked();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(find(&ui.hardware, "hardware:radios:radio-test:prefer").unwrap().downcast::<gtk::Button>().unwrap().icon_name().as_deref(),
+            Some("emblem-favorite-symbolic"), "A failed preference write must not claim the adapter is selected");
+        prefer.emit_clicked();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        let prefer = find(&ui.hardware, "hardware:radios:radio-test:prefer").unwrap().downcast::<gtk::Button>().unwrap();
+        assert_eq!(snapshot.borrow()["settings"]["hardware"]["preferred_adapter"], "radio-test");
+        assert_eq!(prefer.icon_name().as_deref(), Some("emblem-ok-symbolic"),
+            "A confirmed preference must be visible even without an inventory or revision change");
+        assert_eq!(prefer.tooltip_text().as_deref(), Some(tr("Preferred adapter").as_str()));
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&ui.window), Some(prefer.clone().upcast()),
+            "Confirming an adapter preference preserves keyboard focus");
+        let writes = setting_calls.get();
+        prefer.emit_clicked();
+        settle().await;
+        assert_eq!(setting_calls.get(), writes, "Reactivating the preferred adapter must not repeat its write");
+        snapshot.borrow_mut()["settings"]["bluetooth"]["adapter"] = json!("hci-test");
+        ui.refresh();
+        settle().await;
+        assert_eq!(find(&ui.hardware, "hardware:bluetooth:hci-test:prefer").unwrap().downcast::<gtk::Button>().unwrap().icon_name().as_deref(),
+            Some("emblem-ok-symbolic"), "Bluetooth preferences must also follow confirmed settings-only changes");
         let details = find(&ui.hardware, "hardware:radios:radio-test:details").unwrap();
         assert!(details.grab_focus());
         snapshot.borrow_mut()["hardware"]["radios"][0]["rfkill"] = json!(true);
@@ -753,6 +789,12 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert_eq!(gtk::prelude::GtkWindowExt::focus(&ui.window), Some(details), "Inventory updates preserve keyboard focus");
         assert!(!find(&ui.hardware, "hardware:radios:radio-test:test").unwrap().is_sensitive(), "A newly blocked adapter cannot be tested");
         capture(&ui, "hardware-inspection.png");
+        let prefer = find(&ui.hardware, "hardware:radios:radio-test:prefer").unwrap();
+        let scrolled = ui.hardware.ancestor(gtk::ScrolledWindow::static_type()).unwrap().downcast::<gtk::ScrolledWindow>().unwrap();
+        let bounds = prefer.compute_bounds(&ui.hardware).unwrap();
+        scrolled.vadjustment().set_value(f64::from(bounds.y()) - 80.0);
+        settle().await;
+        capture(&ui, "hardware-preferred-adapter.png");
         ui.run_hardware_diagnostic("radio-test");
         settle().await;
         assert!(ui.window.visible_dialog().is_some());

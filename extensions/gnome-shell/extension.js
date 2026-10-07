@@ -120,7 +120,10 @@ export default class LinuxDropExtension extends Extension {
         // 50 removed that X11-specific option entirely.
         Main.layoutManager.addChrome(this._notch, {trackFullscreen: true});
         this._connect(global.stage, 'captured-event', (_, event) => this._dismissFromEvent(event));
-        this._connect(global.stage, 'notify::key-focus', () => this._ensureFocusVisible());
+        this._connect(global.stage, 'notify::key-focus', () => {
+            this._ensureFocusVisible();
+            this._scheduleCollapse();
+        });
         this._body.connect('notify::allocation', () => this._ensureFocusVisible());
         this._connect(Main.layoutManager, 'monitors-changed', () => this._position());
         this._connect(St.ThemeContext.get_for_stage(global.stage), 'notify::scale-factor', () => this._position());
@@ -133,6 +136,7 @@ export default class LinuxDropExtension extends Extension {
         this._connect(dnd, 'dnd-position-change', (_, x, y) => this._dragPosition(x, y));
         this._connect(dnd, 'dnd-leave', () => this._cancelDragHover());
         this._connect(this._settings, 'changed', () => { this._position(); this._visibility(); });
+        this._connect(this._settings, 'changed::auto-collapse', () => this._scheduleCollapse());
         this._position(); this._render(); this._visibility();
         const session = this._cancellable;
         Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, null, BUS, PATH, IFACE, session, (source, result) => {
@@ -461,7 +465,8 @@ export default class LinuxDropExtension extends Extension {
     _scheduleCollapse() {
         if (this._collapse) { GLib.source_remove(this._collapse); this._collapse = 0; }
         const seconds = this._settings.get_int('auto-collapse');
-        if (!this._expanded || this._dropWindow || this._dropRequested || !seconds || this._notch.hover) return;
+        const focus = global.stage.get_key_focus();
+        if (!this._expanded || this._dropWindow || this._dropRequested || !seconds || this._notch.hover || (focus && this._notch.contains(focus))) return;
         this._collapse = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, seconds, () => {
             this._collapse = 0;
             const focus = global.stage.get_key_focus();

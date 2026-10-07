@@ -21,7 +21,7 @@ the real OpenDirectory portal's FileManager1 call. It verifies the sandbox canno
 read arbitrary host paths or write its received-file export.
 
 Received-file actions require the host service's `ExportReceivedFile` method
-(Ubuntu review `0.1.0+review.20261007.15` or a matching newer source build). The
+(Ubuntu review `0.1.0+review.20261007.17` or a matching newer source build). The
 service checks completed incoming history and regular-file/no-symlink rules,
 then grants only the installed client read access for the current portal session.
 GTK retains its normal Open With dialog and folder-reveal behavior. Native GTK
@@ -34,11 +34,20 @@ has the bundle and GNOME 50 runtime installed:
 sh tests/integration/run-flatpak-client.sh linuxdrop-flatpak-test /absolute/path/linuxdropd
 ```
 
-Host test dependencies: Xvfb/xauth, xdotool, Python GI/pyatspi, GTK portal,
+Host test dependencies: Xvfb/xauth, Openbox, xdotool, Python GI/pyatspi, GTK portal,
 document portal/FUSE, D-Bus, iproute2, util-linux and Flatpak. The runner creates
 private mount/PID/network namespaces, a private session bus and display, and the
 standard `/run/user/UID` portal mount. It never uses the running demo's session.
 The receive receipt is seeded; this test does not simulate physical radio proof.
 
-Custom receive-folder selection and persistence across portal restarts remain a
-separate acceptance item. See [current evidence](../../docs/acceptance/FLATPAK_CLIENT_2026-10-07.md).
+Both default and per-request receive-folder selections resolve to host paths
+through checked document grants. Ubuntu's older portal uses the host-only Info
+API; an already visible sandbox directory is exported with an O_PATH descriptor.
+The default survives grant revocation and portal/daemon restart; a per-request
+choice does not replace it. Paths escaping a granted directory are rejected.
+These flows now include actual consented LocalSend HTTPS uploads in the installed
+client test. See [folder acceptance](../../docs/acceptance/FLATPAK_FOLDERS_2026-10-07.md).
+
+The Notch preferences button uses the host service's fixed OpenNotchPreferences
+action (review `.17` or newer). The host calls GNOME's OpenExtensionPrefs; the
+client shows failures and permits retry without gaining Shell bus permissions.

@@ -19,7 +19,8 @@ if [ "${1:-}" = --session ]; then
     printf '[preferred]\ndefault=gtk\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
     exec dbus-run-session -- xvfb-run -a -s '-screen 0 1280x900x24' sh -c '
         dbus-update-activation-environment DISPLAY XAUTHORITY XDG_RUNTIME_DIR XDG_CONFIG_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_CURRENT_DESKTOP XDG_DATA_DIRS
-        exec python3 "$1/flatpak_client.py" "$2"
+        openbox > "$XDG_RUNTIME_DIR/openbox.log" 2>&1 &
+        exec timeout 100s python3 "$1/flatpak_client.py" "$2"
     ' sh "$here" "$1"
 fi
 test "$(id -u)" = 0

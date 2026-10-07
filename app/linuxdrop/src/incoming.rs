@@ -5,7 +5,10 @@ use crate::{
 use adw::prelude::*;
 use gtk::{gio, glib};
 use serde_json::{json, Value};
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 impl Ui {
     pub fn receive_link(self: &Rc<Self>, initial: Option<&str>) -> adw::AlertDialog {
@@ -142,6 +145,7 @@ impl Ui {
         dialog.set_close_response("cancel");
         dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
         dialog.set_response_enabled("accept", selected.borrow().iter().any(|value| *value));
+        let resolving_folder = Rc::new(Cell::new(false));
         let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
         for (index, file) in files.iter().enumerate() {
             let name = file["name"].as_str().unwrap_or_default();
@@ -159,12 +163,13 @@ impl Ui {
             check.set_active(selected.borrow()[index]);
             let selected = selected.clone();
             let weak = dialog.downgrade();
+            let resolving = resolving_folder.clone();
             check.connect_toggled(move |check| {
                 selected.borrow_mut()[index] = check.is_active();
                 if let Some(dialog) = weak.upgrade() {
                     dialog.set_response_enabled(
                         "accept",
-                        selected.borrow().iter().any(|value| *value),
+                        !resolving.get() && selected.borrow().iter().any(|value| *value),
                     );
                 }
             });
@@ -203,31 +208,66 @@ impl Ui {
         box_list.set_selection_mode(gtk::SelectionMode::None);
         box_list.append(&destination);
         content.append(&box_list);
-        let ui = self.clone();
+        let ui = Rc::downgrade(self);
         let folder_copy = folder.clone();
-        choose.connect_clicked(move |_| {
+        let review = dialog.downgrade();
+        let resolving = resolving_folder.clone();
+        let selection = selected.clone();
+        let destination = destination.downgrade();
+        choose.connect_clicked(move |choose| {
+            let Some(ui) = ui.upgrade() else {
+                return;
+            };
+            let Some(row) = destination.upgrade() else {
+                return;
+            };
+            let Some(dialog) = review.upgrade() else {
+                return;
+            };
             let picker = gtk::FileDialog::builder()
                 .title(tr("Choose a receiving folder"))
                 .initial_folder(&gio::File::for_path(folder_copy.borrow().as_str()))
                 .build();
             let folder = folder_copy.clone();
-            let row = destination.clone();
             let ui_copy = ui.clone();
+            let choose = choose.clone();
+            let resolving = resolving.clone();
+            let selection = selection.clone();
+            let generation = ui.service_generation();
+            resolving.set(true);
+            choose.set_sensitive(false);
+            dialog.set_response_enabled("accept", false);
             picker.select_folder(Some(&ui.window), gio::Cancellable::NONE, move |result| {
-                match result {
-                    Ok(file) => {
-                        if let Some(path) = file.path() {
-                            *folder.borrow_mut() = path.to_string_lossy().into_owned();
-                            row.set_subtitle(&folder.borrow());
-                        } else {
-                            ui_copy.toast("Choose a local folder");
+                glib::MainContext::default().spawn_local(async move {
+                    let result = match result {
+                        Ok(file) => {
+                            row.set_subtitle(&tr("Checking receiving folder…"));
+                            Some(crate::ipc::receive_directory(file).await)
                         }
+                        Err(error)
+                            if error.matches(gtk::DialogError::Dismissed)
+                                || error.matches(gtk::DialogError::Cancelled) =>
+                        {
+                            None
+                        }
+                        Err(error) => Some(Err(error.to_string())),
+                    };
+                    resolving.set(false);
+                    choose.set_sensitive(true);
+                    if !dialog.is_visible() || generation != ui_copy.service_generation() {
+                        return;
                     }
-                    Err(error)
-                        if error.matches(gtk::DialogError::Dismissed)
-                            || error.matches(gtk::DialogError::Cancelled) => {}
-                    Err(error) => ui_copy.toast(&error.to_string()),
-                }
+                    dialog.set_response_enabled(
+                        "accept",
+                        selection.borrow().iter().any(|value| *value),
+                    );
+                    match result {
+                        Some(Ok(path)) => *folder.borrow_mut() = path,
+                        Some(Err(error)) => ui_copy.toast(&error),
+                        None => {}
+                    }
+                    row.set_subtitle(&folder.borrow());
+                });
             });
         });
         let collision = adw::ComboRow::builder()
@@ -253,7 +293,7 @@ impl Ui {
         let request = transfer.clone();
         let generation = self.service_generation();
         dialog.connect_response(None, move |_, response| {
-            if response != "accept" { return; }
+            if response != "accept" || resolving_folder.get() { return; }
             let Some(ui) = weak.upgrade() else { return; };
             if ui.service_generation() != generation { return; }
             let mut options = json!({"collision_policy": if collision.selected() == 1 {"reject"} else {"rename"}});

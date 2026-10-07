@@ -586,7 +586,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     let weak = Rc::downgrade(ui);
                     let section = section.to_string();
                     let key = field.key.to_owned();
-                    button.connect_clicked(move |_| {
+                    let folder_row = row.downgrade();
+                    button.connect_clicked(move |button| {
                         if let Some(ui) = weak.upgrade() {
                             let dialog = gtk::FileDialog::builder()
                                 .title(tr("Choose a receiving folder"))
@@ -594,26 +595,46 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                             let owned = ui.clone();
                             let section = section.clone();
                             let key = key.clone();
+                            let button = button.clone();
+                            let Some(row) = folder_row.upgrade() else {
+                                return;
+                            };
+                            let generation = ui.service_generation();
+                            button.set_sensitive(false);
                             dialog.select_folder(
                                 Some(&ui.window),
                                 gio::Cancellable::NONE,
                                 move |result| match result {
                                     Ok(file) => {
-                                        if let Some(path) = file.path() {
-                                            update(
-                                                &owned,
-                                                &section,
-                                                &key,
-                                                json!(path.to_string_lossy()),
+                                        let previous = row.subtitle();
+                                        row.set_subtitle(&tr("Checking receiving folder…"));
+                                        glib::MainContext::default().spawn_local(async move {
+                                            let result = crate::ipc::receive_directory(file).await;
+                                            button.set_sensitive(true);
+                                            if row.root().is_none()
+                                                || owned.service_generation() != generation
+                                            {
+                                                return;
+                                            }
+                                            row.set_subtitle(
+                                                previous.as_deref().unwrap_or_default(),
                                             );
-                                        } else {
-                                            owned.toast("Choose a local folder");
+                                            match result {
+                                                Ok(path) => {
+                                                    update(&owned, &section, &key, json!(path))
+                                                }
+                                                Err(error) => owned.toast(&error),
+                                            }
+                                        });
+                                    }
+                                    Err(error) => {
+                                        button.set_sensitive(true);
+                                        if !error.matches(gtk::DialogError::Dismissed)
+                                            && !error.matches(gtk::DialogError::Cancelled)
+                                        {
+                                            owned.toast(&error.to_string());
                                         }
                                     }
-                                    Err(error)
-                                        if error.matches(gtk::DialogError::Dismissed)
-                                            || error.matches(gtk::DialogError::Cancelled) => {}
-                                    Err(error) => owned.toast(&error.to_string()),
                                 },
                             );
                         }
@@ -747,20 +768,31 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
     open.add_suffix(&button);
     open.set_activatable_widget(Some(&button));
     let weak = Rc::downgrade(ui);
-    button.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            match gio::Subprocess::newv(
-                &[
-                    std::ffi::OsStr::new("gnome-extensions"),
-                    std::ffi::OsStr::new("prefs"),
-                    std::ffi::OsStr::new("linuxdrop@marius4lui.github.io"),
-                ],
-                gio::SubprocessFlags::NONE,
-            ) {
-                Ok(_) => {}
-                Err(_) => ui.toast("Install and enable the LinuxDrop GNOME extension first"),
+    button.connect_clicked(move |button| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let Some(proxy) = ui.proxy.borrow().clone() else {
+            ui.toast("The sharing service is not connected yet");
+            return;
+        };
+        button.set_sensitive(false);
+        let button = button.downgrade();
+        let weak = Rc::downgrade(&ui);
+        let generation = ui.service_generation();
+        glib::MainContext::default().spawn_local(async move {
+            let result = crate::ipc::call(&proxy, "OpenNotchPreferences", None).await;
+            if let Some(button) = button.upgrade() {
+                button.set_sensitive(true);
             }
-        }
+            if let Some(ui) = weak.upgrade() {
+                if ui.service_generation() == generation {
+                    if let Err(error) = result {
+                        ui.toast(&error);
+                    }
+                }
+            }
+        });
     });
     desktop.add(&open);
     ui.settings_body.append(&desktop);

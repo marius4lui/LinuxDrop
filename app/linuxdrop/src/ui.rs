@@ -850,14 +850,19 @@ impl Ui {
             let proxy = match existing {
                 Some(proxy) => Ok(proxy),
                 None => match ipc::connect().await {
-                    Ok(proxy) => { ui.install_proxy(&proxy); Ok(proxy) }
+                    Ok(proxy) => {
+                        ui.install_proxy(&proxy);
+                        Ok(proxy)
+                    }
                     Err(error) => Err(error),
                 },
             };
             let generation = ui.service_generation.get();
             let settings_generation = ui.settings_generation.get();
             let snapshot_proxy = proxy.as_ref().ok().cloned();
-            let owner = snapshot_proxy.as_ref().and_then(|proxy| proxy.g_name_owner());
+            let owner = snapshot_proxy
+                .as_ref()
+                .and_then(|proxy| proxy.g_name_owner());
             let result = match proxy {
                 Ok(proxy) => {
                     if owner.is_none() {
@@ -872,7 +877,10 @@ impl Ui {
             };
             if generation != ui.service_generation.get()
                 || snapshot_proxy.as_ref() != ui.proxy.borrow().as_ref()
-                || snapshot_proxy.as_ref().and_then(|proxy| proxy.g_name_owner()) != owner
+                || snapshot_proxy
+                    .as_ref()
+                    .and_then(|proxy| proxy.g_name_owner())
+                    != owner
             {
                 // Never clear a newer refresh flag or restore an old owner's consent.
                 return;
@@ -919,23 +927,37 @@ impl Ui {
                         let mut structure = ui.snapshot.borrow()["transfers"].clone();
                         if let Some(transfers) = structure.as_array_mut() {
                             for transfer in transfers {
-                                if let Some(object) = transfer.as_object_mut() { object.remove("transferred_bytes"); }
+                                if let Some(object) = transfer.as_object_mut() {
+                                    object.remove("transferred_bytes");
+                                }
                                 if let Some(files) = transfer["files"].as_array_mut() {
-                                    for file in files { if let Some(object) = file.as_object_mut() { object.remove("transferred"); } }
+                                    for file in files {
+                                        if let Some(object) = file.as_object_mut() {
+                                            object.remove("transferred");
+                                        }
+                                    }
                                 }
                             }
                         }
                         if *ui.rendered_transfer_structure.borrow() != structure {
                             *ui.rendered_transfer_structure.borrow_mut() = structure;
                             ui.render_transfers();
-                        } else { ui.update_transfer_progress(); }
-                        let mut hardware = ui.snapshot.borrow()["hardware"].clone();
-                        if let Some(object) = hardware.as_object_mut() { object.remove("observed_unix"); }
-                        let hardware_view = serde_json::json!({"hardware":hardware,"backends":ui.snapshot.borrow()["backends"]});
-                        if *ui.rendered_hardware.borrow() != hardware_view {
-                            *ui.rendered_hardware.borrow_mut() = hardware_view;
-                            ui.render_hardware();
+                        } else {
+                            ui.update_transfer_progress();
                         }
+                    }
+                    let mut hardware = ui.snapshot.borrow()["hardware"].clone();
+                    if let Some(object) = hardware.as_object_mut() {
+                        object.remove("observed_unix");
+                    }
+                    let hardware_view = serde_json::json!({
+                        "hardware":hardware,"backends":ui.snapshot.borrow()["backends"],
+                        "preferred_adapter":settings_value["hardware"]["preferred_adapter"],
+                        "bluetooth_adapter":settings_value["bluetooth"]["adapter"]
+                    });
+                    if *ui.rendered_hardware.borrow() != hardware_view {
+                        *ui.rendered_hardware.borrow_mut() = hardware_view;
+                        ui.render_hardware();
                     }
                     if *ui.rendered_settings.borrow() != settings_value {
                         *ui.rendered_settings.borrow_mut() = settings_value.clone();
@@ -949,7 +971,8 @@ impl Ui {
                         "light" => adw::ColorScheme::ForceLight,
                         _ => adw::ColorScheme::Default,
                     });
-                    ui.download_link.set_visible(ui.snapshot.borrow()["download_link_active"] == true);
+                    ui.download_link
+                        .set_visible(ui.snapshot.borrow()["download_link_active"] == true);
                     ui.stop_link.set_sensitive(!ui.stopping_link.get());
                     ui.update_settings_status();
                     ui.update_send();
@@ -1022,6 +1045,8 @@ impl Ui {
             } else if method == "ResetSettings" {
                 ui.settings_drafts.borrow_mut().clear();
                 ui.settings_writes.borrow_mut().clear();
+                ui.confirm_settings_write();
+            } else if method == "UpdateSettings" {
                 ui.confirm_settings_write();
             }
             ui.refresh();
@@ -1391,12 +1416,14 @@ impl Ui {
             let peer_copy = peer.clone();
             button.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
-                    *ui.selected.borrow_mut() = Some(id.clone());
-                    *ui.selected_protocol.borrow_mut() = peer_copy["preferred_protocol"]
-                        .as_str()
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or("auto")
-                        .to_owned();
+                    if ui.selected.borrow().as_ref() != Some(&id) {
+                        *ui.selected.borrow_mut() = Some(id.clone());
+                        *ui.selected_protocol.borrow_mut() = peer_copy["preferred_protocol"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("auto")
+                            .to_owned();
+                    }
                     ui.render_peers();
                     ui.update_send();
                 }
@@ -1894,7 +1921,10 @@ impl Ui {
                     "dialog-information-symbolic"
                 },
             ));
-            row.add_suffix(&label(text(&backend, "state"), "protocol-badge"));
+            let status = label(text(&backend, "state"), "protocol-badge");
+            status.set_widget_name(&format!("hardware:backend:{}:state", text(&backend, "id")));
+            status.set_wrap(false);
+            row.add_suffix(&status);
             let group = adw::PreferencesGroup::new();
             group.add(&row);
             self.hardware.append(&group);
@@ -2013,24 +2043,44 @@ impl Ui {
                     row.add_row(&test);
                 }
                 if matches!(key, "radios" | "bluetooth") {
+                    let id = text(&item, "id").to_owned();
+                    let settings = self.settings.borrow();
+                    let preferred = if key == "radios" {
+                        settings["hardware"]["preferred_adapter"].as_str()
+                    } else {
+                        settings["bluetooth"]["adapter"].as_str()
+                    } == Some(id.as_str())
+                        && !id.is_empty();
+                    drop(settings);
+                    let title = if preferred {
+                        "Preferred adapter"
+                    } else {
+                        "Use as preferred adapter"
+                    };
                     let prefer = adw::ActionRow::builder()
-                        .title(tr("Use as preferred adapter"))
+                        .title(tr(title))
                         .subtitle(tr(
                             "Selection still respects availability and connection protection",
                         ))
                         .build();
-                    let button = gtk::Button::from_icon_name("emblem-favorite-symbolic");
+                    let button = gtk::Button::from_icon_name(if preferred {
+                        "emblem-ok-symbolic"
+                    } else {
+                        "emblem-favorite-symbolic"
+                    });
                     button.set_valign(gtk::Align::Center);
-                    button.set_tooltip_text(Some(&tr("Use as preferred adapter")));
+                    button.set_tooltip_text(Some(&tr(title)));
                     button.set_widget_name(&format!("{identity}:prefer"));
                     button.update_property(&[gtk::accessible::Property::Label(&format!(
                         "{}: {name}",
-                        tr("Use as preferred adapter")
+                        tr(title)
                     ))]);
-                    let id = text(&item, "id").to_owned();
                     let kind = key.to_owned();
                     let weak = Rc::downgrade(self);
                     button.connect_clicked(move |_| {
+                        if preferred {
+                            return;
+                        }
                         if let Some(ui) = weak.upgrade() {
                             let patch = if kind == "radios" {
                                 serde_json::json!({"hardware":{"preferred_adapter":id}})

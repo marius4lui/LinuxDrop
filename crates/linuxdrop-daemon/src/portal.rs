@@ -1,4 +1,4 @@
-//! Read-only session exports for the optional sandboxed GTK client.
+//! Narrow document grants and host directory resolution for the sandboxed client.
 use anyhow::{Context, Result};
 use linuxdrop_core::SendSource;
 use std::{collections::HashMap, path::PathBuf};
@@ -43,4 +43,70 @@ pub async fn export_received(connection: &zbus::Connection, path: String) -> Res
         .join(source.name())
         .to_string_lossy()
         .into_owned())
+}
+
+/// Info exists on older supported portals where GetHostPaths is not available.
+pub async fn resolve_directory(
+    connection: &zbus::Connection,
+    id: String,
+    relative: String,
+) -> Result<String> {
+    anyhow::ensure!(
+        !id.is_empty() && id.len() <= 64 && id.bytes().all(|c| c.is_ascii_hexdigit()),
+        "Invalid folder portal response"
+    );
+    let proxy = zbus::Proxy::new(
+        connection,
+        "org.freedesktop.portal.Documents",
+        "/org/freedesktop/portal/documents",
+        "org.freedesktop.portal.Documents",
+    )
+    .await?;
+    let (path, applications): (Vec<u8>, HashMap<String, Vec<String>>) =
+        proxy.call("Info", &(id,)).await?;
+    let permissions = applications
+        .get("io.github.marius4lui.LinuxDrop.App")
+        .context("Choose the receiving folder again")?;
+    anyhow::ensure!(
+        ["read", "write"]
+            .iter()
+            .all(|required| permissions.iter().any(|p| p == required)),
+        "Choose a writable receiving folder"
+    );
+    let path = std::str::from_utf8(path.strip_suffix(&[0]).unwrap_or(&path))?;
+    anyhow::ensure!(
+        std::path::Path::new(path).is_absolute(),
+        "Invalid folder portal response"
+    );
+    let root = std::path::Path::new(path);
+    anyhow::ensure!(
+        relative.len() <= 4096
+            && !std::path::Path::new(&relative).is_absolute()
+            && std::path::Path::new(&relative)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_))),
+        "Invalid folder portal response"
+    );
+    let selected = if relative.is_empty() {
+        root.to_owned()
+    } else {
+        let mut parts = std::path::Path::new(&relative).components();
+        let name = parts.next().context("Invalid folder portal response")?;
+        anyhow::ensure!(
+            root.file_name() == Some(name.as_os_str()),
+            "Invalid folder portal response"
+        );
+        root.join(parts.as_path())
+    };
+    let root = tokio::fs::canonicalize(root).await?;
+    let path = tokio::fs::canonicalize(selected).await?;
+    anyhow::ensure!(path.starts_with(&root), "Choose the receiving folder again");
+    anyhow::ensure!(
+        tokio::fs::metadata(&path).await?.is_dir(),
+        "Choose a local folder"
+    );
+    Ok(path
+        .to_str()
+        .context("Choose a folder with a UTF-8 name")?
+        .to_owned())
 }

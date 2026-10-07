@@ -33,7 +33,7 @@ items retain their remaining acceptance scope even where code now exists.
 - [ ] Pointer-monitor option, position pinned during interaction, monitor removal recovery; configurable drag dwell and keyboard shortcut without conflict.
 - [x] Adaptive wide-window navigation and targeted 480x600 and wide rendering.
 - [ ] Fractional rendering acceptance.
-- [x] Portal-origin file acceptance validated with a real document-portal export and descriptor handoff; revocation/closed-client lifetime and daemon access tested. Installed Flatpak chooser, descriptor transfer, registered MIME opening and folder-reveal portal actions now pass; receive-folder persistence remains in system packaging work.
+- [x] Portal-origin file acceptance validated with a real document-portal export and descriptor handoff; revocation/closed-client lifetime and daemon access tested. Installed Flatpak chooser, descriptor transfer, registered MIME opening and folder-reveal portal actions now pass; default/per-request folder persistence and actual HTTPS receive now pass across portal/daemon restart. The sandbox Notch preferences action now routes through the host; its acceptance scope is recorded separately below.
 - [ ] Assess folder/GVfs import safely; the original plan explicitly deferred these beyond regular local files, so any added import requires clear staging/cancel semantics rather than silent rejection.
 - [ ] Redigierte Diagnose als Datei speichern; reset/restart dialogs explain active transfer impact.
 - [x] Targeted native tests cover the reviewed draft, protocol, focus, settings and incoming decision regressions.
@@ -134,3 +134,13 @@ Fedora revision 3 GTK captures exposed horizontal clipping at the default window
 width. This was a cross-page minimum-width bug from unbroken transfer filenames,
 now fixed and verified in installed Fedora revision 4 across all three file
 managers. See [width acceptance](../acceptance/GTK_TRANSFER_WIDTH_2026-10-07.md).
+
+2026-10-07 additional bounded Astra/high pass: same-recipient activation preserves
+explicit protocol choice, confirmed Wi-Fi/Bluetooth preference is visible, and
+compact backend status badges stay on one line. Shell inactivity preferences now
+apply immediately and keyboard focus pauses/rearms dismissal. See
+[GTK selection acceptance](../acceptance/UI_GTK_SELECTION_2026-10-07.md) and
+[Shell inactivity acceptance](../acceptance/UI_SHELL_INACTIVITY_2026-10-07.md).
+The sandbox uses a fixed host action to open Notch preferences, with asynchronous
+failure/retry feedback; it receives no additional Shell or filesystem permissions.
+See [host preferences acceptance](../acceptance/UI_HOST_PREFERENCES_2026-10-07.md).

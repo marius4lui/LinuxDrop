@@ -194,6 +194,22 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     } finally { this._proxy = realProxy; }
                     this._setExpanded(false);
                     check(!this._notch.visible && global.stage.get_key_focus() === this._panelButton, 'Close must hide and restore panel focus');
+                    const collapseSeconds = this._settings.get_int('auto-collapse');
+                    this._setExpanded(true);
+                    this._panelButton.grab_key_focus();
+                    this._settings.set_int('auto-collapse', 0);
+                    check(!this._collapse, 'Disabling inactivity dismissal must cancel an already running timer');
+                    this._settings.set_int('auto-collapse', 1);
+                    check(this._collapse, 'Enabling inactivity dismissal must start a timer for an unfocused bubble');
+                    this._header.grab_key_focus();
+                    check(!this._collapse, 'Keyboard interaction must suspend inactivity dismissal');
+                    for (let tick = 0; tick < 10; tick++) await settle();
+                    check(this._expanded, 'A focused bubble must stay open beyond the inactivity interval');
+                    this._panelButton.grab_key_focus();
+                    check(this._collapse, 'Leaving keyboard interaction must rearm inactivity dismissal');
+                    for (let tick = 0; tick < 12 && this._expanded; tick++) await settle();
+                    check(!this._expanded && !this._notch.visible, 'Unfocused bubble must close after the configured inactivity interval');
+                    this._settings.set_int('auto-collapse', collapseSeconds);
                     if (GLib.getenv('LINUXDROP_SMOKE_REAL_DROP') === '1') {
                         for (let attempt = 0; attempt < 2; attempt++) {
                             this._setExpanded(true);
@@ -225,7 +241,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         }
                         console.log('LINUXDROP_REAL_DROP_PASSED: installed Wayland surface launch, measured centering, close and reopen');
                     }
-                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, stable action focus, consent focus isolation, literal external names, persistent send/settings, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, post-action snapshot gating, Quick Settings feedback, focus');
+                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, stable action focus, consent focus isolation, literal external names, persistent send/settings, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, post-action snapshot gating, Quick Settings feedback, focus, inactivity preference and keyboard dismissal');
                 });
             });
         });

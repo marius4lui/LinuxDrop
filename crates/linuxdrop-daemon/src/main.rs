@@ -666,6 +666,24 @@ impl Manager {
         .map_err(|_| failed("The file portal did not respond"))?
         .map_err(failed)
     }
+    async fn resolve_receive_directory(
+        &self,
+        document_id: String,
+        relative_path: String,
+    ) -> zbus::fdo::Result<String> {
+        let connection = self
+            .0
+            .connection
+            .get()
+            .ok_or_else(|| failed("Sharing service is offline"))?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            portal::resolve_directory(connection, document_id, relative_path),
+        )
+        .await
+        .map_err(|_| failed("The file portal did not respond"))?
+        .map_err(failed)
+    }
     async fn discard_draft(&self, draft_id: String) {
         self.0.data.lock().await.drafts.remove(&draft_id);
     }
@@ -1060,6 +1078,39 @@ impl Manager {
         }
         self.0.changed().await;
         Ok(())
+    }
+    /// A fixed host action for the sandbox; never accepts a command or extension ID.
+    async fn open_notch_preferences(&self) -> zbus::fdo::Result<()> {
+        let connection = self
+            .0
+            .connection
+            .get()
+            .ok_or_else(|| failed("Sharing service is offline"))?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let proxy = zbus::Proxy::new(
+                connection,
+                "org.gnome.Shell.Extensions",
+                "/org/gnome/Shell/Extensions",
+                "org.gnome.Shell.Extensions",
+            )
+            .await?;
+            proxy
+                .call::<_, _, ()>(
+                    "OpenExtensionPrefs",
+                    &(
+                        "linuxdrop@marius4lui.github.io",
+                        "",
+                        std::collections::HashMap::<String, zbus::zvariant::Value<'_>>::new(),
+                    ),
+                )
+                .await
+        })
+        .await
+        .map_err(|_| failed("Notch preferences did not respond; try again"))?
+        .map_err(|error| {
+            tracing::debug!(%error, "Could not open Notch preferences");
+            failed("Install and enable the LinuxDrop GNOME extension first")
+        })
     }
     async fn open_application(&self) -> zbus::fdo::Result<()> {
         tokio::process::Command::new("linuxdrop")

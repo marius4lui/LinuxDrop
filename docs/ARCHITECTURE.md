@@ -37,6 +37,7 @@ Service `io.github.marius4lui.LinuxDrop`, object `/io/github/marius4lui/LinuxDro
 | PrepareSend | absolute host file paths (legacy CLI contract) | temporary draft ID |
 | PrepareSendFiles | draft ID (empty to create), array of `(logical name, Unix FD)` | draft ID; append 1?16 regular files atomically |
 | ExportReceivedFile | completed incoming saved path | read-only session document-portal path for the installed Flatpak client |
+| ResolveReceiveDirectory | document ID, exported basename/relative path (empty for exact grant root) | canonical writable-grant host directory, independent of document-portal lifetime |
 | DiscardDraft | draft ID | release selection |
 | StartSend | draft ID, peer ID, protocol ID | transfer ID |
 | AcceptTransfer / RejectTransfer / CancelTransfer | transfer ID | consent / terminal action |
@@ -47,6 +48,7 @@ Service `io.github.marius4lui.LinuxDrop`, object `/io/github/marius4lui/LinuxDro
 | StopDownloadOffer | none | revoke download server |
 | ReceiveDownloadOffer | explicit local HTTP URL | transfer ID; metadata/PIN then receive review before payload download |
 | ProvideTransferPin | transfer ID, PIN | LocalSend upload or download-offer PIN challenge |
+| OpenNotchPreferences | none | host GNOME OpenExtensionPrefs for the fixed LinuxDrop extension; bounded failure feedback |
 | OpenApplication | none | open native app |
 
 Signal `Changed(revision: u64)` invalidates snapshots. JSON shapes follow `linuxdrop-core` and `settings.rs`. Unknown settings/types are rejected. Incompatible contract changes require Manager2.
