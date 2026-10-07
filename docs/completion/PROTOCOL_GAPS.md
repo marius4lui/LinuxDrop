@@ -59,6 +59,10 @@ Google's wire schema distinguishes password-based joining from device-name disco
   and interface-reconnect evidence](../acceptance/AIRDROP_HELPER_LIFETIME_2026-10-07.md).
   AirDrop health checks also run independently of pending Wi-Fi Direct operations.
   The combined row remains open for actual helper/channel integration.
+  [Managed AWDL link acceptance](../acceptance/AWDL_MANAGED_LINK_2026-10-07.md)
+  additionally fixes premature readiness and silent channel failures, and runs
+  the real Filin process through a kernel-rejected channel startup. Complete
+  watchdog/channel-loss integration remains separate from that scoped check.
 
 ## Physical acceptance (software work continues independently)
 

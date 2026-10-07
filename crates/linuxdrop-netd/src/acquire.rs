@@ -221,6 +221,13 @@ async fn prepare_monitor(
     let Some(tap) = &lease.awdl_interface else {
         return Ok(None);
     };
+    if Path::new("/sys/class/net")
+        .join(tap)
+        .try_exists()
+        .map_err(|error| error.to_string())?
+    {
+        return Err("AWDL interface name is already in use".into());
+    }
     let allowed = lease
         .allowed_frequencies
         .iter()
@@ -243,38 +250,59 @@ async fn prepare_monitor(
         .env("PATH", "/usr/sbin:/usr/bin")
         .env("LC_ALL", "C")
         .env("LINUXDROP_ALLOWED_FREQUENCIES", allowed)
+        .env("LINUXDROP_MANAGED_LEASE", "1")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| format!("AWDL helper unavailable: {error}"))?;
-    let ready = async {
-        for _ in 0..30 {
-            check_cancel(&cancel)?;
-            if child
-                .try_wait()
-                .map_err(|error| error.to_string())?
-                .is_some()
-            {
-                return Err("AWDL helper exited before creating its interface".into());
-            }
-            if Path::new("/sys/class/net").join(tap).exists() {
-                return Ok(());
-            }
-            tokio::select! {
-                _ = cancel.cancelled() => return Err("Radio preparation cancelled".into()),
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-            }
-        }
-        Err("AWDL helper did not create its interface".into())
-    }
-    .await;
+    let ready = wait_awdl_ready(&mut child, tap, &cancel)
+        .await
+        .and_then(|()| verify_owned(&lease));
     if let Err(error) = ready {
         reap_child(Some(child)).await?;
         return Err(error);
     }
     Ok(Some(child))
+}
+
+async fn wait_awdl_ready(
+    child: &mut tokio::process::Child,
+    tap: &str,
+    cancel: &CancellationToken,
+) -> Result<(), String> {
+    const READY: &[u8] = b"LINUXDROP_AWDL_READY_V1\n";
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or("AWDL readiness pipe unavailable")?;
+    let mut receipt = [0_u8; READY.len()];
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err("Radio preparation cancelled".into()),
+        result = timeout(Duration::from_secs(3), stdout.read_exact(&mut receipt)) => {
+            result.map_err(|_| "AWDL helper readiness timed out")?
+                .map_err(|_| "AWDL helper stopped before confirming ready")?;
+        }
+    }
+    check_cancel(cancel)?;
+    if receipt != READY
+        || child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Err("AWDL helper did not confirm an active link".into());
+    }
+    if !Path::new("/sys/class/net")
+        .join(tap)
+        .try_exists()
+        .map_err(|error| error.to_string())?
+    {
+        return Err("AWDL interface disappeared before readiness".into());
+    }
+    Ok(())
 }
 
 // Passive inventory can involve D-Bus/netlink timeouts; only the final choice
@@ -340,4 +368,116 @@ pub(super) async fn reserve_radio(
     Ok(Response::Acquired {
         lease: Box::new(lease),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn readiness_requires_receipt_and_observes_cancellation_and_child_exit() {
+        for (script, success, cancel_early) in [
+            (
+                "printf 'LINUXDROP_AWDL_READY_V1\\n'; exec sleep 30",
+                true,
+                false,
+            ),
+            (
+                "printf 'invalid readiness receipt\\n'; exec sleep 30",
+                false,
+                false,
+            ),
+            ("exit 1", false, false),
+            ("exec sleep 30", false, true),
+        ] {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let cancel = CancellationToken::new();
+            if cancel_early {
+                let stop = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    stop.cancel();
+                });
+            }
+            // lo exists in every test namespace. Its mere existence must not
+            // substitute for the process's explicit configuration receipt.
+            let result = wait_awdl_ready(&mut child, "lo", &cancel).await;
+            assert_eq!(result.is_ok(), success, "{result:?}");
+            reap_child(Some(child)).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "private network namespace and actual filin binary required"]
+    async fn real_managed_filin_rejects_channel_failure_without_false_readiness() {
+        assert_eq!(
+            std::env::var("LINUXDROP_TEST_PRIVATE_AWDL").as_deref(),
+            Ok("1")
+        );
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        let binary = std::env::var("LINUXDROP_TEST_FILIN").unwrap();
+        run_command(
+            "/usr/sbin/ip",
+            &["link", "add", "ldmon-test", "type", "dummy"],
+            5,
+        )
+        .await
+        .unwrap();
+        let mut child = Command::new(binary)
+            .args([
+                "-i",
+                "ldmon-test",
+                "-h",
+                "latap-test",
+                "-c",
+                "6",
+                "-N",
+                "--no-http",
+                "--no-force-master",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin")
+            .env("LC_ALL", "C")
+            .env("LINUXDROP_ALLOWED_FREQUENCIES", "2437")
+            .env("LINUXDROP_MANAGED_LEASE", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = wait_awdl_ready(&mut child, "latap-test", &CancellationToken::new()).await;
+        assert!(
+            result.is_err(),
+            "A created TAP cannot report a failed channel setup as ready"
+        );
+        let output = timeout(Duration::from_secs(2), child.wait_with_output())
+            .await
+            .expect("Managed filin must exit rather than reopen the leased interface")
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("Channel"),
+            "The real channel failure must be reached: {error}"
+        );
+        let inventory = Command::new("/usr/sbin/ip")
+            .args(["-j", "link", "show"])
+            .output()
+            .await
+            .unwrap();
+        assert!(inventory.status.success());
+        let links: Vec<serde_json::Value> = serde_json::from_slice(&inventory.stdout).unwrap();
+        assert!(
+            !links.iter().any(|link| link["ifname"] == "latap-test"),
+            "Failed startup must release its nonpersistent TAP"
+        );
+    }
 }

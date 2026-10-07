@@ -36,6 +36,7 @@ Quick Share:
 AirDrop / AWDL:
 
 - Filin checks every requested frequency against the netd-provided `LINUXDROP_ALLOWED_FREQUENCIES` regulatory allowlist; malformed present policy fails closed.
+- Netd launches Filin with `LINUXDROP_MANAGED_LEASE=1`. It emits the bounded `LINUXDROP_AWDL_READY_V1` receipt only after link initialization and exits on startup/runtime failure instead of reopening an interface outside its lease. Failed channel switches stop the runtime before further traffic; monitor and TAP disappearance/replacement retire the link. Netd requires the receipt, live child, TAP and monitor ownership before publishing readiness, and watches link ownership throughout the lease.
 - LinuxDrop does not invoke Luftlift's auto-accept server or salvage archive decoder. It uses its plist builders/parser, mDNS metadata and self-signed server certificate generation behind a separate consent-aware server.
 - LinuxDrop's AirDrop HTTPS client verifies the TLS signature and pins the receiver certificate across the whole transfer. This does not verify an Apple account or contacts identity.
 - Strict bounded dvzip/CPIO processing, regular-file-only extraction, advertised filename matching, private spool files and no-replace publication.
@@ -239,3 +240,5 @@ subscription cleanup. FastInit treats stream termination as a recoverable error.
 Unit and private-bus flood tests cover bounds, complete termination and scanner
 recovery only after cleanup. No upstream implementation code copied. See
 docs/acceptance/BLUETOOTH_SIGNAL_BOUNDS_2026-10-07.md.
+
+The managed AWDL schedule also limits our advertised slots, park selection and transfer pins to the lease frequency policy while preserving peer channel sequences. Unsupported slots use the permitted anchor, allowing limited-band adapters to remain on shared channels. Actual driver tuning failures still retire the link.

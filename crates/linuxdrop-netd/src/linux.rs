@@ -484,6 +484,9 @@ pub async fn run() -> io::Result<()> {
                 let ipv6_survives = dead
                     && lease.p2p_group.as_ref().is_some_and(|group| group.peer_object != "/")
                     && p2p_addresses(&lease).await.is_ok_and(|a| a.ipv6.is_some());
+                let link_invalid = lease.kind == LeaseKind::Monitor
+                    && (verify_owned(&lease).is_err() || lease.awdl_interface.as_ref().is_some_and(|tap|
+                        !Path::new("/sys/class/net").join(tap).try_exists().unwrap_or(false)));
                 {
                     let mut state = monitor.lock().await;
                     if !state.observation_is_current(revision, &lease.id) { continue; }
@@ -496,12 +499,12 @@ pub async fn run() -> io::Result<()> {
                         lease.allowed_frequencies.iter().any(|frequency| !radio.channels.iter().any(|c| c.frequency_mhz == *frequency && !c.disabled && !c.no_ir && !c.radar))
                     });
                     let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.producers.get(&lease.id)));
-                    if (dead && !ipv6_survives) || radio_gone || unsafe_use || regulatory_change || owner_lost {
+                    if (dead && !ipv6_survives) || radio_gone || unsafe_use || regulatory_change || owner_lost || link_invalid {
                         // Validate the observation and reserve cleanup under the
                         // same lock. Slow I/O still runs in the persistent worker.
                         let _ = begin_cleanup_locked_with(&mut state, &monitor, &lease.id, restore_child_and_lease, persist);
                         state.record_recovery_error(format!(
-                            "{}: lease stopped after helper exit, supplicant owner loss, unplug, regulatory change, or competing radio use", lease.interface));
+                            "{}: lease stopped after helper exit, interface loss/ownership change, supplicant owner loss, unplug, regulatory change, or competing radio use", lease.interface));
                     }
                 }
             }

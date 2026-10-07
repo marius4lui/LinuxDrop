@@ -18,7 +18,11 @@ fn main() -> anyhow::Result<()> {
     let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "filin_rs=debug,info".into());
     let registry = tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(fmt_filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(fmt_filter),
+        )
         .with(introspect.trace_layer());
     tracing::subscriber::set_global_default(registry)
         .map_err(|err| anyhow::anyhow!("failed to install tracing subscriber: {err:?}"))?;
@@ -57,10 +61,19 @@ fn main() -> anyhow::Result<()> {
     // then None — and only when open_links succeeds, so the server spawns on
     // the first run that actually starts, not the first attempt.
     let mut http_addr = config.http_addr;
+    // netd owns the lease and recovery. Reopening a replaced interface by name
+    // would bypass that ownership boundary and leave stale readiness visible.
+    let managed = std::env::var("LINUXDROP_MANAGED_LEASE").as_deref() == Ok("1");
     loop {
         match filin_rs::runtime::open_links(&config) {
             Ok(links) => {
                 tracing::info!("filin links are up");
+                if managed {
+                    use std::io::Write;
+                    let mut output = std::io::stdout().lock();
+                    output.write_all(b"LINUXDROP_AWDL_READY_V1\n")?;
+                    output.flush()?;
+                }
                 match filin_rs::runtime::run(
                     links,
                     introspect.clone(),
@@ -74,6 +87,9 @@ fn main() -> anyhow::Result<()> {
                         tracing::info!("filin runtime exited cleanly");
                         return Ok(());
                     }
+                    Err(err) if managed => {
+                        return Err(anyhow::anyhow!("managed AWDL link stopped: {err:?}"))
+                    }
                     Err(err) => tracing::warn!(
                         ?err,
                         "filin runtime stopped (monitor iface gone?); reopening links in 1s"
@@ -85,6 +101,9 @@ fn main() -> anyhow::Result<()> {
             // operator-facing explanation already logged by open_links.
             Err(filin_rs::runtime::Error::UnsupportedAdapter(msg)) => {
                 return Err(anyhow::anyhow!("unusable monitor adapter: {msg}"));
+            }
+            Err(err) if managed => {
+                return Err(anyhow::anyhow!("managed AWDL link startup failed: {err:?}"))
             }
             Err(err) => tracing::warn!(
                 ?err,

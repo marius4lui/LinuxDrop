@@ -4448,6 +4448,8 @@ pub mod state {
         /// park mode — `desired_channel` returns this channel for every EAW
         /// slot and `update_channel` never hops. Set via [`enable_park`].
         park_channel: Option<u8>,
+        /// Channels permitted by the owning LinuxDrop radio lease.
+        allowed_channels: Option<Vec<u8>>,
     }
 
     impl AwdlState {
@@ -4476,6 +4478,42 @@ pub mod state {
                 last_seen_master_addr: self_addr,
                 last_seen_sync_addr: self_addr,
                 park_channel: None,
+                allowed_channels: None,
+            }
+        }
+
+        /// Constrain our advertised schedule without rewriting peer schedules.
+        /// The configured anchor must be usable as a fallback for limited radios.
+        pub fn set_channel_policy(&mut self, allowed: Vec<u8>) -> bool {
+            if !allowed.contains(&(self.anchor_channel as u8)) || allowed.contains(&0) {
+                return false;
+            }
+            self.allowed_channels = Some(allowed);
+            self.constrain_channel_sequence();
+            true
+        }
+
+        fn permitted_channel(&self, channel: u8) -> u8 {
+            if self
+                .allowed_channels
+                .as_ref()
+                .is_some_and(|allowed| channel != 0 && !allowed.contains(&channel))
+            {
+                self.anchor_channel as u8
+            } else {
+                channel
+            }
+        }
+
+        fn constrain_channel_sequence(&mut self) {
+            let Some(allowed) = &self.allowed_channels else {
+                return;
+            };
+            let fallback = [self.anchor_channel as u8, chan_opclass(self.anchor_channel)];
+            for slot in &mut self.channel_sequence {
+                if slot[0] != 0 && !allowed.contains(&slot[0]) {
+                    *slot = fallback;
+                }
             }
         }
 
@@ -4556,6 +4594,11 @@ pub mod state {
         /// re-adoption entirely so an in-flight bulk upload is not
         /// descheduled.
         fn sync_channel_sequence(&mut self, now_us: u64) {
+            self.sync_channel_sequence_inner(now_us);
+            self.constrain_channel_sequence();
+        }
+
+        fn sync_channel_sequence_inner(&mut self, now_us: u64) {
             // Bug C: an active unicast transfer freezes the committed master
             // (and thus the channel schedule) until the peer goes quiet.
             if crate::schedule::transfer_active(
@@ -4662,6 +4705,10 @@ pub mod state {
         /// channel instead of the slot channel, so [`update_channel`] does not
         /// hop the radio away mid-upload.
         pub fn desired_channel(&self, now_us: u64) -> u8 {
+            self.permitted_channel(self.scheduled_channel(now_us))
+        }
+
+        fn scheduled_channel(&self, now_us: u64) -> u8 {
             // FILIN_SYNC_QUALITY.md pivot: in park mode, return the parked
             // channel for every EAW slot — no hopping. The dedicated monitor
             // doesn't share a radio, so it need not time-share channels.
@@ -4684,7 +4731,7 @@ pub mod state {
         /// different `enable_park` call (or the runtime updating the park
         /// channel to track the top master's anchor) moves the radio.
         pub fn enable_park(&mut self, channel: u8) {
-            self.park_channel = Some(channel);
+            self.park_channel = Some(self.permitted_channel(channel));
         }
 
         /// Disable park mode and resume hopping.
@@ -4716,6 +4763,7 @@ pub mod state {
                 if peer.election.master_addr == top
                     && ch != 0
                     && !crate::channel::is_no_ir_channel(ch)
+                    && self.permitted_channel(ch) == ch
                 {
                     *counts.entry(ch).or_default() += 1;
                 }
@@ -4727,7 +4775,10 @@ pub mod state {
             // top master is itself a peer and its anchor is TX-capable, use it.
             if let Some(top_peer) = self.peers.get(&top) {
                 let ch = top_peer.sequence[0][0];
-                if ch != 0 && !crate::channel::is_no_ir_channel(ch) {
+                if ch != 0
+                    && !crate::channel::is_no_ir_channel(ch)
+                    && self.permitted_channel(ch) == ch
+                {
                     return ch;
                 }
             }
@@ -5133,6 +5184,55 @@ pub mod state {
             state.clean_peers(1_000 + peers::PEER_TIMEOUT_US + 1);
             assert!(state.peers.get(&peer_addr).is_none());
             assert_eq!(state.election.sync_addr, state.election.self_addr);
+        }
+
+        #[test]
+        fn limited_radio_preserves_peer_schedule_and_advertises_only_usable_channels() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 6, 0);
+            assert!(state.set_channel_policy(vec![6]));
+            let peer_addr = [0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+            let mut chanseq = vec![15, 3, 0, 3];
+            chanseq.extend_from_slice(&0xffffu16.to_le_bytes());
+            for i in 0..16 {
+                chanseq.extend_from_slice(&(if i < 8 { 149u16 } else { 6u16 }).to_le_bytes());
+            }
+            state.apply_action(
+                peer_addr,
+                mif(),
+                &[
+                    election_v2_tlv(50, 200),
+                    version_tlv(0x34, 1),
+                    awdl::Tlv {
+                        kind: 18,
+                        value: &chanseq,
+                    },
+                ],
+                1_000,
+            );
+            assert_eq!(state.committed_master, peer_addr);
+            assert!(state.channel_sequence.iter().all(|slot| slot[0] == 6));
+            let peer = state.peers.get(&peer_addr).unwrap();
+            assert_eq!(peer.sequence[0][0], 149);
+            assert_eq!(peer.sequence[8][0], 6);
+            assert_eq!(state.park_channel(), 6);
+            state.enable_park(149);
+            assert_eq!(state.desired_channel(2_000), 6);
+            state.disable_park();
+            state.note_unicast_rx(peer_addr, 44, 2_000);
+            assert_eq!(state.desired_channel(2_001), 6);
+        }
+
+        #[test]
+        fn channel_policy_requires_usable_anchor_and_preserves_dual_band_slots() {
+            let mut state = AwdlState::new([0x02, 0, 0, 0, 0, 1], "filin".into(), 6, 0);
+            assert!(!state.set_channel_policy(vec![]));
+            assert!(!state.set_channel_policy(vec![44]));
+            assert!(!state.set_channel_policy(vec![0, 6]));
+            state.channel_sequence[1] = [44, 0x80];
+            state.channel_sequence[2] = [149, 0x80];
+            assert!(state.set_channel_policy(vec![6, 44]));
+            assert_eq!(state.channel_sequence[1][0], 44);
+            assert_eq!(state.channel_sequence[2][0], 6);
         }
 
         #[test]
@@ -6075,7 +6175,7 @@ pub mod runtime {
         tx_retransmits: u32,
     ) -> Result<(), Error> {
         if tx_retransmits > 0 {
-            println!("tx-retransmits: re-injecting each unicast data frame {tx_retransmits}x extra (with Retry bit)");
+            eprintln!("tx-retransmits: re-injecting each unicast data frame {tx_retransmits}x extra (with Retry bit)");
         }
         let mut bridge = TsftBridge::default();
         let mut awdl_state = crate::state::AwdlState::new(
@@ -6084,11 +6184,29 @@ pub mod runtime {
             links.anchor_channel,
             host_time_us(),
         );
+        match std::env::var("LINUXDROP_ALLOWED_FREQUENCIES") {
+            Ok(policy) => {
+                let allowed = (1..=u8::MAX)
+                    .filter(|&channel| {
+                        channel::channel_to_frequency_mhz(u16::from(channel)).is_some_and(
+                            |frequency| {
+                                os::nl80211::frequency_allowed(Some(&policy), u32::from(frequency))
+                            },
+                        )
+                    })
+                    .collect();
+                if !awdl_state.set_channel_policy(allowed) {
+                    return Err(Error::Channel);
+                }
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(_) => return Err(Error::Channel),
+        }
         // --force-master: seed the election so filin wins and stays master,
         // forcing the cluster onto filin's social-channel sequence.
         if let Some(metric) = force_master {
             awdl_state.election.force_self_master(metric);
-            println!("force-master enabled: advertising election metric {metric}");
+            eprintln!("force-master enabled: advertising election metric {metric}");
         }
         let mut announce = AnnounceScheduler::new(host_time_us());
         let mut wlan_buf = vec![0u8; 4096];
@@ -6174,6 +6292,7 @@ pub mod runtime {
         // up + channel, rebind the socket on the new index). Same MAC → awdl0
         // keeps its address, so luftlift isn't disturbed.
         let monitor_ifindex = os::netdev::ifindex(&links.monitor_iface);
+        let host_ifindex = os::netdev::ifindex(&links.host_iface);
         let mut last_iface_check_us: u64 = 0;
         const IFACE_CHECK_PERIOD_US: u64 = 1_000_000;
 
@@ -6186,6 +6305,8 @@ pub mod runtime {
                 if cur_ifindex == 0
                     || cur_ifindex != monitor_ifindex
                     || !os::netdev::is_up(&links.monitor_iface)
+                    || os::netdev::ifindex(&links.host_iface) != host_ifindex
+                    || !os::netdev::is_up(&links.host_iface)
                 {
                     tracing::warn!(
                         iface = %links.monitor_iface,
@@ -6235,9 +6356,14 @@ pub mod runtime {
                                 "switched monitor channel"
                             ),
                             Err(err) => {
-                                tracing::warn!(?err, channel, "failed to switch monitor channel")
+                                tracing::warn!(?err, channel, "failed to switch monitor channel");
+                                // update_channel has advanced the logical schedule.
+                                // Never transmit as if a failed hardware hop succeeded.
+                                return Err(Error::Channel);
                             }
                         }
+                    } else {
+                        return Err(Error::Channel);
                     }
                 }
             }
