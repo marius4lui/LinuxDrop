@@ -295,7 +295,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     key: "history_limit",
                     title: "Recent transfers to keep",
                     detail: "Limit local transfer history",
-                    kind: Kind::Number(0.0, 1000.0, 1.0),
+                    kind: Kind::Number(0.0, 10000.0, 1.0),
                 },
             ],
         ),

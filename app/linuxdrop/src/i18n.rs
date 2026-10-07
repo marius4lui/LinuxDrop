@@ -323,7 +323,7 @@ pub fn tr(message: &str) -> String {
         "Help nearby Apple devices become discoverable" => "Gerätesuche auf Apple-Geräten in der Nähe anstoßen",
         "Keep existing connections safe" => "Bestehende Verbindungen schützen",
         "Saving device preference…" => "Geräteeinstellung wird gespeichert…",
-        "Change was not saved. Try again." => "Änderung wurde nicht gespeichert. Versuche es erneut.",
+        "Could not confirm this change. Try again." => "Änderung konnte nicht bestätigt werden. Versuche es erneut.",
         "Preferred adapter" => "Bevorzugter Adapter",
         "Stable adapter ID; leave empty for automatic selection" => "Stabile Adapter-ID; für automatische Auswahl leer lassen",
         "Prefer dedicated USB adapters" => "Separate USB-Adapter bevorzugen",

@@ -236,6 +236,32 @@ GNOME 46 smoke at normal text and German 150%, including native preferences;
 all-target Clippy for the app and affected core/network/daemon/Quick Share crates.
 The Shell race cases use controlled replies inside real GNOME, not a physical
 service failure. Root reviewed `ui/completion/device-preference-failed.png`.
-The general GTK snapshot owner-generation race in `ui.rs` remains open; this pass
-fixes device write receipts and Shell state. Physical mixed-DPI, screen-reader
+This pass initially left the GTK snapshot owner-generation race open; the
+follow-up below closes it. Physical mixed-DPI, screen-reader
 and installed-package acceptance remain separate. Live demo unchanged.
+
+
+### GTK snapshot follow-up in the same two-agent pass
+
+The existing GTK agent then closed the confirmed snapshot race. Every read is
+associated with its installed proxy and service generation. Owner changes retire
+old request dialogs and remote actions immediately, then request a new snapshot
+without waiting for the old reply. Stale replies/signals cannot overwrite it.
+Normal D-Bus activation remains enabled; local file drafts and saved-file actions
+remain available. The history limit widget now matches the daemon's 10000-entry
+range (a saved 5000 is tested), and uncertain device write receipts say they could
+not be confirmed instead of claiming that persistence definitely failed.
+
+The native test uses two actual private-bus connections, ReleaseName/RequestName,
+and delayed replies in reverse order. It verifies that only the replacement
+snapshot survives and that even emitting an old dialog's accept response cannot
+reach the new owner. Native scenario passed in 11.02 seconds; app all-target Clippy
+with warnings denied passed. Root reviewed the diff and final logs.
+
+One intermediate test autoactivated the installed daemon on its private bus.
+That process was absent when checked after the test; no unverified PID cleanup
+is claimed. The runner now isolates config/data/cache and uses an explicit private
+service directory excluding LinuxDrop while preserving GTK/portal services. The
+final run passed with no LinuxDrop activation entry. No live demo restart or
+installed-package update was performed. Physical devices, mixed-DPI hotplug and
+screen-reader acceptance remain outside this fixture.

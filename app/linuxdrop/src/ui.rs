@@ -43,6 +43,10 @@ pub struct Ui {
     busy: Cell<bool>,
     refreshing: Cell<bool>,
     refresh_again: Cell<bool>,
+    service_generation: Cell<u64>,
+    service_ready: Cell<bool>,
+    remote_transfer_actions: RefCell<Vec<gtk::Box>>,
+    service_dialogs: RefCell<Vec<glib::WeakRef<adw::AlertDialog>>>,
     closing: Cell<bool>,
     allow_close: Cell<bool>,
     pub settings_query: RefCell<String>,
@@ -387,6 +391,10 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         busy: Cell::new(false),
         refreshing: Cell::new(false),
         refresh_again: Cell::new(false),
+        service_generation: Cell::new(0),
+        service_ready: Cell::new(false),
+        remote_transfer_actions: RefCell::new(Vec::new()),
+        service_dialogs: RefCell::new(Vec::new()),
         closing: Cell::new(false),
         allow_close: Cell::new(false),
         settings_query: RefCell::new(String::new()),
@@ -702,6 +710,16 @@ impl Ui {
         self.stack.set_visible_child_name("transfers");
     }
     fn service_error(&self, error: &str) {
+        self.service_ready.set(false);
+        self.status.set_sensitive(false);
+        for actions in self.remote_transfer_actions.borrow().iter() {
+            actions.set_sensitive(false);
+        }
+        for dialog in self.service_dialogs.borrow_mut().drain(..) {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.force_close();
+            }
+        }
         self.connection
             .set_label(&tr("Sharing service unavailable. Retrying automatically…"));
         self.connection.set_tooltip_text(Some(error));
@@ -717,6 +735,13 @@ impl Ui {
         self.settings_status_row.set_subtitle(&tr(
             "The last known settings are shown. LinuxDrop will reconnect automatically.",
         ));
+    }
+    pub fn track_service_dialog(&self, dialog: &adw::AlertDialog) {
+        self.service_dialogs.borrow_mut().retain(|dialog| dialog.upgrade().is_some());
+        self.service_dialogs.borrow_mut().push(dialog.downgrade());
+    }
+    pub fn service_generation(&self) -> u64 {
+        self.service_generation.get()
     }
     fn update_settings_status(&self) {
         let snapshot = self.snapshot.borrow();
@@ -748,10 +773,13 @@ impl Ui {
     fn install_proxy(self: &Rc<Self>, proxy: &gio::DBusProxy) {
         // Every new proxy subscribes before its first snapshot, including reconnects.
         let weak = Rc::downgrade(self);
+        let installed = proxy.downgrade();
         proxy.connect_local("g-signal", false, move |values| {
             if values[2].get::<String>().ok().as_deref() == Some("Changed") {
                 if let Some(ui) = weak.upgrade() {
-                    ui.refresh();
+                    if installed.upgrade().as_ref() == ui.proxy.borrow().as_ref() {
+                        ui.refresh();
+                    }
                 }
             }
             None
@@ -759,10 +787,15 @@ impl Ui {
         let weak = Rc::downgrade(self);
         proxy.connect_notify_local(Some("g-name-owner"), move |proxy, _| {
             if let Some(ui) = weak.upgrade() {
-                ui.revision.borrow_mut().clear();
-                if proxy.g_name_owner().is_none() {
-                    ui.service_error("Service owner disappeared");
+                if ui.proxy.borrow().as_ref() != Some(proxy) {
+                    return;
                 }
+                ui.service_generation.set(ui.service_generation.get().wrapping_add(1));
+                ui.revision.borrow_mut().clear();
+                ui.service_error("Service owner changed");
+                // A replacement owner must not wait for the old owner's reply.
+                ui.refreshing.set(false);
+                ui.refresh_again.set(false);
                 ui.refresh();
             }
         });
@@ -783,16 +816,36 @@ impl Ui {
                     Err(error) => Err(error),
                 },
             };
+            let generation = ui.service_generation.get();
+            let snapshot_proxy = proxy.as_ref().ok().cloned();
+            let owner = snapshot_proxy.as_ref().and_then(|proxy| proxy.g_name_owner());
             let result = match proxy {
                 Ok(proxy) => {
-                    *ui.proxy.borrow_mut() = Some(proxy.clone());
+                    if owner.is_none() {
+                        ui.service_error("Background service unavailable");
+                    }
+                    // Calling the well-known name also permits normal D-Bus activation.
+                    // An owner appearing during this call invalidates its generation;
+                    // the owner-change handler obtains the authoritative snapshot.
                     ipc::json(&proxy, "GetSnapshot").await
                 }
                 Err(error) => Err(error),
             };
+            if generation != ui.service_generation.get()
+                || snapshot_proxy.as_ref() != ui.proxy.borrow().as_ref()
+                || snapshot_proxy.as_ref().and_then(|proxy| proxy.g_name_owner()) != owner
+            {
+                // Never clear a newer refresh flag or restore an old owner's consent.
+                return;
+            }
             ui.refreshing.set(false);
             match result {
                 Ok(snapshot) => {
+                    ui.service_ready.set(true);
+                    ui.status.set_sensitive(true);
+                    for actions in ui.remote_transfer_actions.borrow().iter() {
+                        actions.set_sensitive(true);
+                    }
                     let revision = format!("{}:{}", snapshot["epoch"], snapshot["revision"]);
                     let settings_value = snapshot.get("settings").cloned().unwrap_or(Value::Null);
                     *ui.settings.borrow_mut() = settings_value.clone();
@@ -857,7 +910,6 @@ impl Ui {
                 }
                 Err(error) => {
                     ui.service_error(&error);
-                    *ui.proxy.borrow_mut() = None;
                 }
             }
             if ui.refresh_again.replace(false) {
@@ -868,6 +920,10 @@ impl Ui {
         });
     }
     pub fn mutate(self: &Rc<Self>, method: &str, params: glib::Variant) {
+        if !self.service_ready.get() {
+            self.toast("The sharing service is not connected yet");
+            return;
+        }
         let Some(proxy) = self.proxy.borrow().clone() else {
             self.toast("The sharing service is not connected yet");
             return;
@@ -1040,7 +1096,8 @@ impl Ui {
             .proxy
             .borrow()
             .as_ref()
-            .is_some_and(|proxy| proxy.g_name_owner().is_some());
+            .is_some_and(|proxy| proxy.g_name_owner().is_some())
+            && self.service_ready.get();
         let restarting = self.snapshot.borrow()["restarting"] == true;
         let selected = self.selected.borrow().clone();
         let peers = array(&self.snapshot.borrow(), "peers");
@@ -1074,6 +1131,7 @@ impl Ui {
         }));
         self.send_caption.set_label(&match (count, peer) {
             _ if restarting => tr("Sharing services are restarting; try again shortly"),
+            _ if !connected => tr("Sharing service unavailable. Retrying automatically…"),
             (count, _) if count > 0 && !ready => tr("Check the marked files before sending"),
             (_, Some(_)) if !protocol_available => {
                 tr("The selected protocol is unavailable; choose another protocol")
@@ -1408,6 +1466,7 @@ impl Ui {
         let focus = gtk::prelude::GtkWindowExt::focus(&self.window)
             .map(|widget| widget.widget_name().to_string());
         clear(&self.transfers);
+        self.remote_transfer_actions.borrow_mut().clear();
         self.transfer_progress.borrow_mut().clear();
         let transfers = array(&self.snapshot.borrow(), "transfers");
         if transfers.is_empty() {
@@ -1509,6 +1568,10 @@ impl Ui {
             }
             let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
             actions.set_halign(gtk::Align::End);
+            if state != "completed" {
+                actions.set_sensitive(self.service_ready.get());
+                self.remote_transfer_actions.borrow_mut().push(actions.clone());
+            }
             let pending = (state == "waiting" && incoming) || state == "verification";
             if state == "pin_required" {
                 let button = gtk::Button::with_label(&tr("Enter PIN"));

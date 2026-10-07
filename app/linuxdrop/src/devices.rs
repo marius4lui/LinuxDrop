@@ -339,7 +339,7 @@ fn update_preference(
                 status.add_css_class("error");
                 status.set_label(&format!(
                     "{}\n{error}",
-                    tr("Change was not saved. Try again.")
+                    tr("Could not confirm this change. Try again.")
                 ));
             }
         }

@@ -66,6 +66,7 @@ impl Ui {
                 }
             });
         });
+        self.track_service_dialog(&dialog);
         dialog.present(Some(&self.window));
         dialog
     }
@@ -250,9 +251,11 @@ impl Ui {
         ));
         let weak = Rc::downgrade(self);
         let request = transfer.clone();
+        let generation = self.service_generation();
         dialog.connect_response(None, move |_, response| {
             if response != "accept" { return; }
             let Some(ui) = weak.upgrade() else { return; };
+            if ui.service_generation() != generation { return; }
             let mut options = json!({"collision_policy": if collision.selected() == 1 {"reject"} else {"rename"}});
             options["selected_indices"] = json!(selected.borrow().iter().enumerate().filter_map(|(index, value)| value.then_some(index)).collect::<Vec<_>>());
             options["directory"] = json!(folder.borrow().as_str());
@@ -264,6 +267,7 @@ impl Ui {
                     Some(proxy) => crate::ipc::call(&proxy, "AcceptTransferWithOptions", Some((id, options.to_string()).to_variant())).await.map(|_| ()),
                     None => Err(tr("The sharing service is not connected yet")),
                 };
+                if ui.service_generation() != generation { return; }
                 if let Err(error) = result {
                     // Failed consent must not discard the user's destination or subset.
                     ui.review_request(&request, Some(&options), Some(&error));
@@ -271,6 +275,7 @@ impl Ui {
                 ui.refresh();
             });
         });
+        self.track_service_dialog(&dialog);
         dialog.present(Some(&self.window));
         dialog
     }
@@ -397,6 +402,7 @@ impl Ui {
             }
             pin.set_text("");
         });
+        self.track_service_dialog(&dialog);
         dialog.present(Some(&self.window));
     }
 }

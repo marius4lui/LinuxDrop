@@ -88,6 +88,8 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let fail_next_stop = Rc::new(Cell::new(true));
     let fail_next_preference = Rc::new(Cell::new(false));
     let preference_calls = Rc::new(Cell::new(0));
+    let hold_snapshot = Rc::new(Cell::new(false));
+    let pending_snapshots = Rc::new(RefCell::new(Vec::<(gio::DBusMethodInvocation, glib::Variant)>::new()));
     let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='StopDownloadOffer'/><method name='UpdatePeerPreferences'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
@@ -98,12 +100,19 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let fail_stop = fail_next_stop.clone();
     let fail_preference = fail_next_preference.clone();
     let preference_count = preference_calls.clone();
+    let hold = hold_snapshot.clone();
+    let pending = pending_snapshots.clone();
     let registration = bus
         .register_object(ipc::PATH, &info.interfaces()[0])
         .method_call(
             move |_, _, _, _, method, parameters, invocation| match method {
                 "GetSnapshot" => {
-                    invocation.return_value(Some(&(state.borrow().to_string(),).to_variant()))
+                    let response = (state.borrow().to_string(),).to_variant();
+                    if hold.get() {
+                        pending.borrow_mut().push((invocation, response));
+                    } else {
+                        invocation.return_value(Some(&response));
+                    }
                 }
                 "StopDownloadOffer" => {
                     if fail_stop.replace(false) {
@@ -294,7 +303,9 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         let require_pin = find(&ui.settings_body, "setting:localsend.require_pin").unwrap();
         assert!(!require_pin.is_sensitive(), "A receiving PIN must be saved before it can be required");
         config["localsend"]["pin"] = json!("1234");
+        config["transfers"]["history_limit"] = json!(5000);
         settings::render(&ui, &config);
+        assert_eq!(find(&ui.settings_body, "setting:transfers.history_limit").unwrap().downcast::<adw::SpinRow>().unwrap().value(), 5000.0, "A valid saved history limit must not be silently clamped");
         assert!(find(&ui.settings_body, "setting:localsend.require_pin").unwrap().is_sensitive());
         let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
         search.set_text(&tr("Device name"));
@@ -562,6 +573,63 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert!(status.text().contains(&tr("Background service unavailable")));
         assert_eq!(preference_calls.get(), calls, "Offline edits must not silently stick");
         devices.force_close();
+        // Hold an old owner's snapshot across a real private-bus replacement.
+        // Its eventual reply must not revive stale consent or overwrite the replacement.
+        snapshot.borrow_mut()["peers"][0]["blocked"] = json!(false);
+        let incoming = json!({"id":"stale-consent", "peer_name":"Old owner", "protocol":"localsend", "direction":"incoming", "state":"waiting", "total_bytes":0, "files":[{"name":"old.txt", "size":0}]});
+        snapshot.borrow_mut()["transfers"].as_array_mut().unwrap().push(incoming.clone());
+        snapshot.borrow_mut()["revision"] = json!(36);
+        ui.refresh();
+        settle().await;
+        ui.add_files(vec![gio::File::for_path(&first)]);
+        settle().await;
+        let draft = ui.files.borrow().clone();
+        let review = ui.accept_request(&incoming);
+        settle().await;
+        assert!(find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").unwrap().is_sensitive());
+        hold_snapshot.set(true);
+        ui.refresh();
+        settle().await;
+        assert_eq!(pending_snapshots.borrow().len(), 1);
+        bus.call_sync(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReleaseName", Some(&(ipc::BUS,).to_variant()), None, gio::DBusCallFlags::NONE, 2000, gio::Cancellable::NONE).unwrap();
+        settle().await;
+        assert!(!ui.service_ready.get());
+        assert!(!ui.send.is_sensitive() && !ui.share_link.is_sensitive());
+        assert!(!find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").unwrap().is_sensitive());
+        assert!(find(&ui.transfers, "transfer:received:OpenFiles").unwrap().is_sensitive(), "Saved-file actions remain available without the service");
+        assert!(ui.window.visible_dialog().is_none(), "Owner loss closes stale consent");
+        let replacement = gio::DBusConnection::for_address_sync(&std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap(), gio::DBusConnectionFlags::AUTHENTICATION_CLIENT | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION, None, gio::Cancellable::NONE).unwrap();
+        snapshot.borrow_mut()["epoch"] = json!("replacement-owner");
+        snapshot.borrow_mut()["revision"] = json!(1);
+        snapshot.borrow_mut()["transfers"].as_array_mut().unwrap().retain(|transfer| transfer["id"] != "stale-consent");
+        let state = snapshot.clone();
+        let pending = pending_snapshots.clone();
+        let hold = hold_snapshot.clone();
+        let replacement_registration = replacement.register_object(ipc::PATH, &info.interfaces()[0]).method_call(move |_,_,_,_,method,_,invocation| {
+            assert_eq!(method, "GetSnapshot", "Old consent must not reach the replacement owner");
+            let response = (state.borrow().to_string(),).to_variant();
+            if hold.get() { pending.borrow_mut().push((invocation,response)); } else { invocation.return_value(Some(&response)); }
+        }).build().unwrap();
+        replacement.call_sync(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", Some(&(ipc::BUS,0_u32).to_variant()), None, gio::DBusCallFlags::NONE, 2000, gio::Cancellable::NONE).unwrap();
+        settle().await;
+        assert_eq!(pending_snapshots.borrow().len(), 2, "New owner refresh must not wait for the old reply");
+        assert!(!ui.service_ready.get(), "Owner presence alone is not a current snapshot");
+        assert!(!find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").unwrap().is_sensitive());
+        hold_snapshot.set(false);
+        let (new_call, new_reply) = pending_snapshots.borrow_mut().remove(1);
+        new_call.return_value(Some(&new_reply));
+        settle().await;
+        assert!(ui.service_ready.get());
+        assert_eq!(ui.snapshot.borrow()["epoch"], "replacement-owner");
+        let (old_call, old_reply) = pending_snapshots.borrow_mut().remove(0);
+        old_call.return_value(Some(&old_reply));
+        settle().await;
+        assert_eq!(ui.snapshot.borrow()["epoch"], "replacement-owner", "Late old snapshots cannot restore stale state");
+        assert!(find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").is_none());
+        assert_eq!(*ui.files.borrow(), draft, "Owner replacement preserves local file drafts");
+        review.emit_by_name::<()>("response", &[&"accept"]);
+        settle().await;
+        replacement.unregister_object(replacement_registration).unwrap();
         ui.allow_close.set(true);
         ui.window.close();
     });

@@ -22,7 +22,7 @@ The focused review fixes and their native evidence are recorded in
 items retain their remaining acceptance scope even where code now exists.
 
 - [x] Show individual invalid files and reasons, preserve valid selections, permit zero-byte files; asynchronous metadata validation.
-- [ ] Reconnect signal subscription on every proxy; owner-change invalidation, dirty snapshot retry and epoch/revision handling.
+- [x] Reconnect signal subscription on every proxy; owner-change invalidation, dirty snapshot retry and epoch/revision handling. GTK replacement is covered by an actual private-bus owner change; Shell by controlled replies in native GNOME.
 - [ ] Stable peer/protocol selection across updates; favorites, custom labels, protocol preferences and soft-block controls using daemon contract.
 - [x] Per-request destination and partial file acceptance using daemon contract.
 - [ ] Full settings inventory from final schema: language/close behavior, receive policy/subfolders, public duration, protocol ports/modes, adapters/controllers, network filters, notifications/privacy/sound, limits/history, diagnosis/restart/reset/export.
@@ -64,5 +64,15 @@ scope; broader accessibility and mixed-DPI acceptance remain open.
 rollback and retry feedback; external device names are literal. Shell owner
 replacement invalidates consent immediately, ignores stale completions and
 coalesces in-flight updates; launcher failure remains visible. Native evidence
-is in the acceptance record. The GTK general snapshot owner-generation guard is
-still required even though the Shell side and device write receipts are fixed.
+is in the acceptance record. The follow-up below also closes the GTK general snapshot owner-generation gap.
+
+
+2026-10-07 GTK follow-up: stale proxy signals/replies cannot overwrite a new
+owner's snapshot or enable consent; owner loss immediately disables remote actions
+and closes old request dialogs. A fresh owner is queried independently of old
+pending replies, while normal D-Bus activation remains available. Local file drafts
+and completed-file actions survive. Native private-bus replacement/late-reply
+regression and app Clippy passed. History values through 10000 display correctly.
+The native runner now isolates configuration/data/cache and excludes LinuxDrop
+activation from its private bus services; it cannot start the installed sharing
+daemon during owner-loss tests.
