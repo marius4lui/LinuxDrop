@@ -7,13 +7,14 @@ use std::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-static UPGRADE_LEASE: RwLock<Option<nm::Lease>> = RwLock::new(None);
+static UPGRADE_LEASE: RwLock<Option<(nm::Lease, linuxdrop_network::DirectWifiCapabilities)>> =
+    RwLock::new(None);
 static P2P_CONNECTOR: RwLock<Option<Arc<dyn P2pConnector>>> = RwLock::new(None);
 fn exclusive() -> Arc<Semaphore> {
     static SLOT: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SLOT.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
-pub fn set_upgrade_lease(lease: Option<nm::Lease>) {
+pub fn set_upgrade_lease(lease: Option<(nm::Lease, linuxdrop_network::DirectWifiCapabilities)>) {
     *UPGRADE_LEASE.write().unwrap() = lease;
 }
 pub fn set_p2p_connector(connector: Option<Arc<dyn P2pConnector>>) {
@@ -24,7 +25,21 @@ fn lease() -> anyhow::Result<nm::Lease> {
         .read()
         .unwrap()
         .clone()
+        .map(|(lease, _)| lease)
         .ok_or_else(|| anyhow::anyhow!("Wi-Fi upgrade requires a reserved dedicated adapter"))
+}
+pub fn upgrade_capabilities() -> linuxdrop_network::DirectWifiCapabilities {
+    let mut capabilities = UPGRADE_LEASE
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|(_, capabilities)| capabilities.clone())
+        .unwrap_or_default();
+    if P2P_CONNECTOR.read().unwrap().is_none() {
+        capabilities.p2p_client = false;
+        capabilities.p2p_group_owner = false;
+    }
+    capabilities
 }
 pub const HOTSPOT_TCP_PORT: u16 = 61812;
 
@@ -74,6 +89,10 @@ pub async fn join_wifi(
     password: &str,
     candidates: &[SocketAddr],
 ) -> anyhow::Result<JoinGuard> {
+    anyhow::ensure!(
+        upgrade_capabilities().station,
+        "Reserved adapter cannot join a Wi-Fi network"
+    );
     let lease = lease()?;
     let interface = lease.interface.clone();
     let link_local = candidates
@@ -98,6 +117,10 @@ pub async fn join_wifi(
     })
 }
 pub async fn join_p2p(peer_name: &str, pin: &str, frequency: u32) -> anyhow::Result<JoinGuard> {
+    anyhow::ensure!(
+        upgrade_capabilities().p2p_client,
+        "Reserved adapter cannot join a P2P group"
+    );
     let connector = P2P_CONNECTOR
         .read()
         .unwrap()
@@ -120,6 +143,10 @@ pub async fn join_p2p(peer_name: &str, pin: &str, frequency: u32) -> anyhow::Res
 /// Create an autonomous P2P group on the reserved radio. Keep the permit and
 /// cleanup guard alive from before the first await through transfer completion.
 pub async fn start_direct_group() -> anyhow::Result<HotspotGuard> {
+    anyhow::ensure!(
+        upgrade_capabilities().p2p_group_owner,
+        "Reserved adapter cannot host a P2P group"
+    );
     let connector = P2P_CONNECTOR
         .read()
         .unwrap()
@@ -146,6 +173,10 @@ pub async fn start_direct_group() -> anyhow::Result<HotspotGuard> {
     })
 }
 pub async fn start_hotspot() -> anyhow::Result<HotspotGuard> {
+    anyhow::ensure!(
+        upgrade_capabilities().hotspot,
+        "Reserved adapter cannot host a hotspot"
+    );
     let lease = lease()?;
     let interface = lease.interface.clone();
     let (ssid, password) = {
@@ -196,6 +227,65 @@ pub async fn listen_hosted(
         .filter(|local| local.address.is_ipv6() || local.address == IpAddr::V4(guard.gateway))
         .collect();
     crate::lan_policy::LanListeners::new_on(HOTSPOT_TCP_PORT, interfaces).await
+}
+pub fn hosted_offer(
+    guard: &HotspotGuard,
+    listener: &crate::lan_policy::LanListeners,
+    medium: crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium,
+) -> anyhow::Result<
+    crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::UpgradePathInfo,
+> {
+    guard.offer(listener.port(), hosted_candidates(listener), medium)
+}
+impl HotspotGuard {
+    pub fn offer(
+        &self,
+        port: u16,
+        address_candidates: Vec<crate::location_nearby_connections::ServiceAddress>,
+        medium: crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium,
+    ) -> anyhow::Result<
+        crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::UpgradePathInfo,
+    > {
+        use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            UpgradePathInfo,
+            upgrade_path_info::{Medium, WifiDirectCredentials, WifiHotspotCredentials},
+        };
+        anyhow::ensure!(port != 0, "Hosted upgrade has no listening port");
+        let mut info = UpgradePathInfo {
+            medium: Some(medium.into()),
+            supports_client_introduction_ack: Some(true),
+            ..Default::default()
+        };
+        match medium {
+            Medium::WifiDirect if self._p2p.is_some() => {
+                info.wifi_direct_credentials = Some(WifiDirectCredentials {
+                    ssid: Some(self.ssid.clone()),
+                    password: Some(self.password.clone()),
+                    port: Some(port.into()),
+                    frequency: Some(self.frequency),
+                    gateway: Some(self.gateway.to_string()),
+                    ip_v6_address: address_candidates.iter().find_map(|candidate| {
+                        let ip = crate::lan_policy::decode_ip(candidate.ip_address()).ok()?;
+                        matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local())
+                            .then(|| candidate.ip_address().to_vec())
+                    }),
+                    ..Default::default()
+                });
+            }
+            Medium::WifiHotspot if self._network.is_some() => {
+                info.wifi_hotspot_credentials = Some(WifiHotspotCredentials {
+                    ssid: Some(self.ssid.clone()),
+                    password: Some(self.password.clone()),
+                    port: Some(port.into()),
+                    frequency: Some(self.frequency),
+                    gateway: Some(self.gateway.to_string()),
+                    address_candidates,
+                });
+            }
+            _ => anyhow::bail!("Hosted upgrade medium does not match its owned network"),
+        }
+        Ok(info)
+    }
 }
 pub fn hosted_candidates(
     listener: &crate::lan_policy::LanListeners,

@@ -2125,6 +2125,7 @@ dependencies = [
  "linuxdrop-core",
  "linuxdrop-network",
  "linuxdrop-storage",
+ "prost",
  "rqs_lib",
  "tempfile",
  "tokio",

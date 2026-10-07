@@ -29,6 +29,7 @@ pub struct DirectWifiLease {
     pub interface: String,
     pub lease_id: String,
     pub connection_uuid: String,
+    pub capabilities: linuxdrop_network::DirectWifiCapabilities,
 }
 
 /// Starts LAN discovery, UKEY2 encrypted send/receive and BlueZ discovery.
@@ -86,11 +87,14 @@ pub async fn start_with_budget(
     rqs_lib::set_receive_limits(config.max_receive_bytes, config.max_files);
     rqs_lib::payload_budget::set_budget(bandwidth);
     rqs_lib::hdl::set_upgrade_lease(config.upgrade_lease.map(|lease| {
-        linuxdrop_network::nm::Lease {
-            interface: lease.interface,
-            lease_id: lease.lease_id,
-            connection_uuid: lease.connection_uuid,
-        }
+        (
+            linuxdrop_network::nm::Lease {
+                interface: lease.interface,
+                lease_id: lease.lease_id,
+                connection_uuid: lease.connection_uuid,
+            },
+            lease.capabilities,
+        )
     }));
     rqs_lib::hdl::set_p2p_connector(config.p2p_connector);
     let mut messages = engine.message_sender.subscribe();

@@ -62,6 +62,8 @@ pub struct Lease {
     pub connection_uuid: Option<String>,
     #[serde(default)]
     pub p2p_group: Option<linuxdrop_network::p2p::GroupIdentity>,
+    #[serde(default)]
+    pub direct_capabilities: linuxdrop_network::DirectWifiCapabilities,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

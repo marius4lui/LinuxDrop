@@ -1410,6 +1410,7 @@ async fn reserve_direct_wifi(
             interface: lease.interface.clone(),
             lease_id: lease.id.clone(),
             connection_uuid,
+            capabilities: lease.direct_capabilities.clone(),
         });
     *shared.quickshare_helper.lock().await = Some(helper::HelperLease::new(client, *lease, shared));
     helper::release_after_failure(&shared.quickshare_helper, result).await

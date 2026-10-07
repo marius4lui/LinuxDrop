@@ -245,6 +245,7 @@ pub(crate) mod tests {
             kind: linuxdrop_netd::LeaseKind::Monitor,
             connection_uuid: None,
             p2p_group: None,
+            direct_capabilities: Default::default(),
         }
     }
 

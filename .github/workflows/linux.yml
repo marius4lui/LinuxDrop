@@ -12,7 +12,7 @@ jobs:
       - name: Native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi busybox
       - name: Rust tools
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
@@ -24,8 +24,11 @@ jobs:
         run: |
           cargo test --workspace --locked
           sh crates/linuxdrop-network/tests/run-nm-lifecycle.sh
+          sh crates/linuxdrop-network/tests/run-p2p-host.sh
           sh crates/linuxdrop-network/tests/run-bluetooth-lifecycle.sh
           cargo test --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs linuxdrop_policy_tests --lib
+      - name: Isolated kernel network and upgrade lifecycles
+        run: python3 packaging/ci/network-lifecycle.py
       - name: Native resources
         run: |
           desktop-file-validate packaging/io.github.marius4lui.LinuxDrop.desktop

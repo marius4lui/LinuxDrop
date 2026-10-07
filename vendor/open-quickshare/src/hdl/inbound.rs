@@ -173,6 +173,8 @@ pub struct InboundRequest<S = TcpStream> {
     /// The sender's advertised LAN address (from its ConnectionRequest's
     /// medium_metadata); decides the bandwidth-upgrade path.
     remote_ip: Option<std::net::IpAddr>,
+    remote_mediums: Vec<i32>,
+    remote_metadata: Option<location_nearby_connections::MediumMetadata>,
     /// Host our own hotspot for the next upgrade attempt (no shared LAN with
     /// the sender, or the LAN offer already failed once).
     bwu_try_hotspot: bool,
@@ -228,6 +230,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             post_accept_lan_tries: 0,
             bwu_retry_at: None,
             remote_ip: None,
+            remote_mediums: Vec::new(),
+            remote_metadata: None,
             bwu_try_hotspot: false,
             #[cfg(all(feature = "experimental", target_os = "linux"))]
             hotspot_guard: None,
@@ -605,6 +609,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             .connection_request
             .as_ref()
             .ok_or_else(|| anyhow!("Missing required fields"))?;
+
+        self.remote_mediums = connection_request.mediums.clone();
+        self.remote_metadata = connection_request.medium_metadata.clone();
 
         // The sender's advertised LAN address picks the upgrade path later:
         // same subnet → offer our LAN socket; different/absent → host a hotspot.
@@ -2088,11 +2095,8 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             };
         }
         if self.bwu_try_hotspot {
-            // Hosting a hotspot tears this machine off its own Wi-Fi -- don't
-            // do that before the user has even accepted the transfer. The
-            // harmless WIFI_LAN offer still goes out early (matching Android),
-            // but the disruptive path waits for consent; poll again shortly
-            // without burning a retry-ladder slot.
+            // Dedicated-radio changes wait for consent. Ordinary LAN offers
+            // remain available while the user is reviewing the request.
             if self.state.state != TransferState::ReceivingFiles {
                 debug!("BWU: hotspot path deferred until the transfer is accepted");
                 self.bwu_retry_at = Some(tokio::time::Instant::now() + Duration::from_secs(2));
@@ -2214,15 +2218,24 @@ impl InboundRequest<crate::hdl::MigratableStream> {
     /// over Wi-Fi. Mirror of the phone-hosted group we join when sending.
     async fn do_bwu_hotspot(&mut self) -> Result<(), anyhow::Error> {
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
-        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::UpgradePathInfo;
-        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::{
-            Medium as UpMedium, WifiHotspotCredentials,
-        };
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium as UpMedium;
 
-        let guard = match crate::hdl::start_hotspot().await {
+        let Some(medium) =
+            crate::hdl::select_host_medium(&self.remote_mediums, self.remote_metadata.as_ref())
+        else {
+            self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
+            self.schedule_bwu_retry();
+            return Ok(());
+        };
+        let hosted = if medium == UpMedium::WifiDirect {
+            crate::hdl::start_direct_group().await
+        } else {
+            crate::hdl::start_hotspot().await
+        };
+        let guard = match hosted {
             Ok(g) => g,
             Err(e) => {
-                warn!("BWU: couldn't host a hotspot ({e}); staying on BLE");
+                warn!("BWU: couldn't host {medium:?} ({e}); staying on BLE");
                 // Only fall back to the LAN offer if we actually have a LAN.
                 self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
                 self.schedule_bwu_retry();
@@ -2231,25 +2244,12 @@ impl InboundRequest<crate::hdl::MigratableStream> {
         };
         let listener = crate::hdl::listen_hosted(&guard).await?;
         let port = listener.port();
-        let address_candidates = crate::hdl::hosted_candidates(&listener);
         info!(
-            "BWU: hosting hotspot '{}' (gateway {}:{port}) for the sender to join",
+            "BWU: hosting {medium:?} '{}' (gateway {}:{port}) for the sender to join",
             guard.ssid, guard.gateway
         );
 
-        let info = UpgradePathInfo {
-            medium: Some(UpMedium::WifiHotspot.into()),
-            wifi_hotspot_credentials: Some(WifiHotspotCredentials {
-                ssid: Some(guard.ssid.clone()),
-                password: Some(guard.password.clone()),
-                port: Some(port as i32),
-                gateway: Some(guard.gateway.to_string()),
-                frequency: Some(guard.frequency),
-                address_candidates,
-            }),
-            supports_client_introduction_ack: Some(true),
-            ..Default::default()
-        };
+        let info = crate::hdl::hosted_offer(&guard, &listener, medium)?;
         self.encrypt_and_send(&Self::bwu_frame(
             EventType::UpgradePathAvailable,
             Some(info),
@@ -2337,7 +2337,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
 
         self.hotspot_guard = Some(guard);
         self.socket = crate::hdl::MigratableStream::Tcp(tcp);
-        info!("BWU: upgraded to our hosted hotspot; payload continues over TCP");
+        info!("BWU: upgraded to our hosted {medium:?}; payload continues over TCP");
         // Announce ourselves on the new channel (both sides restart keep-alives
         // after a channel switch); also un-sticks a sender waiting to see the
         // receiver's traffic before resuming the payload.
@@ -2345,3 +2345,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
         Ok(())
     }
 }
+
+#[cfg(all(test, feature = "experimental", target_os = "linux"))]
+#[path = "inbound_bwu_tests.rs"]
+mod bwu_tests;

@@ -388,6 +388,34 @@ async fn authorize(pid: i32, uid: u32, start: u64) -> Result<(), String> {
     Ok(())
 }
 
+fn direct_capabilities(
+    modes: &[String],
+    channels: &[linuxdrop_hardware::Channel],
+) -> linuxdrop_network::DirectWifiCapabilities {
+    let mode = |name| modes.iter().any(|value| value == name);
+    let frequencies: Vec<_> = channels
+        .iter()
+        .filter(|channel| !channel.disabled)
+        .map(|channel| channel.frequency_mhz)
+        .collect();
+    let can_initiate = |band: std::ops::Range<u32>| {
+        channels.iter().any(|channel| {
+            band.contains(&channel.frequency_mhz)
+                && !channel.disabled
+                && !channel.no_ir
+                && !channel.radar
+        })
+    };
+    linuxdrop_network::DirectWifiCapabilities {
+        station: mode("managed") && !frequencies.is_empty(),
+        // The NM hotspot profile currently requests the 2.4 GHz band explicitly.
+        hotspot: mode("AP") && can_initiate(2400..2500),
+        p2p_group_owner: mode("P2P-GO") && (can_initiate(2400..2500) || can_initiate(4900..5900)),
+        p2p_client: mode("P2P-client") && !frequencies.is_empty(),
+        frequencies,
+    }
+}
+
 async fn join_p2p(
     shared: &Shared,
     lease_id: String,
@@ -783,6 +811,7 @@ async fn apply(
                 kind: LeaseKind::DirectWifi,
                 connection_uuid: Some(uuid::Uuid::new_v4().to_string()),
                 p2p_group: None,
+                direct_capabilities: direct_capabilities(&radio.modes, &radio.channels),
             };
             state.leases.insert(id.clone(), lease.clone());
             if let Err(e) = persist(&state) {
@@ -857,6 +886,7 @@ async fn apply(
                 kind: LeaseKind::Monitor,
                 connection_uuid: None,
                 p2p_group: None,
+                direct_capabilities: Default::default(),
                 allowed_frequencies: radio
                     .channels
                     .iter()
@@ -1488,6 +1518,43 @@ async fn restore_connection(lease: &Lease) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn reserved_capabilities_exclude_unsupported_and_regulatory_blocked_roles() {
+        use linuxdrop_hardware::Channel;
+        let modes = vec![
+            "managed".into(),
+            "AP".into(),
+            "P2P-GO".into(),
+            "P2P-client".into(),
+        ];
+        let mut channels = vec![
+            Channel {
+                frequency_mhz: 2437,
+                number: 6,
+                ..Default::default()
+            },
+            Channel {
+                frequency_mhz: 5180,
+                number: 36,
+                disabled: true,
+                ..Default::default()
+            },
+        ];
+        let cap = direct_capabilities(&modes, &channels);
+        assert!(cap.station && cap.hotspot && cap.p2p_group_owner && cap.p2p_client);
+        assert_eq!(cap.frequencies, vec![2437]);
+        channels[0].no_ir = true;
+        let cap = direct_capabilities(&modes, &channels);
+        assert!(cap.station && cap.p2p_client);
+        assert!(!cap.hotspot && !cap.p2p_group_owner);
+        channels[0].disabled = true;
+        assert!(!direct_capabilities(&modes, &channels).station);
+        channels[1].disabled = false;
+        let cap = direct_capabilities(&["managed".into()], &channels);
+        assert!(cap.station);
+        assert!(!cap.hotspot && !cap.p2p_group_owner && !cap.p2p_client);
+    }
+
+    #[test]
     fn hosted_subnet_avoids_specific_and_aggregate_routes() {
         use serde_json::json;
         use std::net::Ipv4Addr;
@@ -1529,6 +1596,7 @@ mod tests {
             kind: LeaseKind::DirectWifi,
             connection_uuid: Some("owned-uuid".into()),
             p2p_group: None,
+            direct_capabilities: Default::default(),
         }
     }
     fn active_interface(name: &str) -> linuxdrop_hardware::NetworkInterface {

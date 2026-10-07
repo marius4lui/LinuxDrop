@@ -48,6 +48,8 @@ mod mdns_discovery;
 pub use mdns_discovery::*;
 mod mdns;
 pub use mdns::*;
+mod upgrade_policy;
+pub use upgrade_policy::*;
 mod outbound;
 pub use outbound::*;
 

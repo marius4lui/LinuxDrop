@@ -16,5 +16,6 @@ uuid = { version = "1", features = ["v4"] }
 bluer = { version = "0.17", features = ["bluetoothd"] }
 
 [dev-dependencies]
+prost = "0.13"
 zbus.workspace = true
 tokio-util.workspace = true

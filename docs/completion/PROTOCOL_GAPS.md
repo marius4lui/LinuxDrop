@@ -28,7 +28,8 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Stable configurable IPv4 LAN listener port and interface-filtered advertisement/discovery/listening; exact local-address binds and source-bound outgoing connections.
 - [x] Live IPv4 LAN address/interface changes reconcile listeners, mDNS records, discovery probes and readiness without requiring a manual backend restart.
 - [x] IPv6 LAN listeners, scoped discovery endpoints and WIFI_LAN address-candidate offers/selection, including IPv6-only readiness and exact interface binding.
-- [ ] IPv6 credentials/candidates for direct/hotspot networks; prolonged mDNS reconfiguration/resource-bound acceptance.
+- [x] IPv6 credentials/candidates for direct/hotspot networks; owned-interface binding and IPv6-only group readiness.
+- [ ] Prolonged mDNS reconfiguration/resource-bound acceptance.
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
 - [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
@@ -36,7 +37,7 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Exclusive hardware lease and transfer semaphore for radio-changing upgrades, unique owned NetworkManager profiles and cancellation cleanup; isolated D-Bus lifecycle test passed.
 - [ ] Protocol metadata and upgrade failure regression tests beyond existing TCP handshake simulator.
 
-Google's wire schema distinguishes password-based joining from device-name discovery. `device_name` is field 9; field 8 is an optional PIN reserved for future use with the device-name mode, not a requirement that every such offer includes a PIN. The engine now decodes these fields and routes empty-SSID offers through the reserved supplicant helper, with PBC for an empty PIN. Discovery, group identity, cancellation, DHCP and cleanup paths exist. Negotiation/role advertisement, native group-owner behavior and IPv6-only/address-candidate support still require implementation and protocol simulation before this row is complete. Password-based joining and an ordinary NetworkManager AP are not labelled complete Wi-Fi Direct conformance.
+Google's wire schema distinguishes password-based joining from device-name discovery. `device_name` is field 9; field 8 is an optional PIN reserved for future use with the device-name mode, not a requirement that every such offer includes a PIN. The engine now decodes these fields and routes empty-SSID offers through the reserved supplicant helper, with PBC for an empty PIN. Discovery, group identity, cancellation, DHCP and cleanup paths exist. Password-based group hosting, capability-based role advertisement and IPv6/address-candidate paths are now implemented and have scoped simulation evidence below. Remaining work includes device-name-authenticated hosting, receiver-as-client dynamic role switching and supplicant owner-loss recovery. Password-based joining and an ordinary NetworkManager AP are not labelled complete Wi-Fi Direct conformance.
 
 ## AirDrop / AWDL
 
@@ -567,3 +568,47 @@ conformance or installed-package acceptance is claimed. Live demo unchanged.
 
 Primary protocol references: [supplicant D-Bus GroupAdd/GroupStarted API](https://w1.fi/wpa_supplicant/devel/dbus.html)
 and [Nearby offline wire formats](https://github.com/google/nearby/blob/main/connections/implementation/proto/offline_wire_formats.proto).
+
+
+## Hardware-backed upgrade roles and receive-side group hosting, 2026-10-07
+
+The helper's reserved-radio response now carries station/AP/P2P modes and enabled
+frequencies. Missing fields in an old journal default to no capabilities. Hosting
+requires permitted initiating channels; the current NM hotspot profile is limited
+to its actual 2.4-GHz band. Quick Share no longer hardcodes 5-GHz or hosting support.
+Its connection metadata and offered direct/hotspot media use the owned radio;
+a missing P2P connector removes the P2P host/client operations. Both roles check
+these capabilities again before a radio-changing operation.
+
+An explicit peer client-role exclusion or incompatible authentication list is
+honored. Missing legacy metadata remains compatible with password-based peers.
+Unsupported requests fail instead of inventing a hotspot offer. Receive-side
+hosting now selects an actual supplicant P2P group when both sides support it;
+ordinary hotspots remain a separate medium. Both directions use one credential
+generator, which rejects a medium that does not match the guard's owned network.
+The role/auth fields were checked against [Google's wire schema](https://github.com/google/nearby/blob/main/connections/implementation/proto/offline_wire_formats.proto).
+
+Passed: 13 daemon tests, 8 netd tests and 16 default Quick Share tests; workspace
+all-target Clippy. New tests cover regulatory/mode exclusions, no-radio and
+2.4-only metadata, peer role/authentication incompatibility, the actual serialized
+TCP ConnectionRequest, exclusive helper ownership and cleanup, and shared direct
+offer credentials. `run-direct-upgrade.sh` with the built rqs_lib unit-test binary
+also passed in a verified private kernel network namespace: a simulated group
+provider supplies an actual interface; an encrypted BLE-style duplex offer moves
+to real TCP, exchanges introduction/ack and channel-drain frames, then validates
+an encrypted keepalive with the original keys and sequence counters. Ordinary LAN
+policy excludes the group interface, so only the dedicated group path can bind it.
+The first fixture run lacked an up loopback interface; fixing that isolated
+namespace setup made the targeted scenario pass in 0.23 seconds.
+
+This is software negotiation/channel migration evidence, not over-the-air WPS,
+physical Android acceptance or a complete direct-mode claim. Device-name-only
+hosting and the receiver's dynamic client-role path remain active implementation
+work. The live demo and installed packages remain unchanged.
+
+2026-10-07 integrated runner: `python3 packaging/ci/network-lifecycle.py`
+passed all four isolated kernel fixtures locally: IPv6-only P2P readiness,
+DHCP without router/DNS options, live LAN address/link reconciliation, and
+receiver-hosted Direct upgrade with encrypted sequence continuity. The runner
+derives test executables from Cargo JSON and is wired into Linux CI; remote CI
+has not run for these unpushed changes. No physical radio acceptance is implied.

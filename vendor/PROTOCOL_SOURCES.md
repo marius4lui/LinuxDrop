@@ -162,3 +162,11 @@ uses LinuxDrop's leased supplicant P2P group-owner operation, retaining its clea
 and exclusivity guard. Ordinary WIFI_HOTSPOT hosting continues through NM. The
 advertised direct SSID/passphrase/channel come from the actual running group.
 No additional upstream code was imported for this change.
+
+
+2026-10-07 local Quick Share policy: connection media/metadata now use capabilities
+from the helper's reserved radio. Dynamic host selection honors peer media,
+explicit client-role exclusions and password-auth compatibility. Receive-side
+hosting can use the actual supplicant group; both directions share an owned-network
+credential generator. A private kernel/duplex regression exercises encrypted
+receive-side direct-to-TCP migration. No additional upstream code imported.

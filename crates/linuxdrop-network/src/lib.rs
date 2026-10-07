@@ -1,6 +1,17 @@
 //! Shared network selection and bounded bandwidth policy; no radio mutations.
 pub mod nm;
 pub mod p2p;
+/// Passive capabilities of the specific radio reserved for direct upgrades.
+/// An absent/older helper field decodes conservatively to no supported roles.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DirectWifiCapabilities {
+    pub station: bool,
+    pub hotspot: bool,
+    pub p2p_group_owner: bool,
+    pub p2p_client: bool,
+    pub frequencies: Vec<u32>,
+}
 pub struct P2pConnection {
     pub interface: String,
     pub ipv4_address: Option<Ipv4Addr>,

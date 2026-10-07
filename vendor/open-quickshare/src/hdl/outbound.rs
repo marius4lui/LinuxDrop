@@ -367,36 +367,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
 
     pub async fn send_connection_request(&mut self) -> Result<(), anyhow::Error> {
         let device_name = DEVICE_NAME.read().unwrap().clone();
-        // Experiment knob for the paired-key-disconnect hunt: `PACKET_SEND_META`
-        // = `plain` (no medium_metadata at all), `norole` (metadata without the
-        // host-role/auth fields), `linux` (full metadata; only the os_info shim
-        // is dropped, see send of the connection response). Unset = default.
-        let meta_exp = std::env::var("PACKET_SEND_META")
-            .ok()
-            .map(|v| v.to_ascii_lowercase());
-        let medium_metadata = match meta_exp.as_deref() {
-            Some("plain") => None,
-            Some("norole") => Some(location_nearby_connections::MediumMetadata {
-                supports_5_ghz: Some(true),
-                ip_address: crate::utils::local_lan_ip().map(crate::lan_policy::address_bytes),
-                ap_frequency: Some(-1),
-                ..Default::default()
-            }),
-            _ => Some(location_nearby_connections::MediumMetadata {
-                supports_5_ghz: Some(true),
-                ip_address: crate::utils::local_lan_ip().map(crate::lan_policy::address_bytes),
-                ap_frequency: Some(-1),
-                medium_role: Some(location_nearby_connections::MediumRole {
-                    support_wifi_direct_group_owner: Some(true),
-                    support_wifi_hotspot_host: Some(true),
-                    ..Default::default()
-                }),
-                supported_wifi_direct_auth_types: vec![
-                    location_nearby_connections::medium_metadata::WifiDirectAuthType::WifiDirectWithPassword.into(),
-                ],
-                ..Default::default()
-            }),
-        };
+        let medium_metadata = Some(crate::hdl::upgrade_metadata());
         let request = location_nearby_connections::OfflineFrame {
             version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
             v1: Some(location_nearby_connections::V1Frame {
@@ -1291,17 +1262,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                         .upgrade_path_info
                         .as_ref()
                         .and_then(|u| u.upgrade_path_request.as_ref());
-                    let has_wifi_direct = request
-                        .map(|r| r.mediums.iter().any(|m| *m == UpMedium::WifiDirect as i32))
-                        .unwrap_or(false);
-                    let phone_role = request
-                        .and_then(|r| r.medium_meta_data.as_ref())
-                        .and_then(|m| m.medium_role.as_ref());
-                    info!(
-                        "BWU(send): phone requested a role switch (we host); wifi_direct={has_wifi_direct} phone_role={phone_role:?}"
-                    );
+                    let selected = request.and_then(|request| {
+                        crate::hdl::select_host_medium(
+                            &request.mediums,
+                            request.medium_meta_data.as_ref(),
+                        )
+                    });
                     #[cfg(all(feature = "experimental", target_os = "linux"))]
-                    return self.host_wifi_upgrade(has_wifi_direct).await;
+                    if let Some(medium) = selected {
+                        return self.host_wifi_upgrade(medium == UpMedium::WifiDirect).await;
+                    } else {
+                        // A role switch cannot invent a medium the peer did not
+                        // request or a host role our reserved radio cannot perform.
+                        let _ = self
+                            .encrypt_and_send(&Self::bwu_frame(
+                                EventType::UpgradeFailure,
+                                bwu.upgrade_path_info.clone(),
+                                None,
+                            ))
+                            .await;
+                        return Ok(false);
+                    }
                     #[cfg(not(all(feature = "experimental", target_os = "linux")))]
                     return Ok(false);
                 }
@@ -1434,9 +1415,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
     /// receiver share no LAN. The hotspot lives until the transfer ends.
     #[cfg(all(feature = "experimental", target_os = "linux"))]
     async fn host_wifi_upgrade(&mut self, wifi_direct: bool) -> Result<bool, anyhow::Error> {
-        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::{
-            Medium as UpMedium, WifiDirectCredentials, WifiHotspotCredentials,
-        };
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium as UpMedium;
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
             EventType, UpgradePathInfo,
         };
@@ -1471,41 +1450,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         };
         let listener = crate::hdl::listen_hosted(&guard).await?;
         let port = listener.port();
-        let address_candidates = crate::hdl::hosted_candidates(&listener);
         info!(
             "BWU(send): hosting '{}' as {:?} (gateway {}:{port}); waiting for the phone to join",
             guard.ssid, medium, guard.gateway
         );
 
-        let mut info = UpgradePathInfo {
-            medium: Some(medium.into()),
-            supports_client_introduction_ack: Some(true),
-            ..Default::default()
-        };
-        if wifi_direct {
-            info.wifi_direct_credentials = Some(WifiDirectCredentials {
-                ssid: Some(guard.ssid.clone()),
-                password: Some(guard.password.clone()),
-                port: Some(port as i32),
-                frequency: Some(guard.frequency),
-                gateway: Some(guard.gateway.to_string()),
-                ip_v6_address: address_candidates.iter().find_map(|candidate| {
-                    let ip = crate::lan_policy::decode_ip(candidate.ip_address()).ok()?;
-                    matches!(ip, std::net::IpAddr::V6(ip) if ip.is_unicast_link_local())
-                        .then(|| candidate.ip_address().to_vec())
-                }),
-                ..Default::default()
-            });
-        } else {
-            info.wifi_hotspot_credentials = Some(WifiHotspotCredentials {
-                ssid: Some(guard.ssid.clone()),
-                password: Some(guard.password.clone()),
-                port: Some(port as i32),
-                gateway: Some(guard.gateway.to_string()),
-                frequency: Some(guard.frequency),
-                address_candidates,
-            });
-        }
+        let info = crate::hdl::hosted_offer(&guard, &listener, medium)?;
         self.encrypt_and_send(&Self::bwu_frame(
             EventType::UpgradePathAvailable,
             Some(info),

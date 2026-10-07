@@ -313,7 +313,7 @@ impl TransferConnector {
             // same LAN → WIFI_LAN (we connect to its ip:port); no shared LAN →
             // WIFI_DIRECT (it hosts its own group, we join it). Either way the
             // payload leaves BLE for Wi-Fi speed.
-            or.set_mediums(vec![5, 8, 3, 10]);
+            or.set_mediums(crate::hdl::upgrade_mediums());
         }
 
         or.send_connection_request().await?;
