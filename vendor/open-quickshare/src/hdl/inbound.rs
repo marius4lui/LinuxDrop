@@ -11,7 +11,7 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use prost::Message;
 use rand::Rng;
 use sha2::{Digest, Sha256, Sha512};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 
@@ -147,11 +147,75 @@ async fn send_frame_on<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Retain partially read framing across competing upgrade/control futures.
+/// Cancelling `read` never discards bytes already consumed from the transport.
+#[derive(Debug, Default)]
+struct FrameReader {
+    length: [u8; 4],
+    length_read: usize,
+    body: Vec<u8>,
+    body_read: usize,
+    deadline: Option<tokio::time::Instant>,
+}
+impl FrameReader {
+    async fn read<S: AsyncRead + Unpin>(&mut self, socket: &mut S) -> anyhow::Result<Vec<u8>> {
+        while self.length_read < 4 {
+            let read = socket.read(&mut self.length[self.length_read..]);
+            let count = if let Some(deadline) = self.deadline {
+                tokio::time::timeout_at(deadline, read).await??
+            } else {
+                read.await?
+            };
+            anyhow::ensure!(count != 0, "Peer closed connection");
+            self.deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_secs(30));
+            self.length_read += count;
+        }
+        let length = u32::from_be_bytes(self.length) as usize;
+        anyhow::ensure!(
+            length > 0 && length <= SANE_FRAME_LENGTH as usize,
+            "Invalid frame length {length}"
+        );
+        if self.body.is_empty() {
+            self.body.resize(length, 0);
+        }
+        while self.body_read < length {
+            let count = tokio::time::timeout_at(
+                self.deadline.expect("frame header was read"),
+                socket.read(&mut self.body[self.body_read..]),
+            )
+            .await??;
+            anyhow::ensure!(count != 0, "Peer closed an incomplete frame");
+            self.body_read += count;
+        }
+        self.length_read = 0;
+        self.body_read = 0;
+        self.deadline = None;
+        Ok(std::mem::take(&mut self.body))
+    }
+}
+
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+#[derive(Clone, Copy)]
+pub(crate) struct InboundUpgrade {
+    port: u16,
+    endpoint_id: Option<[u8; 4]>,
+}
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+impl InboundUpgrade {
+    pub(crate) fn new(advertisement: &[u8], port: u16) -> Self {
+        Self {
+            port,
+            endpoint_id: crate::hdl::decode_receiver_advert(advertisement)
+                .map(|advert| advert.endpoint_id),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct InboundRequest<S = TcpStream> {
     socket: S,
-    length_buf: [u8; 4],
-    length_read: usize,
+    framing: FrameReader,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
@@ -159,9 +223,11 @@ pub struct InboundRequest<S = TcpStream> {
     /// Set (BLE sessions) to enable offering a Wi-Fi bandwidth upgrade once the
     /// encrypted connection is established.
     bwu_tcp_port: Option<u16>,
+    local_endpoint_id: Option<[u8; 4]>,
     /// Set by the state machine when it's time to run the bandwidth-upgrade
     /// handoff; consumed by the BLE session loop (which owns a MigratableStream).
     bwu_pending: bool,
+    bwu_peer_last_write: bool,
     /// Wi-Fi upgrade retries used so far (the phone's Wi-Fi often returns a
     /// few seconds into a BLE-only transfer).
     bwu_attempts: u8,
@@ -182,6 +248,8 @@ pub struct InboundRequest<S = TcpStream> {
     /// transfer; torn down (and Wi-Fi restored) on drop.
     #[cfg(all(feature = "experimental", target_os = "linux"))]
     hotspot_guard: Option<crate::hdl::HotspotGuard>,
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
+    join_guard: Option<crate::hdl::JoinGuard>,
 }
 
 impl<S> Drop for InboundRequest<S> {
@@ -211,8 +279,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
 
         Self {
             socket,
-            length_buf: [0; 4],
-            length_read: 0,
+            framing: FrameReader::default(),
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -225,7 +292,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             receiver,
             bandwidth: crate::payload_budget::current(),
             bwu_tcp_port: None,
+            local_endpoint_id: None,
             bwu_pending: false,
+            bwu_peer_last_write: false,
             bwu_attempts: 0,
             post_accept_lan_tries: 0,
             bwu_retry_at: None,
@@ -235,12 +304,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             bwu_try_hotspot: false,
             #[cfg(all(feature = "experimental", target_os = "linux"))]
             hotspot_guard: None,
+            #[cfg(all(feature = "experimental", target_os = "linux"))]
+            join_guard: None,
         }
     }
 
     /// Enable Wi-Fi bandwidth upgrade for this (BLE) session.
     pub fn set_bwu_tcp_port(&mut self, port: u16) {
         self.bwu_tcp_port = Some(port);
+    }
+
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
+    pub(crate) fn set_bwu_config(&mut self, config: InboundUpgrade) {
+        self.set_bwu_tcp_port(config.port);
+        self.local_endpoint_id = config.endpoint_id;
     }
 
     /// Consume the "run the bandwidth upgrade now" flag.
@@ -388,16 +465,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
     /// OfflineFrame (advancing client_seq). Used to drain the BLE channel during a
     /// bandwidth upgrade without dispatching to the payload state machine.
     async fn read_encrypted_offline_frame(&mut self) -> Result<OfflineFrame, anyhow::Error> {
-        let mut len_buf = [0u8; 4];
-        stream_read_exact(&mut self.socket, &mut len_buf).await?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-        if msg_len == 0 || msg_len > SANE_FRAME_LENGTH as usize {
-            return Err(anyhow!("bad frame length {msg_len}"));
-        }
-        let mut data = vec![0u8; msg_len];
-        stream_read_exact(&mut self.socket, &mut data).await?;
+        let data = self.framing.read(&mut self.socket).await?;
+        self.decrypt_offline_frame(&data).await
+    }
 
-        let smsg = SecureMessage::decode(&*data)?;
+    async fn decrypt_offline_frame(&mut self, data: &[u8]) -> anyhow::Result<OfflineFrame> {
+        let smsg = SecureMessage::decode(data)?;
         let mut hmac = HmacSha256::new_from_slice(
             self.state
                 .recv_hmac_key
@@ -484,35 +557,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
                     }
                 }
             },
-            h = tokio::io::AsyncReadExt::read(&mut self.socket, &mut self.length_buf[self.length_read..]) => {
-                let n = h?;
-                if n == 0 { return Err(anyhow!("Peer closed connection")); }
-                self.length_read += n;
-                if self.length_read < 4 { return Ok(()); }
-                let length_buf = self.length_buf; self.length_read = 0;
-                self._handle(length_buf).await?
+            frame = self.framing.read(&mut self.socket) => {
+                self.process_frame(frame?).await?;
             }
         }
-
         Ok(())
     }
 
-    pub async fn _handle(&mut self, length_buf: [u8; 4]) -> Result<(), anyhow::Error> {
-        let msg_length = u32::from_be_bytes(length_buf) as usize;
-        // Ensure the message length is not unreasonably big to avoid allocation attacks
-        if msg_length > SANE_FRAME_LENGTH as usize {
-            error!("Message length too big");
-            return Err(anyhow!("value"));
-        }
-
-        // Allocate buffer for the actual message and read it
-        let mut frame_data = vec![0u8; msg_length];
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            stream_read_exact(&mut self.socket, &mut frame_data),
-        )
-        .await??;
-
+    async fn process_frame(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -2002,24 +2054,19 @@ impl InboundRequest<crate::hdl::MigratableStream> {
         ))
         .await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-        let mut peer_last_write = false;
+        let mut peer_last_write = self.bwu_peer_last_write;
+        if peer_last_write {
+            self.encrypt_and_send(&Self::bwu_frame(
+                EventType::SafeToClosePriorChannel,
+                None,
+                None,
+            ))
+            .await?;
+        }
         let mut peer_safe_to_close = false;
         while !(peer_last_write && peer_safe_to_close) {
-            let offline = match tokio::time::timeout_at(
-                deadline,
-                self.read_encrypted_offline_frame(),
-            )
-            .await
-            {
-                Ok(Ok(f)) => f,
-                Ok(Err(e)) => {
-                    debug!("BWU drain: prior channel ended ({e})");
-                    break;
-                }
-                Err(_) => {
-                    warn!("BWU drain: deadline reached; proceeding with the swap");
-                    break;
-                }
+            let Some(offline) = self.next_upgrade_frame(deadline).await? else {
+                anyhow::bail!("Prior channel did not finish bandwidth upgrade before its deadline");
             };
             match offline.v1.as_ref().map(|v| v.r#type()) {
                 Some(
@@ -2034,13 +2081,12 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                         Some(EventType::LastWriteToPriorChannel) => {
                             debug!("BWU drain: peer LAST_WRITE → sending SAFE_TO_CLOSE");
                             peer_last_write = true;
-                            let _ = self
-                                .encrypt_and_send(&Self::bwu_frame(
-                                    EventType::SafeToClosePriorChannel,
-                                    None,
-                                    None,
-                                ))
-                                .await;
+                            self.encrypt_and_send(&Self::bwu_frame(
+                                EventType::SafeToClosePriorChannel,
+                                None,
+                                None,
+                            ))
+                            .await?;
                         }
                         Some(EventType::SafeToClosePriorChannel) => {
                             debug!("BWU drain: peer SAFE_TO_CLOSE");
@@ -2053,11 +2099,8 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                     // Never write to a channel we already LAST_WRITE'd.
                 }
                 _ => {
-                    // In-flight payload (and any late handshake frames): process
-                    // so nothing is lost across the switch.
-                    if let Err(e) = self.process_offline_frame(offline).await {
-                        debug!("BWU drain: error processing frame: {e}");
-                    }
+                    anyhow::ensure!(!peer_last_write, "Payload after prior-channel LAST_WRITE");
+                    self.process_offline_frame(offline).await?;
                 }
             }
         }
@@ -2067,8 +2110,8 @@ impl InboundRequest<crate::hdl::MigratableStream> {
     /// Run the Wi-Fi bandwidth upgrade: offer a TCP path over the (encrypted) BLE
     /// channel, accept the phone, exchange the plaintext CLIENT_INTRODUCTION/ACK,
     /// drain the BLE channel, then swap the socket to TCP so the (large) payload
-    /// streams over Wi-Fi with the same keys/sequence numbers. On failure the
-    /// session stays on BLE — never worse than BLE-only.
+    /// streams over Wi-Fi with the same keys/sequence numbers. Setup failures
+    /// retain BLE; a broken encrypted handoff ends the session.
     pub async fn do_bwu(&mut self) -> Result<(), anyhow::Error> {
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
 
@@ -2158,9 +2201,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                     }
                     // Keep the handshake moving (paired-key frames, keep-alives,
                     // even the consent response arrive here).
-                    if let Err(e) = self.process_offline_frame(offline).await {
-                        debug!("BWU wait: error processing frame: {e}");
-                    }
+                    self.process_offline_frame(offline).await?;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     warn!("BWU: no TCP upgrade within timeout; staying on BLE");
@@ -2223,9 +2264,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
         let Some(medium) =
             crate::hdl::select_host_medium(&self.remote_mediums, self.remote_metadata.as_ref())
         else {
-            self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
-            self.schedule_bwu_retry();
-            return Ok(());
+            return self.request_peer_upgrade().await;
         };
         let hosted = if medium == UpMedium::WifiDirect {
             crate::hdl::start_direct_group().await
@@ -2236,10 +2275,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             Ok(g) => g,
             Err(e) => {
                 warn!("BWU: couldn't host {medium:?} ({e}); staying on BLE");
-                // Only fall back to the LAN offer if we actually have a LAN.
-                self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
-                self.schedule_bwu_retry();
-                return Ok(());
+                return self.request_peer_upgrade().await;
             }
         };
         let listener = crate::hdl::listen_hosted(&guard).await?;
@@ -2292,9 +2328,7 @@ impl InboundRequest<crate::hdl::MigratableStream> {
                         self.schedule_bwu_retry();
                         return Ok(());
                     }
-                    if let Err(e) = self.process_offline_frame(offline).await {
-                        debug!("BWU hotspot wait: error processing frame: {e}");
-                    }
+                    self.process_offline_frame(offline).await?;
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     warn!("BWU: sender never joined our hotspot; staying on BLE");
@@ -2349,3 +2383,38 @@ impl InboundRequest<crate::hdl::MigratableStream> {
 #[cfg(all(test, feature = "experimental", target_os = "linux"))]
 #[path = "inbound_bwu_tests.rs"]
 mod bwu_tests;
+
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+#[path = "inbound_client_upgrade.rs"]
+mod client_upgrade;
+
+#[cfg(test)]
+mod framing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_reads_retain_partial_header_and_body() {
+        let (mut writer, mut socket) = tokio::io::duplex(64);
+        let mut framing = FrameReader::default();
+        writer.write_all(&[0, 0]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), framing.read(&mut socket))
+                .await
+                .is_err()
+        );
+        writer.write_all(&[0, 6, 1, 2, 3]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), framing.read(&mut socket))
+                .await
+                .is_err()
+        );
+        writer.write_all(&[4, 5, 6, 0, 0, 0, 1, 7]).await.unwrap();
+        assert_eq!(
+            framing.read(&mut socket).await.unwrap(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(framing.read(&mut socket).await.unwrap(), vec![7]);
+        writer.write_all(&[0, 0, 0, 0]).await.unwrap();
+        assert!(framing.read(&mut socket).await.is_err());
+    }
+}

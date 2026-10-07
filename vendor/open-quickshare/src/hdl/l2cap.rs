@@ -180,7 +180,7 @@ impl L2capServer {
                             // as it does from GATT sessions.
                             let _suppressor = BleScanSuppressor::new();
                             if let Err(e) =
-                                serve_connection(stream, &advert, sender, tcp_port, sessions).await
+                                serve_connection(stream, &advert, sender, crate::hdl::InboundUpgrade::new(&advert, tcp_port), sessions).await
                             {
                                 debug!("{INNER_NAME}: connection from {} ended: {e}", peer.addr);
                             }
@@ -225,7 +225,7 @@ async fn serve_connection(
     mut stream: Stream,
     advert: &[u8],
     sender: Sender<ChannelMessage>,
-    tcp_port: u16,
+    upgrade: crate::hdl::InboundUpgrade,
     tasks: BluetoothTasks,
 ) -> Result<(), anyhow::Error> {
     // Sniff the dialect from the first four bytes (see the type-level docs).
@@ -237,14 +237,14 @@ async fn serve_connection(
     if head[0] == 0x00 && head[1] == 0x00 {
         // u32-BE frame lengths: the GmsCore BLE-socket stream.
         debug!("{INNER_NAME}: client speaks u32-framed packets");
-        serve_ble_socket(stream, leftover, advert, sender, tcp_port, tasks).await
+        serve_ble_socket(stream, leftover, advert, sender, upgrade, tasks).await
     } else if head[0] == 0x00 {
         // u16-BE packet lengths around the command protocol.
         debug!("{INNER_NAME}: client speaks length-prefixed command packets");
-        serve_commands(stream, leftover, true, advert, sender, tcp_port).await
+        serve_commands(stream, leftover, true, advert, sender, upgrade).await
     } else {
         debug!("{INNER_NAME}: client speaks bare command packets");
-        serve_commands(stream, leftover, false, advert, sender, tcp_port).await
+        serve_commands(stream, leftover, false, advert, sender, upgrade).await
     }
 }
 
@@ -260,7 +260,7 @@ async fn serve_ble_socket(
     mut leftover: Vec<u8>,
     advert: &[u8],
     sender: Sender<ChannelMessage>,
-    tcp_port: u16,
+    upgrade: crate::hdl::InboundUpgrade,
     tasks: BluetoothTasks,
 ) -> Result<(), anyhow::Error> {
     loop {
@@ -274,8 +274,7 @@ async fn serve_ble_socket(
 
         // Weave-style messages: [00 00 00|service_hash][data].
         if msg.len() >= 3 && (msg[..3] == [0, 0, 0] || msg[..3] == SVC_HASH) {
-            return serve_weave_messages(stream, leftover, Some(msg), sender, tcp_port, tasks)
-                .await;
+            return serve_weave_messages(stream, leftover, Some(msg), sender, upgrade, tasks).await;
         }
 
         // Otherwise: a u32-framed BleL2capPacket command.
@@ -310,7 +309,7 @@ async fn serve_ble_socket(
                 // weave-style messages (INTRODUCTION control frame first, then
                 // service-hash-tagged entries) -- not the bare endpoint
                 // channel.
-                return serve_weave_messages(stream, leftover, None, sender, tcp_port, tasks).await;
+                return serve_weave_messages(stream, leftover, None, sender, upgrade, tasks).await;
             }
             other => anyhow::bail!("unsupported framed command {other:?}"),
         }
@@ -333,7 +332,7 @@ async fn serve_weave_messages(
     mut leftover: Vec<u8>,
     first_msg: Option<Vec<u8>>,
     sender: Sender<ChannelMessage>,
-    tcp_port: u16,
+    upgrade: crate::hdl::InboundUpgrade,
     tasks: BluetoothTasks,
 ) -> Result<(), anyhow::Error> {
     let (inbound_side, local) = tokio::io::duplex(64 * 1024);
@@ -341,7 +340,7 @@ async fn serve_weave_messages(
     if !tasks.spawn(run_inbound(
         crate::hdl::MigratableStream::Ble(inbound_side),
         sender,
-        tcp_port,
+        upgrade,
     )) {
         anyhow::bail!("Bluetooth session capacity exhausted or server stopping");
     }
@@ -455,7 +454,7 @@ async fn serve_commands(
     length_prefixed: bool,
     advert: &[u8],
     sender: Sender<ChannelMessage>,
-    tcp_port: u16,
+    upgrade: crate::hdl::InboundUpgrade,
 ) -> Result<(), anyhow::Error> {
     loop {
         let packet: Vec<u8> = if length_prefixed {
@@ -534,12 +533,7 @@ async fn serve_commands(
                         leftover.len()
                     );
                 }
-                run_inbound(
-                    crate::hdl::MigratableStream::L2cap(stream),
-                    sender,
-                    tcp_port,
-                )
-                .await;
+                run_inbound(crate::hdl::MigratableStream::L2cap(stream), sender, upgrade).await;
                 return Ok(());
             }
             other => anyhow::bail!("unsupported command {other}"),
@@ -568,10 +562,10 @@ async fn send_packet(
 async fn run_inbound(
     socket: crate::hdl::MigratableStream,
     sender: Sender<ChannelMessage>,
-    tcp_port: u16,
+    upgrade: crate::hdl::InboundUpgrade,
 ) {
     let mut ir = InboundRequest::new(socket, uuid::Uuid::new_v4().to_string(), sender);
-    ir.set_bwu_tcp_port(tcp_port);
+    ir.set_bwu_config(upgrade);
     let session_shutdown = crate::session_shutdown();
     loop {
         if let Err(e) = tokio::select! { _ = session_shutdown.cancelled() => break, result = ir.handle() => result }
@@ -584,7 +578,8 @@ async fn run_inbound(
         if ir.take_bwu_pending() || ir.bwu_retry_due() {
             if let Err(e) = tokio::select! { _ = session_shutdown.cancelled() => break, result = ir.do_bwu() => result }
             {
-                warn!("{INNER_NAME}: BWU failed, staying on L2CAP: {e}");
+                warn!("{INNER_NAME}: bandwidth upgrade ended the session: {e}");
+                break;
             }
         }
     }

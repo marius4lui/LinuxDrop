@@ -170,3 +170,12 @@ explicit client-role exclusions and password-auth compatibility. Receive-side
 hosting can use the actual supplicant group; both directions share an owned-network
 credential generator. A private kernel/duplex regression exercises encrypted
 receive-side direct-to-TCP migration. No additional upstream code imported.
+
+
+2026-10-07 local receive-side role reversal: GATT/L2CAP retain the advertised
+local endpoint identity. An accepted receiver can request sender-hosted upgrade
+media, join through existing owned NM/P2P guards, validate the optional TCP
+introduction ACK and preserve encrypted payload/sequence continuity. Partial
+frame reads survive competing futures; incomplete handoffs end the session.
+Isolated kernel tests include cancellation and failed-upgrade cleanup. No new
+upstream code imported; Google protocol references are in the completion log.

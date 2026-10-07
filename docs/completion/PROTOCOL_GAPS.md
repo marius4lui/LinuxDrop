@@ -34,11 +34,12 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
 - [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
+- [x] Receiver-initiated dynamic role switching with advertised local identity, reserved-radio joining, consent, cancellation and encrypted channel continuity.
 - [ ] WPS PIN/device-name Wi-Fi Direct authentication path, P2P group discovery and negotiated group connection.
 - [x] Exclusive hardware lease and transfer semaphore for radio-changing upgrades, unique owned NetworkManager profiles and cancellation cleanup; isolated D-Bus lifecycle test passed.
 - [ ] Protocol metadata and upgrade failure regression tests beyond existing TCP handshake simulator.
 
-Google's wire schema distinguishes password-based joining from device-name discovery. `device_name` is field 9; field 8 is an optional PIN reserved for future use with the device-name mode, not a requirement that every such offer includes a PIN. The engine now decodes these fields and routes empty-SSID offers through the reserved supplicant helper, with PBC for an empty PIN. Discovery, group identity, cancellation, DHCP and cleanup paths exist. Password-based group hosting, capability-based role advertisement and IPv6/address-candidate paths are now implemented and have scoped simulation evidence below. Remaining work includes device-name-authenticated hosting, receiver-as-client dynamic role switching and supplicant owner-loss recovery. Password-based joining and an ordinary NetworkManager AP are not labelled complete Wi-Fi Direct conformance.
+Google's wire schema distinguishes password-based joining from device-name discovery. `device_name` is field 9; field 8 is an optional PIN reserved for future use with the device-name mode, not a requirement that every such offer includes a PIN. The engine now decodes these fields and routes empty-SSID offers through the reserved supplicant helper, with PBC for an empty PIN. Discovery, group identity, cancellation, DHCP and cleanup paths exist. Password-based group hosting, capability-based role advertisement and IPv6/address-candidate paths are now implemented and have scoped simulation evidence below. Remaining work includes device-name-authenticated hosting and full peer interoperability. Receiver-as-client dynamic role switching and supplicant owner-change handling have scoped implementation and simulation evidence below. Password-based joining and an ordinary NetworkManager AP are not labelled complete Wi-Fi Direct conformance.
 
 ## AirDrop / AWDL
 
@@ -688,3 +689,48 @@ complete Wi-Fi Direct role/authentication interoperability.
 
 The generation model follows the [D-Bus name/owner specification](https://dbus.freedesktop.org/doc/dbus-specification.html#message-bus-names)
 and the [supplicant P2P D-Bus API](https://w1.fi/wpa_supplicant/devel/dbus.html).
+
+## Receiver joins a sender-hosted upgrade, 2026-10-07
+
+After file consent, a receiver that cannot host a suitable network can now send
+UPGRADE_PATH_REQUEST and join the sender's offered direct group or hotspot. The
+request intersects reserved-radio capabilities with explicitly advertised peer
+host roles and compatible authentication. Password joining uses the existing
+owned NetworkManager path; device-name/PBC joining uses the reserved P2P helper.
+No request is sent without the receiver's actual advertised endpoint identity,
+which is carried through GATT and all supported L2CAP entry paths.
+
+While joining and connecting, encrypted BLE traffic continues through the payload
+assembler and local cancellation remains responsive. Framing retains partial
+headers and bodies across competing futures. Client introductions keep encryption
+enabled; an advertised introduction ACK is required and validated. Legacy peers
+that do not advertise ACK support do not incur an ACK read. Invalid offers or
+failed setup send UPGRADE_FAILURE and release the owned network. An incomplete
+prior-channel drain ends the session instead of claiming a successful switch.
+Early LAST_WRITE arriving before the TCP ACK is retained for the final handoff.
+
+The private kernel fixture now covers both receiver roles. Its new client case
+uses real interface-bound TCP sockets and encrypted frames with a simulated P2P
+helper. Scenarios cover consent gating, the exact advertised endpoint identity,
+24 buffered payload chunks across setup, normal/no-ACK transitions, invalid ACK
+and BLE recovery, local cancellation and cleanup, truncated drain, unrequested
+media and invalid addresses. Separate tests cover interrupted frame reads and
+role/authentication selection. All adapter-changing operations remain confined
+to the fixture namespace; no physical radio or Android device is simulated as
+verified hardware.
+
+The implementation follows the event and role definitions in Google's
+[wire schema](https://github.com/google/nearby/blob/main/connections/implementation/proto/offline_wire_formats.proto)
+and ACK/role-switch behavior in its
+[bandwidth-upgrade manager](https://github.com/google/nearby/blob/main/connections/implementation/bwu_manager.cc).
+No additional upstream implementation code was copied. Device-name hosting,
+remaining outbound handoff validation, full Bluetooth recovery/resource
+coordination and physical interoperability remain separate completion work.
+
+Validation for this pass: nine protocol-library unit tests, sixteen Quick Share
+adapter/integration tests (including the real UKEY2/file transfer), and both
+private-kernel receiver-upgrade cases passed. The client case contains seven
+success/failure scenarios. Protocol library/test Clippy and Quick Share all-target
+Clippy passed with warnings denied; the unrelated upstream `tx_probe` example
+still emits its existing dead-field warning when included in a combined
+all-target invocation. Edited Rust files were formatted and diff checks passed.

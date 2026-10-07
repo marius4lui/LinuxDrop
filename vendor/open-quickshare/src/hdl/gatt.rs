@@ -133,7 +133,7 @@ impl ReceiverGattServer {
         let chan = Arc::new(Mutex::new(WeaveChannel::new()));
         let write_chan = chan.clone();
         let sender = self.sender.clone();
-        let tcp_port = self.tcp_port;
+        let upgrade = crate::hdl::InboundUpgrade::new(&self.advertisement, self.tcp_port);
         let adapter = self.adapter.clone();
         let slot0_adapter = self.adapter.clone();
         // Devices whose slot-0 connection we're already waiting out (a long
@@ -232,7 +232,7 @@ impl ReceiverGattServer {
                                     let sessions = tasks.clone();
                                     tasks.spawn(async move {
                                         weave_session(
-                                            notifier, chan, sender, tcp_port, adapter, sessions,
+                                            notifier, chan, sender, upgrade, adapter, sessions,
                                         )
                                         .await;
                                     });
@@ -278,7 +278,7 @@ async fn weave_session(
     notifier: CharacteristicNotifier,
     chan: Arc<Mutex<WeaveChannel>>,
     sender: Sender<ChannelMessage>,
-    tcp_port: u16,
+    upgrade: crate::hdl::InboundUpgrade,
     adapter: Arc<Adapter>,
     tasks: BluetoothTasks,
 ) {
@@ -316,7 +316,7 @@ async fn weave_session(
     // pauses our advertisement outright.
     let _suppressor = BleScanSuppressor::new();
 
-    let peer = weave_session_inner(notifier, &mut rx, ctk, sender, tcp_port, tasks.clone()).await;
+    let peer = weave_session_inner(notifier, &mut rx, ctk, sender, upgrade, tasks.clone()).await;
 
     // Hand a fresh channel back, dropping anything this connection left queued
     // along with the old one.
@@ -372,7 +372,7 @@ async fn weave_session_inner(
     rx: &mut Receiver<(Address, Vec<u8>)>,
     ctk: CancellationToken,
     sender: Sender<ChannelMessage>,
-    tcp_port: u16,
+    upgrade: crate::hdl::InboundUpgrade,
     tasks: BluetoothTasks,
 ) -> Option<Address> {
     info!("{INNER_NAME}: weave: notify session open");
@@ -456,7 +456,7 @@ async fn weave_session_inner(
             uuid::Uuid::new_v4().to_string(),
             isender,
         );
-        ir.set_bwu_tcp_port(tcp_port);
+        ir.set_bwu_config(upgrade);
         let session_shutdown = crate::session_shutdown();
         loop {
             if let Err(e) = tokio::select! { _ = session_shutdown.cancelled() => break, result = ir.handle() => result }
@@ -470,7 +470,8 @@ async fn weave_session_inner(
             if ir.take_bwu_pending() || ir.bwu_retry_due() {
                 if let Err(e) = tokio::select! { _ = session_shutdown.cancelled() => break, result = ir.do_bwu() => result }
                 {
-                    warn!("{INNER_NAME}: BWU failed, staying on BLE: {e}");
+                    warn!("{INNER_NAME}: bandwidth upgrade ended the session: {e}");
+                    break;
                 }
             }
         }
