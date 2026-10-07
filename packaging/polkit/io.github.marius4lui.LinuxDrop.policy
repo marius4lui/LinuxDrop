@@ -4,8 +4,12 @@
   <vendor>LinuxDrop</vendor>
   <vendor_url>https://github.com/marius4lui/LinuxDrop</vendor_url>
   <action id="io.github.marius4lui.LinuxDrop.manage-radio">
-    <description>Use a dedicated wireless adapter for AirDrop</description>
+    <description>Use a dedicated wireless adapter for nearby sharing</description>
+    <description xml:lang="de">Einen separaten WLAN-Adapter für LinuxDrop verwenden</description>
     <message>Authentication is required to let LinuxDrop configure an idle wireless adapter.</message>
+    <message xml:lang="de">Eine Administrator-Bestätigung ist erforderlich, damit LinuxDrop einen unbenutzten WLAN-Adapter konfigurieren kann.</message>
     <defaults><allow_any>no</allow_any><allow_inactive>no</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <!-- The non-root mechanism may check this action for its peer's identity. -->
+    <annotate key="org.freedesktop.policykit.owner">unix-user:linuxdrop-netd</annotate>
   </action>
 </policyconfig>

@@ -35,7 +35,11 @@ Remaining code/evidence requirements:
   now passes real unit identity/capabilities, restart/stop/start, malformed journal
   recovery and inactive-user denial; see
   [installed service evidence](../acceptance/BOOTED_UBUNTU_SERVICE_2026-10-07.md).
-  Interactive Polkit/session matrix and booted package upgrade/removal remain open.
+  Real terminal-agent Polkit authorization now passes active/inactive/seatless,
+  no-agent and wrong/correct password cases after fixing the mechanism action-owner
+  annotation; see [authorization evidence](../acceptance/POLKIT_AUTHORIZATION_2026-10-07.md).
+  Graphical agent/user-service invocation, remote-session combinations and booted
+  package upgrade/removal remain open.
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.

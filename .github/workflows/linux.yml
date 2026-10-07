@@ -12,7 +12,7 @@ jobs:
       - name: Native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi busybox gjs
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi python3-pexpect busybox gjs
       - name: Rust tools
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
@@ -63,6 +63,8 @@ jobs:
           printf '%s\n' linuxdrop-systemd-acceptance-v1 | sudo tee /etc/linuxdrop-disposable-acceptance >/dev/null
           sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 python3 tests/integration/netd_systemd.py > dist/BOOTED_SERVICE.json
           cat dist/BOOTED_SERVICE.json
+          sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 python3 tests/integration/netd_polkit.py > dist/POLKIT_AUTHORIZATION.json
+          cat dist/POLKIT_AUTHORIZATION.json
           sudo apt-get remove -y linuxdrop
           test ! -e /usr/lib/systemd/system/linuxdrop-netd.service
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -70,6 +72,7 @@ jobs:
           name: linuxdrop-ubuntu-24.04
           path: |
             dist/BOOTED_SERVICE.json
+            dist/POLKIT_AUTHORIZATION.json
             dist/*.deb
             dist/*_source.tar.gz
             dist/SHA256SUMS
