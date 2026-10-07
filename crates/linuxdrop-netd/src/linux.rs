@@ -35,6 +35,7 @@ struct State {
     pending_p2p: HashMap<String, PendingP2p>,
     cancelled_p2p: std::collections::HashSet<String>,
     cleanups: HashMap<String, CleanupReceipt>,
+    group_cleanups: HashMap<String, CleanupReceipt>,
 }
 impl State {
     fn record_recovery_error(&mut self, error: String) {
@@ -64,10 +65,7 @@ async fn restore_child_and_lease(
     lease: Lease,
     child: Option<tokio::process::Child>,
 ) -> Result<(), String> {
-    if let Some(mut child) = child {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
-    }
+    reap_child(child).await?;
     restore(&lease).await
 }
 
@@ -103,10 +101,22 @@ where
     if let Some(pending) = state.pending_p2p.remove(id) {
         pending.cancel.cancel();
     }
-    let child = state.children.remove(id);
+    let group_cleanup = state.group_cleanups.get(id).cloned();
     state.cleanups.insert(id.to_owned(), receipt.clone());
     let shared = shared.clone();
     tokio::spawn(async move {
+        // A group leave already owns teardown and its child. Full retirement
+        // first waits for that operation to settle, then reads its final journal
+        // identity. A failed leave retains that identity for this retry.
+        if let Some(receipt) = group_cleanup {
+            let _ = wait_cleanup(receipt).await;
+        }
+        let (lease, child) = {
+            let mut state = shared.lock().await;
+            let current = state.leases.get(&lease.id).cloned().unwrap_or(lease);
+            let child = state.children.remove(&current.id);
+            (current, child)
+        };
         let original = lease.clone();
         // Observe panics/cancellation of the I/O task too: the supervisor retains
         // the lease and publishes a failed receipt, allowing explicit recovery.
@@ -128,6 +138,101 @@ where
         let _ = sender.send(Some(result));
     });
     receipt
+}
+
+// Leaving a P2P group preserves the parent's direct-Wi-Fi reservation. Like
+// full retirement, its worker survives a disconnected or cancelled caller.
+async fn begin_group_cleanup(shared: &Shared, id: &str) -> Result<CleanupReceipt, String> {
+    begin_group_cleanup_with(
+        shared,
+        id,
+        |lease, child| async move {
+            reap_child(child).await?;
+            restore_p2p(&lease).await
+        },
+        persist,
+    )
+    .await
+}
+
+async fn begin_group_cleanup_with<F, Fut, P>(
+    shared: &Shared,
+    id: &str,
+    operation: F,
+    journal: P,
+) -> Result<CleanupReceipt, String>
+where
+    F: FnOnce(Lease, Option<tokio::process::Child>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    P: FnOnce(&State) -> io::Result<()> + Send + 'static,
+{
+    let mut state = shared.lock().await;
+    if state.cleanups.contains_key(id) {
+        return Err("lease cleanup is in progress".into());
+    }
+    if let Some(receipt) = state.group_cleanups.get(id) {
+        return Ok(receipt.clone());
+    }
+    let lease = state.leases.get(id).ok_or("lease not found")?.clone();
+    if lease.kind != LeaseKind::DirectWifi {
+        return Err("direct Wi-Fi lease required".into());
+    }
+    if !state.attached.contains(id) {
+        return Err("lease is revoked; complete radio recovery first".into());
+    }
+    // A producer must settle before partial cleanup can start. Full retirement
+    // owns cancellation of outstanding formation. Never guess its final group.
+    if state.pending_p2p.contains_key(id) {
+        return Err("P2P group formation is still in progress".into());
+    }
+    let child = state.children.remove(id);
+    state.attached.remove(id);
+    let (sender, receipt) = tokio::sync::watch::channel(None);
+    state.group_cleanups.insert(id.to_owned(), receipt.clone());
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let original = lease.clone();
+        let mut result = tokio::spawn(async move { operation(lease, child).await })
+            .await
+            .unwrap_or_else(|error| Err(format!("Group cleanup operation stopped: {error}")));
+        let mut state = shared.lock().await;
+        if result.is_ok() {
+            let mut restored = original.clone();
+            restored.p2p_group = None;
+            state.leases.insert(original.id.clone(), restored);
+            if let Err(error) = journal(&state) {
+                state.leases.insert(original.id.clone(), original.clone());
+                result = Err(format!("Group cleanup journal update failed: {error}"));
+            }
+        }
+        if let Err(error) = &result {
+            state.record_recovery_error(format!("{}: {error}", original.interface));
+        } else {
+            state.cancelled_p2p.remove(&original.id);
+            // Full retirement may have been queued while this leave was slow.
+            // Its lease must stay unavailable until that subsequent job ends.
+            if !state.cleanups.contains_key(&original.id) {
+                state.attached.insert(original.id.clone());
+            }
+        }
+        state.group_cleanups.remove(&original.id);
+        let _ = sender.send(Some(result));
+    });
+    Ok(receipt)
+}
+
+async fn reap_child(child: Option<tokio::process::Child>) -> Result<(), String> {
+    if let Some(mut child) = child {
+        child
+            .kill()
+            .await
+            .map_err(|error| format!("Cannot stop owned helper: {error}"))?;
+        child
+            .wait()
+            .await
+            .map_err(|error| format!("Cannot reap owned helper: {error}"))?;
+    }
+    Ok(())
 }
 
 async fn cleanup_lease(shared: &Shared, id: &str) -> Result<(), String> {
@@ -214,6 +319,25 @@ fn competing_use(
     !pending.is_some_and(|operation| !operation.interfaces.contains(&interface.name))
 }
 
+fn state_from_journal(data: io::Result<Vec<u8>>) -> io::Result<State> {
+    let bytes = match data {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::default()),
+        // An unreadable journal must not be interpreted as an empty journal.
+        Err(error) => return Err(error),
+    };
+    let leases: Vec<Lease> = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let mut state = State::default();
+    for lease in leases {
+        if state.leases.insert(lease.id.clone(), lease).is_some() {
+            return Err(io::Error::other(
+                "Duplicate lease identity in recovery journal",
+            ));
+        }
+    }
+    Ok(state)
+}
+
 pub async fn run() -> io::Result<()> {
     let socket = Path::new(SOCKET_PATH);
     if socket.exists() {
@@ -225,21 +349,19 @@ pub async fn run() -> io::Result<()> {
         }
         std::fs::remove_file(socket)?;
     }
-    let mut state = State::default();
-    if let Ok(data) = std::fs::read(JOURNAL) {
-        let leases: Vec<Lease> = serde_json::from_slice(&data).map_err(io::Error::other)?;
-        for lease in leases {
-            if let Err(e) = restore(&lease).await {
-                state.record_recovery_error(format!("{}: {e}", lease.interface));
-                state.leases.insert(lease.id.clone(), lease);
-            }
-        }
-    }
+    let state = state_from_journal(std::fs::read(JOURNAL))?;
     persist(&state)?;
     let listener = UnixListener::bind(socket)?;
     // Every mutation requires an active local session and polkit authorization.
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
+    let startup_leases: Vec<_> = state.leases.keys().cloned().collect();
     let state = Arc::new(Mutex::new(state));
+    // Listen while recovery proceeds. All journaled radios are reserved and
+    // unattached from the outset; slow network restoration cannot prevent status
+    // or recovery clients from learning what is happening.
+    for id in startup_leases {
+        let _ = begin_cleanup(&state, &id).await;
+    }
     let limit = Arc::new(Semaphore::new(16));
     let mut tasks = tokio::task::JoinSet::new();
     let monitor = state.clone();
@@ -796,6 +918,13 @@ async fn apply(
         owned.retain(|id| id != lease_id);
         return Ok(Response::Ok);
     }
+    if let Request::LeaveP2p { ref lease_id } = request {
+        if !owned.contains(lease_id) {
+            return Err("lease does not belong to this connection".into());
+        }
+        wait_cleanup(begin_group_cleanup(shared, lease_id).await?).await?;
+        return Ok(Response::Ok);
+    }
     if matches!(request, Request::RetryRecovery) {
         let abandoned: Vec<_> = {
             let state = shared.lock().await;
@@ -832,29 +961,7 @@ async fn apply(
             state.cancelled_p2p.insert(lease_id);
             Ok(Response::Ok)
         }
-        Request::LeaveP2p { lease_id } => {
-            if !owned.contains(&lease_id) {
-                return Err("lease does not belong to this connection".into());
-            }
-            if state.cleanups.contains_key(&lease_id) {
-                return Err("lease cleanup is in progress".into());
-            }
-            let mut lease = state
-                .leases
-                .get(&lease_id)
-                .ok_or("lease not found")?
-                .clone();
-            if lease.kind != LeaseKind::DirectWifi {
-                return Err("direct Wi-Fi lease required".into());
-            }
-            stop_child(&mut state, &lease_id).await;
-            restore_p2p(&lease).await?;
-            lease.p2p_group = None;
-            state.cancelled_p2p.remove(&lease_id);
-            state.leases.insert(lease_id, lease);
-            persist(&state).map_err(|e| e.to_string())?;
-            Ok(Response::Ok)
-        }
+        Request::LeaveP2p { .. } => unreachable!(),
         Request::RecoveryStatus | Request::RetryRecovery => {
             let issues = state
                 .leases
@@ -870,7 +977,7 @@ async fn apply(
                         lease_id: l.id.clone(),
                         interface: l.interface.clone(),
                         ownership_verified: check.is_ok(),
-                        detail: if state.cleanups.contains_key(&l.id) {
+                        detail: if state.cleanups.contains_key(&l.id) || state.group_cleanups.contains_key(&l.id) {
                             "Cleanup is in progress; the radio remains reserved".into()
                         } else { check.err().unwrap_or_else(|| {
                             "Orphaned lease; authorized retry restores only this owned resource".into()
@@ -1140,7 +1247,7 @@ async fn apply(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 if !ready {
-                    stop_child(&mut state, &id).await;
+                    reap_child(state.children.remove(&id)).await?;
                     if restore(&lease).await.is_ok() {
                         state.leases.remove(&id);
                     }
@@ -1209,13 +1316,6 @@ async fn apply(
             Ok(Response::Ok)
         }
         Request::Release { .. } => unreachable!(),
-    }
-}
-
-async fn stop_child(state: &mut State, id: &str) {
-    if let Some(mut child) = state.children.remove(id) {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
     }
 }
 
@@ -1621,6 +1721,25 @@ async fn restore_connection(lease: &Lease) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_retains_all_reservations_and_rejects_unreadable_journals() {
+        let lease = direct_lease();
+        let data = serde_json::to_vec(&vec![lease.clone()]).unwrap();
+        let state = state_from_journal(Ok(data)).unwrap();
+        assert!(state.leases.contains_key(&lease.id));
+        assert!(state.attached.is_empty());
+        let duplicates = serde_json::to_vec(&vec![lease.clone(), lease]).unwrap();
+        assert!(state_from_journal(Ok(duplicates)).is_err());
+        assert!(state_from_journal(Ok(b"invalid journal".to_vec())).is_err());
+        assert!(state_from_journal(Err(io::Error::from(io::ErrorKind::PermissionDenied))).is_err());
+        assert!(
+            state_from_journal(Err(io::Error::from(io::ErrorKind::NotFound)))
+                .unwrap()
+                .leases
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn cleanup_receipt_preserves_reservation_without_blocking_status() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1762,6 +1881,172 @@ mod tests {
         wait_cleanup(receipt).await.unwrap();
         let state = shared.lock().await;
         assert!(state.leases.is_empty() && state.cleanups.is_empty());
+    }
+
+    fn lease_with_group() -> Lease {
+        let mut lease = direct_lease();
+        lease.p2p_group = Some(linuxdrop_network::p2p::GroupIdentity {
+            interface: "p2p-test0".into(),
+            interface_object: "/test/interface".into(),
+            group_object: "/test/group".into(),
+            parent_interface: lease.interface.clone(),
+            peer_object: "/test/peer".into(),
+            service_owner: ":1.42".into(),
+            bus_guid: "test-bus".into(),
+        });
+        lease
+    }
+
+    #[tokio::test]
+    async fn group_cleanup_is_responsive_and_full_retirement_waits_for_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lease = lease_with_group();
+        let id = lease.id.clone();
+        let uid = lease.uid;
+        let shared = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = shared.lock().await;
+            state.leases.insert(id.clone(), lease);
+            state.attached.insert(id.clone());
+        }
+        let (release, held) = tokio::sync::oneshot::channel();
+        let receipt = begin_group_cleanup_with(
+            &shared,
+            &id,
+            |lease, _| async move {
+                assert!(lease.p2p_group.is_some());
+                held.await.unwrap();
+                Ok(())
+            },
+            |state| {
+                assert!(state.leases.values().all(|lease| lease.p2p_group.is_none()));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let duplicate = begin_group_cleanup_with(
+            &shared,
+            &id,
+            |_, _| async { panic!("A duplicate must share the existing group receipt") },
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            timeout(Duration::from_millis(250), apply(Request::Status, uid, &mut vec![], &shared))
+                .await.unwrap().unwrap(),
+            Response::State { leases, .. } if leases.is_empty()
+        ));
+        assert!(matches!(
+            timeout(Duration::from_millis(250), apply(Request::RecoveryStatus, uid, &mut vec![], &shared))
+                .await.unwrap().unwrap(),
+            Response::Recovery { issues, .. } if issues[0].detail.contains("in progress")
+        ));
+        assert!(apply(
+            Request::LeaveP2p {
+                lease_id: id.clone()
+            },
+            uid,
+            &mut vec![],
+            &shared
+        )
+        .await
+        .is_err());
+        let mut owned = vec![id.clone()];
+        let mut leave_request = Box::pin(apply(
+            Request::LeaveP2p {
+                lease_id: id.clone(),
+            },
+            uid,
+            &mut owned,
+            &shared,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(leave_request.as_mut(), cx).is_pending()
+            ))
+            .await,
+            "LeaveP2p must wait on the injected group operation"
+        );
+        let started = Arc::new(AtomicBool::new(false));
+        let observed = started.clone();
+        let full = begin_cleanup_with(
+            &shared,
+            &id,
+            move |lease, _| async move {
+                // Full retirement must read the post-leave identity instead of
+                // disconnecting the now obsolete group a second time.
+                assert!(lease.p2p_group.is_none());
+                observed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(!started.load(Ordering::SeqCst));
+        assert!(shared.lock().await.leases.contains_key(&id));
+        let abandoned = tokio::spawn(wait_cleanup(receipt));
+        abandoned.abort();
+        let _ = abandoned.await;
+        release.send(()).unwrap();
+        wait_cleanup(duplicate).await.unwrap();
+        assert!(matches!(leave_request.await, Ok(Response::Ok)));
+        assert_eq!(owned, vec![id.clone()]);
+        wait_cleanup(full).await.unwrap();
+        assert!(started.load(Ordering::SeqCst));
+        let state = shared.lock().await;
+        assert!(state.leases.is_empty());
+        assert!(state.cleanups.is_empty() && state.group_cleanups.is_empty());
+        assert!(!state.attached.contains(&id));
+    }
+
+    #[tokio::test]
+    async fn group_cleanup_preserves_direct_lease_and_failed_journal_identity() {
+        for (operation_ok, journal_ok) in [(true, true), (true, false), (false, true)] {
+            let success = operation_ok && journal_ok;
+            let lease = lease_with_group();
+            let id = lease.id.clone();
+            let shared = Arc::new(Mutex::new(State::default()));
+            {
+                let mut state = shared.lock().await;
+                state.leases.insert(id.clone(), lease);
+                state.attached.insert(id.clone());
+                state.cancelled_p2p.insert(id.clone());
+            }
+            let receipt = begin_group_cleanup_with(
+                &shared,
+                &id,
+                move |_, _| async move {
+                    if operation_ok {
+                        Ok(())
+                    } else {
+                        Err("test teardown failure".into())
+                    }
+                },
+                move |_| {
+                    if journal_ok {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other("test journal failure"))
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(wait_cleanup(receipt).await.is_ok(), success);
+            let state = shared.lock().await;
+            let lease = state
+                .leases
+                .get(&id)
+                .expect("Partial cleanup preserves the direct reservation");
+            assert_eq!(lease.kind, LeaseKind::DirectWifi);
+            assert_eq!(lease.p2p_group.is_none(), success);
+            assert_eq!(state.attached.contains(&id), success);
+            assert_eq!(!state.cancelled_p2p.contains(&id), success);
+            assert!(state.group_cleanups.is_empty());
+        }
     }
 
     #[tokio::test]

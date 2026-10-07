@@ -46,6 +46,8 @@ jobs:
           sh -n packaging/install.sh packaging/build-deb.sh
       - name: Build installable package
         run: sh packaging/build-deb.sh
+      - name: Isolated helper startup and journal recovery
+        run: sudo sh crates/linuxdrop-netd/tests/run-startup-recovery.sh "$PWD/target/release/linuxdrop-netd"
       - name: Daemon session and HTTPS integration
         run: |
           LINUXDROP_TEST_GJS_STATUS=1 LINUXDROP_TEST_CONTRACT=1 LINUXDROP_CONTRACT_PROBE="$PWD/target/debug/examples/check_contract" dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd

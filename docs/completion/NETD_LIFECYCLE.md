@@ -6,9 +6,9 @@ Do not treat that bounded pass as full helper completion.
 
 Remaining code/evidence requirements:
 
-- `LeaveP2p` still holds State during child/group teardown. Move partial cleanup
-  onto an acknowledged per-lease operation, preserving the underlying direct
-  reservation. Full retirement must serialize with or supersede this operation.
+- `LeaveP2p` now uses a persistent receipt outside State and full retirement
+  waits for it, preserving the direct reservation until journal publication.
+  See [partial cleanup and startup evidence](../acceptance/NETD_GROUP_RECOVERY_2026-10-07.md).
 - `join_p2p` failure cleanup and producer cancellation need an explicit settled
   receipt. A full release must not admit radio reuse while an old group producer
   or cleanup can still act. The current cleanup-running check prevents a known
@@ -16,9 +16,10 @@ Remaining code/evidence requirements:
   race-free group-operation protocol.
 - Failed Acquire/AcquireAwdl rollback still waits under State, and creation before
   durable journal publication needs a crash-recovery audit/fix.
-- Startup restoration occurs before listening. Verify bounded recovery/startup
-  behavior and service stop/restart with retained journal errors in an isolated
-  booted systemd/polkit environment.
+- Startup now listens while journaled leases recover through receipts. A real
+  helper process in private mount/network namespaces passes old-boot cleanup,
+  retained ownership failure across restart, normal shutdown, and malformed or
+  unreadable journal rejection. Booted systemd/polkit lifecycle remains separate.
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.

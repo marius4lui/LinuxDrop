@@ -134,3 +134,8 @@ receipt. Retiring reservations remain allocated until restoration and journal
 publication succeed; status queries do not wait behind its process/network I/O.
 Partial group cleanup and producer cancellation are tracked separately in
 [helper lifecycle work](completion/NETD_LIFECYCLE.md).
+
+Partial P2P leave uses its own persistent receipt; full retirement waits for it
+and rereads the journal identity. Startup keeps journaled radios reserved while
+restoration runs behind the status socket. See
+[partial cleanup/startup evidence](acceptance/NETD_GROUP_RECOVERY_2026-10-07.md).
