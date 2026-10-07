@@ -6,7 +6,7 @@ import GObject from 'gi://GObject';
 import Pango from 'gi://Pango';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
-import {t, nearby, filesStatus} from './locale.js';
+import {t, nearby, filesStatus, transferError} from './locale.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
@@ -44,8 +44,8 @@ const SharingIndicator = GObject.registerClass(class SharingIndicator extends Qu
     }
 });
 
-function textLabel(text, style = 'linuxdrop-notch-subtitle', singleLine = false) {
-    const value = t(String(text ?? ''));
+function textLabel(text, style = 'linuxdrop-notch-subtitle', singleLine = false, translate = true) {
+    const value = translate ? t(String(text ?? '')) : String(text ?? '');
     const label = new St.Label({text: !singleLine && value.length > 240 ? `${value.slice(0, 237)}…` : value, accessible_name: value, style_class: style, x_expand: true});
     label.clutter_text.line_wrap = !singleLine;
     label.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
@@ -270,10 +270,36 @@ export default class LinuxDropExtension extends Extension {
         }
         this._bodySignature = signature;
         const focus = global.stage.get_key_focus();
-        const navigationFocus = focus && this._body.contains(focus) ? focus.accessible_name : null;
+        const focusedAction = focus && this._body.contains(focus) ? focus._linuxdropAction : null;
+        const context = JSON.stringify([this._serviceState, current?.id, current?.state]);
+        const sameContext = this._bodyContext === context;
+        this._bodyContext = context;
         if (focus && this._body.contains(focus)) this._header.grab_key_focus();
         this._body.destroy_all_children(); this._progress = null;
-        if (this._actionError) this._body.add_child(textLabel(this._actionError, 'linuxdrop-notch-error'));
+        this._populateBody(current, active);
+        if (this._serviceState === 'ready' && current) {
+            const shortcuts = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
+            this._button(shortcuts, this._dropRequested ? 'Opening…' : 'Drop files', () => this.openApp('--notch-drop'), false, this._dropRequested);
+            this._iconButton(shortcuts, 'Settings', 'emblem-system-symbolic', () => this.openApp('--settings'));
+            this._body.add_child(shortcuts);
+        }
+        // An unrelated transfer joining/leaving must not interrupt a keyboard
+        // action. A new request/state must never inherit consent or cancel focus.
+        const navigation = ['Previous transfer', 'Next transfer'].includes(focusedAction);
+        if (focusedAction && (sameContext || navigation)) {
+            const restore = actor => {
+                if (actor._linuxdropAction === focusedAction && actor.can_focus && actor.reactive) {
+                    actor.grab_key_focus();
+                    return true;
+                }
+                return actor.get_children().some(restore);
+            };
+            restore(this._body);
+        }
+    }
+
+    _populateBody(current, active) {
+        if (this._actionError) this._body.add_child(textLabel(this._actionError, 'linuxdrop-notch-error', false, false));
         if (this._serviceState !== 'ready') {
             this._body.add_child(textLabel(this._serviceState === 'connecting' ? 'Connecting…' : 'Service unavailable', 'linuxdrop-notch-heading'));
             this._body.add_child(textLabel('Open LinuxDrop to check the sharing service.'));
@@ -290,23 +316,19 @@ export default class LinuxDropExtension extends Extension {
                 this._selectedTransfer = active[next].id;
                 this._render();
             };
-            const previous = this._iconButton(chooser, 'Previous transfer', 'go-previous-symbolic', () => select(-1));
+            this._iconButton(chooser, 'Previous transfer', 'go-previous-symbolic', () => select(-1));
             const count = textLabel(index < 0 ? t('Active transfers') : `${index + 1} / ${active.length}`);
             count.y_align = Clutter.ActorAlign.CENTER;
             chooser.add_child(count);
-            const next = this._iconButton(chooser, 'Next transfer', 'go-next-symbolic', () => select(1));
+            this._iconButton(chooser, 'Next transfer', 'go-next-symbolic', () => select(1));
             this._body.add_child(chooser);
-            // Keep repeated keyboard navigation on the same arrow. Consent and
-            // cancellation actions still fall back to the header on state changes.
-            if (navigationFocus === previous.accessible_name) previous.grab_key_focus();
-            else if (navigationFocus === next.accessible_name) next.grab_key_focus();
         }
         if (current) {
-            this._body.add_child(textLabel(current.peer_name, 'linuxdrop-notch-heading', true));
+            this._body.add_child(textLabel(current.peer_name, 'linuxdrop-notch-heading', true, false));
             const files = current.files ?? [];
-            this._body.add_child(textLabel(files.length === 1 ? files[0].name : filesStatus(files.length, active.length), 'linuxdrop-notch-subtitle', files.length === 1));
+            this._body.add_child(textLabel(files.length === 1 ? files[0].name : filesStatus(files.length, active.length), 'linuxdrop-notch-subtitle', files.length === 1, false));
             if (TERMINAL.has(current.state)) {
-                this._body.add_child(textLabel(t(current.error || current.state), current.state === 'failed' ? 'linuxdrop-notch-error' : 'linuxdrop-notch-subtitle'));
+                this._body.add_child(textLabel(current.error ? transferError(current.error) : t(current.state), current.state === 'failed' ? 'linuxdrop-notch-error' : 'linuxdrop-notch-subtitle', false, false));
                 const actions = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
                 const saved = current.saved_paths?.[0];
                 if (current.state === 'completed' && saved) {
@@ -328,15 +350,15 @@ export default class LinuxDropExtension extends Extension {
             }
             if (current.state === 'verification') {
                 this._body.add_child(textLabel('Compare this code on both devices'));
-                this._body.add_child(textLabel(current.verification_code ?? '', 'linuxdrop-notch-code'));
+                this._body.add_child(textLabel(current.verification_code ?? '', 'linuxdrop-notch-code', false, false));
             }
             if (current.state === 'transferring') {
                 this._progressFraction = Math.max(0, Math.min(1, (current.transferred_bytes ?? 0) / Math.max(1, current.total_bytes ?? 1)));
-                const track = new St.Bin({style_class: 'linuxdrop-notch-track', x_expand: true, accessible_role: Atk.Role.PROGRESS_BAR, accessible_name: `${current.peer_name}: ${Math.floor(100 * this._progressFraction)}%`});
-                const fill = new St.Widget({style_class: 'linuxdrop-notch-fill', width: 0, x_align: Clutter.ActorAlign.START});
+                const track = new St.Widget({style_class: 'linuxdrop-notch-track', x_expand: true, accessible_role: Atk.Role.PROGRESS_BAR, accessible_name: `${current.peer_name}: ${Math.floor(100 * this._progressFraction)}%`});
+                const fill = new St.Widget({style_class: 'linuxdrop-notch-fill', width: 0});
                 this._progress = fill;
                 track.connect('notify::width', () => { fill.width = track.width * this._progressFraction; });
-                track.set_child(this._progress); this._body.add_child(track);
+                track.add_child(this._progress); this._body.add_child(track);
             }
             const actions = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
             const id = new GLib.Variant('(s)', [current.id]);
@@ -355,7 +377,7 @@ export default class LinuxDropExtension extends Extension {
             this._body.add_child(textLabel('Open the drop area, add your files, and choose a nearby device.'));
             const actions = new St.BoxLayout({style_class: 'linuxdrop-notch-actions'});
             this._button(actions, this._dropRequested ? 'Opening…' : 'Drop files', () => this.openApp('--notch-drop'), true, this._dropRequested);
-            this._button(actions, 'Settings', () => this.openApp('--settings'));
+            this._iconButton(actions, 'Settings', 'emblem-system-symbolic', () => this.openApp('--settings'));
             this._body.add_child(actions);
         }
     }
@@ -363,6 +385,7 @@ export default class LinuxDropExtension extends Extension {
     _button(box, label, callback, primary = false, mutation = false) {
         const disabled = mutation && (this._actionPending || this._dropRequested);
         const button = new St.Button({can_focus: !disabled, reactive: !disabled, accessible_name: t(label), x_expand: true, style_class: `linuxdrop-notch-action${primary ? ' primary' : ''}`});
+        button._linuxdropAction = label;
         const caption = textLabel(label, 'linuxdrop-notch-action-label');
         caption.clutter_text.line_alignment = Pango.Alignment.CENTER;
         button.set_child(caption);
@@ -372,6 +395,7 @@ export default class LinuxDropExtension extends Extension {
 
     _iconButton(box, label, icon, callback) {
         const button = new St.Button({can_focus: true, accessible_name: t(label), style_class: 'linuxdrop-notch-action linuxdrop-notch-navigation'});
+        button._linuxdropAction = label;
         button.set_child(new St.Icon({icon_name: icon, style_class: 'linuxdrop-notch-icon'}));
         button.connect('clicked', callback); box.add_child(button);
         return button;

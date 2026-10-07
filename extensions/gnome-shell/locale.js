@@ -1,8 +1,10 @@
 import GLib from 'gi://GLib';
 const german = GLib.get_language_names().some(language => language.startsWith('de'));
-const de = {
+const deErrors = {
     'LinuxDrop stopped before this transfer finished.': 'LinuxDrop wurde beendet, bevor diese Übertragung abgeschlossen war.',
     'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.': 'Der Netzwerk-Helfer ist nicht erreichbar. Der Freigabedienst wurde gestoppt; der Adapter wird möglicherweise noch freigegeben. Verbinde ihn erneut und starte die Freigabedienste in den Einstellungen neu.',
+};
+const de = {
     'Previous': 'Zurück', 'Next': 'Weiter', 'Active transfers': 'Aktive Übertragungen',
     'Previous transfer': 'Vorherige Übertragung', 'Next transfer': 'Nächste Übertragung',
     'completed': 'Abgeschlossen', 'failed': 'Fehlgeschlagen', 'cancelled': 'Abgebrochen', 'rejected': 'Abgelehnt',
@@ -37,5 +39,8 @@ const de = {
     'Click the LinuxDrop icon in the top panel first. Then choose Drop files or drag files over the open bubble. Click outside or press Escape to close. Requests and progress never open it automatically.': 'Klicke zuerst auf das LinuxDrop-Symbol in der oberen Leiste. Wähle dann Dateien ablegen oder ziehe Dateien über die geöffnete Bubble. Ein Klick außerhalb oder Escape schließt sie. Anfragen und Fortschritt öffnen sie niemals automatisch.',
 };
 export function t(text) { return german ? (de[text] ?? text) : text; }
+// Only known daemon recovery messages are translated. External error text can
+// also be an ordinary name such as "Settings", and must remain literal.
+export function transferError(text) { return german ? (deErrors[text] ?? text) : text; }
 export function nearby(count) { return german ? `${count} Geräte` : `${count} nearby`; }
 export function filesStatus(count, active) { return german ? `${count} Dateien · ${active} aktive Übertragungen` : `${count} files · ${active} active transfers`; }

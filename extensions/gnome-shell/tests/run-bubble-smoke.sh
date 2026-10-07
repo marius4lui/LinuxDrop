@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run from the repository root as an unprivileged user. No live session is used.
-# Optional LINUXDROP_SMOKE_CAPTURE is an absolute PNG path for the verification view.
+# Optional LINUXDROP_SMOKE_CAPTURE and LINUXDROP_SMOKE_CAPTURE_PROGRESS are PNG paths.
+# LINUXDROP_SMOKE_MONITOR can constrain the isolated virtual monitor (default 1440x900).
 set -eu
 if [ "$(id -u)" = 0 ]; then echo 'Run this isolated test as an unprivileged user.' >&2; exit 1; fi
 runroot=$(mktemp -d /tmp/linuxdrop-bubble-smoke.XXXXXX)
@@ -38,7 +39,7 @@ dbus-run-session -- bash -c '
     gsettings set org.gnome.desktop.interface enable-hot-corners false
     gsettings set org.gnome.desktop.notifications show-banners false
     gsettings set org.gnome.desktop.session idle-delay 0
-    gnome-shell --headless --wayland --no-x11 --wayland-display=linuxdrop-bubble-smoke --virtual-monitor=1440x900 > "$LINUXDROP_SMOKE_ROOT/shell.log" 2>&1 &
+    gnome-shell --headless --wayland --no-x11 --wayland-display=linuxdrop-bubble-smoke --virtual-monitor="${LINUXDROP_SMOKE_MONITOR:-1440x900}" > "$LINUXDROP_SMOKE_ROOT/shell.log" 2>&1 &
     shell_pid=$!
     for attempt in {1..15}; do
         sleep 1

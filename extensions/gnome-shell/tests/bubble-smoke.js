@@ -11,6 +11,13 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
         for (const child of actor.get_children()) { const found = find(child, name); if (found) return found; }
         return null;
     };
+    const capture = async path => {
+        if (!path) return;
+        const output = Gio.File.new_for_path(path).replace(null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+        try { await new Shell.Screenshot().screenshot(false, output); }
+        finally { output.close(null); }
+        console.log(`LINUXDROP_SMOKE_CAPTURED: ${path}`);
+    };
     try {
         GLib.source_remove(this._poll); this._poll = 0;
         check(!this._expanded && !this._notch.visible, 'Bubble must start hidden');
@@ -20,19 +27,14 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
             check(this._notch.visible, 'Explicit open must reveal the bubble');
             check(this._scroll.get_child() === this._body, 'Native ScrollView must own the body');
             check(find(this._body, 'Codes match'), 'Verification action must be available');
+            check(find(this._body, 'Drop files') && find(this._body, 'Settings'), 'Incoming verification must retain send and settings access');
             check(this._body.width <= this._notch.width, 'Body must fit the bubble');
             for (const name of ['Codes match', 'Decline', 'Details']) {
                 const button = find(this._body, name);
                 check(button.width <= this._body.width, `${name} must fit the body`);
             }
             check(find(this._body, 'Previous transfer') && find(this._body, 'Next transfer'), 'Transfer chooser must expose specific named controls');
-            const capture = GLib.getenv('LINUXDROP_SMOKE_CAPTURE');
-            if (capture) {
-                const output = Gio.File.new_for_path(capture).replace(null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
-                try { await new Shell.Screenshot().screenshot(false, output); }
-                finally { output.close(null); }
-                console.log(`LINUXDROP_SMOKE_CAPTURED: ${capture}`);
-            }
+            await capture(GLib.getenv('LINUXDROP_SMOKE_CAPTURE'));
             this._scroll.set_style('max-height: 120px;');
             await settle();
             const details = find(this._body, 'Details'); details.grab_key_focus();
@@ -53,14 +55,35 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
             next = find(this._body, 'Next transfer'); next.grab_key_focus(); next.emit('clicked', 1);
             later(() => {
                 const cancel = find(this._body, 'Cancel'); cancel.grab_key_focus();
-                const fill = this._progress;
                 const peerMenuItem = this._indicator.toggle.devices.box.get_first_child();
                 const current = this._snapshot.transfers.find(item => item.id === 'other-transfer');
+                const extra = {id: 'unrelated', state: 'waiting', direction: 'outgoing', peer_name: 'Other device', files: []};
+                this._snapshot.transfers.push(extra); this._render();
+                check(global.stage.get_key_focus() === find(this._body, 'Cancel'), 'An unrelated transfer arriving must preserve the selected transfer action focus');
+                this._snapshot.transfers.pop(); this._render();
+                check(global.stage.get_key_focus() === find(this._body, 'Cancel'), 'An unrelated transfer leaving must preserve the selected transfer action focus');
+                const originalName = current.peer_name;
+                const originalFile = current.files[0].name;
+                current.peer_name = 'Settings'; current.files[0].name = 'Details'; this._render();
+                check(this._body.get_children().some(child => child instanceof St.Label && child.text === 'Settings'), 'External peer names must remain literal in every locale');
+                check(this._body.get_children().some(child => child instanceof St.Label && child.text === 'Details'), 'External filenames must remain literal in every locale');
+                current.peer_name = originalName; current.files[0].name = originalFile; this._render();
+                check(find(this._body, 'Drop files') && find(this._body, 'Settings'), 'Active transfers must retain send and settings access');
+                const stableCancel = find(this._body, 'Cancel');
+                const stableFill = this._progress;
                 current.transferred_bytes = 67; current.files[0].transferred = 67; this._render();
-                check(this._progress === fill && global.stage.get_key_focus() === cancel, 'Progress must preserve actor and keyboard focus');
+                check(this._progress === stableFill && global.stage.get_key_focus() === stableCancel, 'Progress must preserve actor and keyboard focus');
                 check(this._indicator.toggle.devices.box.get_first_child() === peerMenuItem, 'Progress must preserve Quick Settings peer actors');
-                later(() => {
-                    check(Math.abs(fill.width - fill.get_parent().width * 0.67) < 1, `Progress must use the allocated track width: ${fill.width}/${fill.get_parent().width}`);
+                later(async () => {
+                    check(Math.abs(stableFill.width - stableFill.get_parent().width * 0.67) < 1, `Progress must use the allocated track width: ${stableFill.width}/${stableFill.get_parent().width}`);
+                    check(Math.abs(stableFill.get_transformed_position()[0] - stableFill.get_parent().get_transformed_position()[0]) < 1, 'Progress must begin at the left edge, not the center of its track');
+                    const settings = find(this._body, 'Settings'); settings.grab_key_focus();
+                    await settle();
+                    const [, actionY] = settings.get_transformed_position();
+                    const [, scrollY] = this._scroll.get_transformed_position();
+                    check(actionY >= scrollY && actionY + settings.height <= scrollY + this._scroll.height + 1, 'Persistent settings action must remain reachable in the constrained viewport');
+                    await capture(GLib.getenv('LINUXDROP_SMOKE_CAPTURE_PROGRESS'));
+                    find(this._body, 'Cancel').grab_key_focus();
                     this._actionPending = true; this._render();
                     check(!find(this._body, 'Cancel').reactive, 'Mutation must be disabled while pending');
                     check(find(this._body, 'Details').reactive, 'Details must remain available while pending');
@@ -71,7 +94,11 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     current.state = 'failed';
                     current.error = 'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.';
                     this._render();
-                    check(this._body.get_children().some(child => child instanceof St.Label && child.text === t(current.error)), 'Helper failure must show its translated recovery explanation');
+                    check(this._body.get_children().some(child => child instanceof St.Label && child.text === transferError(current.error)), 'Helper failure must show its translated recovery explanation');
+                    const helperError = current.error;
+                    current.error = 'Settings'; this._render();
+                    check(this._body.get_children().some(child => child instanceof St.Label && child.text === 'Settings'), 'Unknown transfer error text must remain literal');
+                    current.error = helperError; this._render();
                     check(!find(this._body, 'Cancel') && find(this._body, 'Details') && find(this._body, 'Done'), 'Failed transfer must replace stale cancellation with recovery navigation');
                     const launchApp = this._launchApp;
                     this._launchApp = () => { throw new Error('Launch failure for smoke test'); };
@@ -113,6 +140,12 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         const newRead = requests.shift();
                         reply(newRead, snapshot(1));
                         check(this._serviceState === 'ready' && find(this._body, 'Codes match'), 'New owner must recover without requiring the polling timer');
+                        find(this._body, 'Codes match').grab_key_focus();
+                        this._snapshot.transfers.push(extra); this._render();
+                        check(global.stage.get_key_focus() === find(this._body, 'Codes match'), 'Unrelated arrivals must preserve consent focus for the same request');
+                        this._snapshot.transfers[0].id = 'replacement-request'; this._selectedTransfer = null; this._render();
+                        check(global.stage.get_key_focus() === this._header, 'A different request must never inherit consent focus');
+                        this._snapshot.transfers[0].id = 'reconnect'; this._selectedTransfer = null; this._render();
                         this.call('AcceptTransfer', new GLib.Variant('(s)', ['reconnect']));
                         const newAction = requests.shift();
                         oldAction.callback(this._proxy, {deep_unpack: () => []});
@@ -124,7 +157,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     } finally { this._proxy = realProxy; }
                     this._setExpanded(false);
                     check(!this._notch.visible && global.stage.get_key_focus() === this._panelButton, 'Close must hide and restore panel focus');
-                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, focus');
+                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, stable action focus, consent focus isolation, literal external names, persistent send/settings, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, focus');
                 });
             });
         });
