@@ -48,6 +48,13 @@ Remaining code/evidence requirements:
   passes in English/German; see [rendered authorization evidence](../acceptance/GNOME_POLKIT_2026-10-07.md).
   Other distro package lifecycles, other Shell versions and the remote CI
   user-service startup result remain open.
+  The CI probe now derives its test user's home from passwd and runtime directory
+  from logind, verifies runtime/bus ownership, and temporarily supplies those XDG
+  values to that user's systemd manager. An installed `.40` daemon passed the
+  focused identity/confinement/D-Bus file-handoff check with deliberately foreign
+  runtime/config values inherited by its PAM session. The manager environment is
+  restored afterwards. This changes only the disposable test setup; the remote
+  full CI result remains to be confirmed.
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.

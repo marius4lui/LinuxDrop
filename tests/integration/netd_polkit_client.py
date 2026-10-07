@@ -2,6 +2,7 @@
 """Client-side real Polkit probe, run in a disposable PAM/logind session."""
 import json
 import os
+import pwd
 import select
 import socket
 import subprocess
@@ -14,7 +15,9 @@ agent = None
 graphical = None
 daemon_mode = '--daemon' in sys.argv
 daemon_started = False
-settings_path = Path.home() / '.config/linuxdrop/settings.json'
+account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+settings_path = account_home / '.config/linuxdrop/settings.json'
+manager_environment = None
 original_settings = None
 settings_existed = False
 stage = 'session lookup'
@@ -37,8 +40,28 @@ try:
     subject_pid = os.getpid()
     if daemon_mode:
         stage = 'user service preparation'
+        # systemd-run/PAM can inherit the CI runner's XDG values. Resolve this
+        # real logind user's runtime directory before talking to its user bus.
+        runtime = Path(subprocess.check_output(['loginctl', 'show-user', str(os.getuid()),
+            '-p', 'RuntimePath', '--value'], text=True).strip())
+        assert runtime.is_absolute() and runtime.stat().st_uid == os.getuid()
+        assert (runtime / 'bus').stat().st_uid == os.getuid()
+        desktop_environment = {
+            'HOME': str(account_home), 'XDG_RUNTIME_DIR': str(runtime),
+            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(runtime / 'bus'),
+            'XDG_CONFIG_HOME': str(account_home / '.config'),
+            'XDG_DATA_HOME': str(account_home / '.local/share'),
+            'XDG_CACHE_HOME': str(account_home / '.cache'),
+        }
+        os.environ.update(desktop_environment)
         active = subprocess.run(['systemctl', '--user', 'is-active', 'linuxdropd.service'], capture_output=True, text=True)
         assert active.stdout.strip() != 'active', 'Do not replace an existing user daemon'
+        existing = subprocess.check_output(['systemctl', '--user', 'show-environment'], text=True).splitlines()
+        manager_environment = dict(line.split('=', 1) for line in existing
+            if line.split('=', 1)[0] in desktop_environment)
+        subprocess.run(['systemctl', '--user', 'set-environment',
+            *(key + '=' + value for key, value in desktop_environment.items())],
+            check=True, capture_output=True, timeout=5)
         settings_existed = settings_path.exists()
         if settings_existed:
             original_settings = settings_path.read_bytes()
@@ -71,6 +94,10 @@ try:
                 'io.github.marius4lui.LinuxDrop', '/io/github/marius4lui/LinuxDrop',
                 'io.github.marius4lui.LinuxDrop.Manager1', 'DiscardDraft', 's', draft],
                 check=True, capture_output=True, timeout=15)
+        if '--daemon-environment-only' in sys.argv:
+            print('LINUXDROP_AUTH_RESULT:' + json.dumps({'status': 'passed',
+                'check': 'installed user service identity, confinement and D-Bus handoff in its own desktop environment'}), flush=True)
+            sys.exit(0)
     if '--gui' in sys.argv:
         from gnome_polkit_driver import GraphicalAgent
         stage = 'graphical agent registration'
@@ -156,3 +183,10 @@ finally:
             settings_path.write_bytes(original_settings)
         else:
             settings_path.unlink(missing_ok=True)
+    if manager_environment is not None:
+        subprocess.run(['systemctl', '--user', 'unset-environment', *desktop_environment],
+            check=False, capture_output=True, timeout=5)
+        if manager_environment:
+            subprocess.run(['systemctl', '--user', 'set-environment',
+                *(key + '=' + value for key, value in manager_environment.items())],
+                check=False, capture_output=True, timeout=5)
