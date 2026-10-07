@@ -26,6 +26,8 @@ const HELPER_DIRECTORY: &str = match option_env!("LINUXDROP_LIBEXECDIR") {
 };
 #[path = "acquire.rs"]
 mod acquire;
+#[path = "channel.rs"]
+mod channel;
 
 const JOURNAL: &str = "/var/lib/linuxdrop-netd/leases.json";
 const MAX_REQUEST: u64 = 4096;
@@ -571,7 +573,7 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
                     let preparing = matches!(&request,
                         Request::JoinP2p { .. } | Request::HostP2p { .. }
                         | Request::Acquire { .. } | Request::AcquireAwdl { .. }
-                        | Request::Diagnose { .. });
+                        | Request::Diagnose { .. } | Request::SetChannel { .. });
                     let response = tokio::select! {
                         result = apply(request, uid, &mut owned, &state) => result,
                         result = reader.fill_buf(), if preparing => {
@@ -1049,6 +1051,9 @@ async fn apply(
         }
         return Ok(Response::Diagnostic { report });
     }
+    if let Request::SetChannel { lease_id, channel } = request {
+        return channel::set_channel(shared, owned, lease_id, channel).await;
+    }
     if let Request::Reserve { radio_id } = request {
         return acquire::reserve_radio(shared, uid, owned, radio_id).await;
     }
@@ -1188,60 +1193,7 @@ async fn apply(
             recovery_errors: state.recovery_errors.clone(),
         }),
         Request::Acquire { .. } | Request::AcquireAwdl { .. } => unreachable!(),
-        Request::SetChannel { lease_id, channel } => {
-            if !state.attached.contains(&lease_id) {
-                return Err("lease is revoked; complete radio recovery first".into());
-            }
-            if !owned.contains(&lease_id) {
-                return Err("lease does not belong to this connection".into());
-            }
-            let lease = state
-                .leases
-                .get(&lease_id)
-                .ok_or("lease not found")?
-                .clone();
-            if lease.kind == LeaseKind::DirectWifi {
-                return Err("direct Wi-Fi reservation cannot change monitor channels".into());
-            }
-            if lease.awdl_interface.is_some() {
-                return Err("AWDL channel scheduling belongs to the link helper".into());
-            }
-            let inventory = inventory().await;
-            let radio = inventory
-                .radios
-                .iter()
-                .find(|r| r.phy == lease.phy)
-                .ok_or("radio unplugged")?;
-            // Our monitor is up by design. Any other newly active interface blocks mutation.
-            if inventory.interfaces.iter().any(|i| {
-                i.phy.as_deref() == Some(&lease.phy) && i.name != lease.interface && i.in_use()
-            }) {
-                return Err("radio became active outside the lease".into());
-            }
-            if !radio
-                .channels
-                .iter()
-                .any(|c| c.number == channel && !c.disabled && !c.no_ir && !c.radar)
-            {
-                return Err("channel is restricted or unavailable".into());
-            }
-            verify_owned(&lease)?;
-            run_command(
-                "/usr/sbin/iw",
-                &[
-                    "dev",
-                    &lease.interface,
-                    "set",
-                    "channel",
-                    &channel.to_string(),
-                ],
-                5,
-            )
-            .await?;
-            state.leases.get_mut(&lease_id).unwrap().channel = channel;
-            persist(&state).map_err(|e| e.to_string())?;
-            Ok(Response::Ok)
-        }
+        Request::SetChannel { .. } => unreachable!(),
         Request::Release { .. } => unreachable!(),
     }
 }
@@ -2371,6 +2323,119 @@ mod tests {
         assert!(restored.load(Ordering::SeqCst));
         let state = shared.lock().await;
         assert!(state.producers.is_empty() && state.leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_retirement_waits_for_command_and_final_journal() {
+        let mut lease = direct_lease();
+        lease.kind = LeaseKind::Monitor;
+        lease.channel = 6;
+        let id = lease.id.clone();
+        let shared = Arc::new(Mutex::new(State::default()));
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let mut state = shared.lock().await;
+        state.leases.insert(id.clone(), lease.clone());
+        state.attached.insert(id.clone());
+        let reply = channel::spawn_channel_with(
+            &mut state,
+            &shared,
+            lease,
+            11,
+            tokio_util::sync::CancellationToken::new(),
+            move |_| async move {
+                started.send(()).unwrap();
+                finishing.await.unwrap();
+                Ok(())
+            },
+            |_| Ok(()),
+        );
+        drop(state);
+        ready.await.unwrap();
+        timeout(
+            Duration::from_millis(250),
+            apply(Request::Status, 1000, &mut vec![], &shared),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let competing = timeout(
+            Duration::from_millis(250),
+            apply(
+                Request::SetChannel {
+                    lease_id: id.clone(),
+                    channel: 1,
+                },
+                1000,
+                &mut vec![id.clone()],
+                &shared,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(competing.contains("still in progress"));
+        let cleanup = begin_cleanup_with(
+            &shared,
+            &id,
+            |lease, _| async move {
+                assert_eq!(
+                    lease.channel, 11,
+                    "Retirement must observe the completed mutation"
+                );
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .await;
+        assert!(cleanup.borrow().is_none());
+        finish.send(()).unwrap();
+        assert!(reply.await.unwrap().unwrap_err().contains("cancelled"));
+        wait_cleanup(cleanup).await.unwrap();
+        let state = shared.lock().await;
+        assert!(state.leases.is_empty() && state.producers.is_empty() && state.attached.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_channel_mutation_or_journal_revokes_the_lease() {
+        for failed_command in [true, false] {
+            let mut lease = direct_lease();
+            lease.kind = LeaseKind::Monitor;
+            lease.channel = 6;
+            let id = lease.id.clone();
+            let shared = Arc::new(Mutex::new(State::default()));
+            let mut state = shared.lock().await;
+            state.leases.insert(id.clone(), lease.clone());
+            state.attached.insert(id.clone());
+            let reply = channel::spawn_channel_with(
+                &mut state,
+                &shared,
+                lease,
+                11,
+                tokio_util::sync::CancellationToken::new(),
+                move |_| async move {
+                    if failed_command {
+                        Err("Synthetic driver failure".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                move |_| {
+                    assert!(!failed_command, "Failed mutation must not journal success");
+                    Err(io::Error::other("Synthetic disk failure"))
+                },
+            );
+            drop(state);
+            assert!(reply.await.unwrap().is_err());
+            let state = shared.lock().await;
+            assert!(state.producers.is_empty());
+            assert!(!state.attached.contains(&id));
+            assert_eq!(
+                state.leases[&id].channel,
+                if failed_command { 6 } else { 11 }
+            );
+            assert!(!state.recovery_errors.is_empty());
+        }
     }
 
     #[tokio::test]

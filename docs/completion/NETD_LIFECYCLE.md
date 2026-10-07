@@ -21,9 +21,11 @@ Remaining code/evidence requirements:
 - Acquire/AcquireAwdl now use persistent producers and cleanup receipts outside
   State; Reserve inventory no longer holds State either. See
   [acquisition evidence](../acceptance/NETD_ACQUISITION_2026-10-07.md).
-  SetChannel still awaits an external command under State and needs coordinated
-  producer retirement. Creation before verifiable owner-marker publication still
-  needs crash-recovery handling; durable intent alone cannot prove ownership.
+  SetChannel now uses the same producer ordering, validates again after inventory
+  and revokes uncertain mutations. See
+  [channel retirement evidence](../acceptance/NETD_CHANNEL_RETIREMENT_2026-10-07.md).
+  Creation before verifiable owner-marker publication still needs crash-recovery
+  handling; durable intent alone cannot prove ownership.
 - Startup now listens while journaled leases recover through receipts. A real
   helper process in private mount/network namespaces passes old-boot cleanup,
   retained ownership failure across restart, normal shutdown, and malformed or
