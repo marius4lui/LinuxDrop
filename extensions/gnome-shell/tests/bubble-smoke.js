@@ -25,6 +25,37 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
         this._setExpanded(true);
         later(async () => {
             check(this._notch.visible, 'Explicit open must reveal the bubble');
+            this._setExpanded(false);
+            Main.overview.show();
+            await settle();
+            check(Main.overview.visible && !this._notch.visible, 'Overview alone must leave the bubble closed');
+            const pointer = Clutter.get_default_backend().get_default_seat().create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
+            const clickPanel = () => {
+                const [x, y] = this._panelButton.get_transformed_position();
+                const [width, height] = this._panelButton.get_transformed_size();
+                pointer.notify_absolute_motion(GLib.get_monotonic_time(), x + width / 2, y + height / 2);
+                pointer.notify_button(GLib.get_monotonic_time(), 1, Clutter.ButtonState.PRESSED);
+                pointer.notify_button(GLib.get_monotonic_time(), 1, Clutter.ButtonState.RELEASED);
+            };
+            clickPanel();
+            await settle();
+            check(!Main.overview.visible && this._expanded && this._notch.visible, 'Panel click from Overview must dismiss Overview and open the bubble');
+            check(global.stage.get_key_focus() === this._header, 'Overview handoff must focus the visible bubble header');
+            Main.overview.show();
+            await settle();
+            Main.overview.hide();
+            await settle();
+            check(!this._expanded && !this._notch.visible, 'Unrequested Overview transitions must not reopen the bubble');
+            Main.overview.show();
+            await settle();
+            this._setExpanded(true);
+            check(this._openAfterOverview, 'Opening from Overview must wait for its modal focus release');
+            this._setExpanded(false);
+            await settle();
+            check(!this._expanded && !this._openAfterOverview && !this._overviewOpenIdle, 'Cancelling the queued activation must leave the bubble closed');
+            clickPanel();
+            await settle();
+            check(this._expanded && this._notch.visible, 'A later panel click must remain available after cancellation');
             check(this._scroll.get_child() === this._body, 'Native ScrollView must own the body');
             check(find(this._body, 'Codes match'), 'Verification action must be available');
             check(find(this._body, 'Drop files') && find(this._body, 'Settings'), 'Incoming verification must retain send and settings access');

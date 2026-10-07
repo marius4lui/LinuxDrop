@@ -41,6 +41,7 @@ pub struct Ui {
     settings_status_row: adw::ActionRow,
     settings_status_details: gtk::Button,
     busy: Cell<bool>,
+    creating_link: Cell<bool>,
     refreshing: Cell<bool>,
     refresh_again: Cell<bool>,
     service_generation: Cell<u64>,
@@ -417,6 +418,7 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         settings_status_row,
         settings_status_details,
         busy: Cell::new(false),
+        creating_link: Cell::new(false),
         refreshing: Cell::new(false),
         refresh_again: Cell::new(false),
         service_generation: Cell::new(0),
@@ -1257,10 +1259,22 @@ impl Ui {
                 && protocol_available
                 && connected
                 && !restarting
+                && !self.creating_link.get()
                 && !self.busy.get(),
         );
-        self.share_link
-            .set_sensitive(count > 0 && ready && connected && !restarting && !self.busy.get());
+        self.share_link.set_sensitive(
+            count > 0
+                && ready
+                && connected
+                && !restarting
+                && !self.busy.get()
+                && !self.creating_link.get(),
+        );
+        self.share_link.set_label(&tr(if self.creating_link.get() {
+            "Preparing…"
+        } else {
+            "Share with a link"
+        }));
         self.send.set_label(&tr(if self.busy.get() {
             "Preparing…"
         } else {
@@ -1495,6 +1509,9 @@ impl Ui {
         });
     }
     fn share_link(self: &Rc<Self>) {
+        if self.busy.get() || self.creating_link.get() || !self.service_is_ready() {
+            return;
+        }
         if self.files.borrow().is_empty() {
             self.toast("Select files first");
             return;
@@ -1505,6 +1522,7 @@ impl Ui {
         dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
         dialog.set_close_response("cancel");
         let weak = Rc::downgrade(self);
+        let generation = self.service_generation();
         dialog.connect_response(None, move |_, response| {
             if response != "create" {
                 return;
@@ -1512,25 +1530,41 @@ impl Ui {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
+            if generation != ui.service_generation()
+                || !ui.service_is_ready()
+                || ui.busy.get()
+                || ui.creating_link.get()
+            {
+                return;
+            }
             let Some(proxy) = ui.proxy.borrow().clone() else {
                 return;
             };
+            let owner = proxy.g_name_owner();
             let paths: Vec<String> = ui
                 .files
                 .borrow()
                 .iter()
                 .filter_map(|f| f.path().map(|p| p.to_string_lossy().into_owned()))
                 .collect();
+            ui.creating_link.set(true);
+            ui.update_send();
             glib::MainContext::default().spawn_local(async move {
                 let result: Result<Value, String> = async {
                     let draft = ipc::prepare_files(&proxy, paths).await?;
+                    if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+                        return Err(tr("Background service unavailable"));
+                    }
                     let reply = ipc::call(
                         &proxy,
                         "CreateDownloadOffer",
                         Some((draft.clone(),).to_variant()),
                     )
                     .await;
-                    if reply.is_err() {
+                    if reply.is_err()
+                        && generation == ui.service_generation()
+                        && proxy.g_name_owner() == owner
+                    {
                         let _ =
                             ipc::call(&proxy, "DiscardDraft", Some((draft,).to_variant())).await;
                     }
@@ -1538,12 +1572,31 @@ impl Ui {
                     serde_json::from_str(&result).map_err(|error| error.to_string())
                 }
                 .await;
+                // A snapshot failure can take the UI offline while this same
+                // service successfully creates a link. Revoke that unseen offer
+                // before allowing another creation, then recover its status.
+                let offline = !ui.service_is_ready();
+                if offline
+                    && result.is_ok()
+                    && generation == ui.service_generation()
+                    && proxy.g_name_owner() == owner
+                {
+                    let _ = ipc::call(&proxy, "StopDownloadOffer", Some(().to_variant())).await;
+                    ui.refresh();
+                }
+                ui.creating_link.set(false);
+                ui.update_send();
+                if generation != ui.service_generation() || proxy.g_name_owner() != owner || offline
+                {
+                    return;
+                }
                 match result {
                     Err(error) => ui.toast(&error),
                     Ok(offer) => ui.show_link(&offer),
                 }
             });
         });
+        self.track_service_dialog(&dialog);
         dialog.present(Some(&self.window));
     }
     fn show_link(self: &Rc<Self>, offer: &Value) {
@@ -1592,13 +1645,34 @@ impl Ui {
         dialog.set_response_appearance("stop", adw::ResponseAppearance::Destructive);
         dialog.set_close_response("stop");
         let weak = Rc::downgrade(self);
+        let generation = self.service_generation();
+        let proxy = self.proxy.borrow().clone();
+        let owner = proxy.as_ref().and_then(|proxy| proxy.g_name_owner());
         dialog.connect_response(None, move |_, response| {
             if response == "stop" {
-                if let Some(ui) = weak.upgrade() {
-                    ui.mutate("StopDownloadOffer", ().to_variant());
+                if let (Some(ui), Some(proxy)) = (weak.upgrade(), proxy.clone()) {
+                    if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+                        return;
+                    }
+                    let owner = owner.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+                            return;
+                        }
+                        let result =
+                            ipc::call(&proxy, "StopDownloadOffer", Some(().to_variant())).await;
+                        if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+                            return;
+                        }
+                        if let Err(error) = result {
+                            ui.toast(&error);
+                        }
+                        ui.refresh();
+                    });
                 }
             }
         });
+        self.track_service_dialog(&dialog);
         dialog.present(Some(&self.window));
     }
     fn render_transfers(self: &Rc<Self>) {

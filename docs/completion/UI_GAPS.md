@@ -144,3 +144,14 @@ apply immediately and keyboard focus pauses/rearms dismissal. See
 The sandbox uses a fixed host action to open Notch preferences, with asynchronous
 failure/retry feedback; it receives no additional Shell or filesystem permissions.
 See [host preferences acceptance](../acceptance/UI_HOST_PREFERENCES_2026-10-07.md).
+
+2026-10-07 targeted two-agent Astra/high pass: top-panel activation now leaves
+GNOME Overview before opening the bubble and preserves keyboard focus; ordinary
+Overview transitions remain closed. Download-link preparation is single-flight
+with pending feedback, failure/retry preserves files, and dialogs follow the
+service owner without exposing late stale offers. Same-owner dialog dismissal
+revokes the link even during snapshot recovery. See
+[Overview acceptance](../acceptance/UI_SHELL_OVERVIEW_2026-10-07.md) and
+[link lifecycle acceptance](../acceptance/UI_GTK_LINK_LIFECYCLE_2026-10-07.md).
+Native GNOME 46 and GTK regressions passed. Broader platform, accessibility and
+physical acceptance remains as recorded above. The live demo was not restarted.

@@ -160,6 +160,8 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let batches = Rc::new(RefCell::new(Vec::new()));
     let discarded = Rc::new(Cell::new(false));
     let fail_next_stop = Rc::new(Cell::new(true));
+    let pending_offer = Rc::new(RefCell::new(None::<gio::DBusMethodInvocation>));
+    let offer_calls = Rc::new(Cell::new(0));
     let fail_next_preference = Rc::new(Cell::new(false));
     let preference_calls = Rc::new(Cell::new(0));
     let fail_next_setting = Rc::new(Cell::new(false));
@@ -178,6 +180,8 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let sent_batches = batches.clone();
     let was_discarded = discarded.clone();
     let fail_stop = fail_next_stop.clone();
+    let offer = pending_offer.clone();
+    let offers = offer_calls.clone();
     let fail_preference = fail_next_preference.clone();
     let preference_count = preference_calls.clone();
     let fail_setting = fail_next_setting.clone();
@@ -213,6 +217,14 @@ fn native_draft_focus_protocol_and_settings_regressions() {
                         state.borrow_mut()["download_link_active"] = json!(false);
                         invocation.return_value(None);
                     }
+                }
+                "CreateDownloadOffer" => {
+                    offers.set(offers.get() + 1);
+                    assert!(
+                        offer.borrow().is_none(),
+                        "Only one link creation may be pending"
+                    );
+                    *offer.borrow_mut() = Some(invocation);
                 }
                 "ResetSettings" => {
                     glib::timeout_add_local_once(Duration::from_millis(250), move || {
@@ -437,6 +449,39 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             find(&ui.file_box, &format!("remove:{}", gio::File::for_path(&first).uri())),
             "Removing an invalid file keeps keyboard focus on the neighboring file action");
         assert!(ui.send.is_sensitive());
+        ui.share_link();
+        let confirmation = ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+        confirmation.emit_by_name::<()>("response", &[&"create"]);
+        confirmation.force_close();
+        assert!(ui.creating_link.get());
+        assert!(!ui.send.is_sensitive() && !ui.share_link.is_sensitive());
+        assert_eq!(ui.share_link.label().as_deref(), Some(tr("Preparing…").as_str()));
+        ui.share_link();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(offer_calls.get(), 1, "Repeated activation must not create overlapping offers");
+        capture(&ui, "download-link-preparing.png");
+        pending_offer.borrow_mut().take().unwrap().return_dbus_error("io.github.marius4lui.Error", "Test link creation failed");
+        settle().await;
+        assert!(!ui.creating_link.get() && ui.share_link.is_sensitive());
+        assert_eq!(ui.files.borrow().len(), 1, "Link failures preserve the selected files for retry");
+        ui.share_link();
+        let confirmation = ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+        confirmation.emit_by_name::<()>("response", &[&"create"]);
+        confirmation.force_close();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        pending_offer.borrow_mut().take().unwrap().return_value(Some(&(json!({"url":"http://127.0.0.1:53317","pin":"1234","expires_in":60}).to_string(),).to_variant()));
+        settle().await;
+        let link = ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+        assert_eq!(link.heading().as_deref(), Some(tr("Share with a link").as_str()));
+        snapshot.borrow_mut()["download_link_active"] = json!(true);
+        fail_next_stop.set(false);
+        ui.service_error("test link owner loss");
+        settle().await;
+        assert!(ui.window.visible_dialog().is_none(), "A disconnected offer must not stay visible as a usable link");
+        assert_eq!(snapshot.borrow()["download_link_active"], false, "Closing an active link on same-owner snapshot failure must revoke it");
+        fail_next_stop.set(true);
+        ui.refresh();
+        settle().await;
         ui.start_send();
         glib::timeout_future(Duration::from_millis(30)).await;
         ui.add_files(vec![gio::File::for_path(&second)]);
@@ -998,6 +1043,12 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         ui.add_files(vec![gio::File::for_path(&first)]);
         settle().await;
         let draft = ui.files.borrow().clone();
+        ui.share_link();
+        let old_link_confirmation = ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+        old_link_confirmation.emit_by_name::<()>("response", &[&"create"]);
+        old_link_confirmation.force_close();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert!(pending_offer.borrow().is_some());
         let review = ui.accept_request(&incoming);
         settle().await;
         ui.run_hardware_diagnostic("radio-test");
@@ -1046,6 +1097,12 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert_eq!(ui.snapshot.borrow()["epoch"], "replacement-owner", "Late old snapshots cannot restore stale state");
         assert!(find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").is_none());
         assert_eq!(*ui.files.borrow(), draft, "Owner replacement preserves local file drafts");
+        pending_offer.borrow_mut().take().unwrap().return_value(Some(&(json!({"url":"http://127.0.0.1:53317","pin":"1234","expires_in":60}).to_string(),).to_variant()));
+        settle().await;
+        assert!(!ui.creating_link.get() && ui.share_link.is_sensitive());
+        assert!(ui.window.visible_dialog().is_none(), "A late old-owner offer must not reopen a stale link dialog");
+        old_link_confirmation.emit_by_name::<()>("response", &[&"create"]);
+        link.emit_by_name::<()>("response", &[&"stop"]);
         review.emit_by_name::<()>("response", &[&"accept"]);
         old_hardware_consent.emit_by_name::<()>("response", &[&"run"]);
         settle().await;

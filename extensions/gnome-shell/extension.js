@@ -57,6 +57,8 @@ export default class LinuxDropExtension extends Extension {
     enable() {
         this._alive = true;
         this._expanded = false;
+        this._openAfterOverview = false;
+        this._overviewOpenIdle = 0;
         this._dropRequested = false;
         this._dropLaunchPending = false;
         this._activeCount = 0;
@@ -80,7 +82,7 @@ export default class LinuxDropExtension extends Extension {
         this._panelButton = new PanelMenu.Button(0.5, t('Open LinuxDrop'), true);
         this._panelIcon = new St.Icon({icon_name: 'document-send-symbolic', style_class: 'system-status-icon'});
         this._panelButton.add_child(this._panelIcon);
-        const toggle = () => { this._setExpanded(!this._expanded); return Clutter.EVENT_STOP; };
+        const toggle = () => { this._setExpanded(!(this._expanded || this._openAfterOverview)); return Clutter.EVENT_STOP; };
         this._panelButton.connect('button-press-event', (_, event) => event.get_button() === 1 ? toggle() : Clutter.EVENT_PROPAGATE);
         this._panelButton.connect('touch-event', (_, event) => event.type() === Clutter.EventType.TOUCH_BEGIN ? toggle() : Clutter.EVENT_PROPAGATE);
         this._panelButton.connect('key-press-event', (_, event) => {
@@ -128,7 +130,16 @@ export default class LinuxDropExtension extends Extension {
         this._connect(St.ThemeContext.get_for_stage(global.stage), 'notify::scale-factor', () => this._position());
         this._connect(Main.sessionMode, 'updated', () => this._visibility());
         this._connect(Main.overview, 'showing', () => this._visibility());
-        this._connect(Main.overview, 'hidden', () => this._visibility());
+        this._connect(Main.overview, 'hidden', () => {
+            if (this._openAfterOverview && !this._overviewOpenIdle) {
+                // Overview releases its modal focus after emitting hidden.
+                this._overviewOpenIdle = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                    this._overviewOpenIdle = 0;
+                    if (this._alive && this._openAfterOverview) this._setExpanded(true);
+                    return GLib.SOURCE_REMOVE;
+                });
+            } else this._visibility();
+        });
         this._connect(global.display, 'in-fullscreen-changed', () => this._visibility());
         this._connect(global.display, 'window-created', (_, window) => this._watchDropSurface(window));
         const dnd = global.backend.get_dnd();
@@ -439,7 +450,19 @@ export default class LinuxDropExtension extends Extension {
     }
 
     _setExpanded(expanded) {
-        if (expanded && !this._settings.get_boolean('show-notch')) return;
+        if (expanded && (!this._settings.get_boolean('show-notch') || Main.sessionMode.isLocked || Main.sessionMode.isGreeter)) {
+            this._openAfterOverview = false;
+            return;
+        }
+        if (expanded && Main.overview.visible) {
+            // The panel remains available in Overview. Honor that explicit
+            // activation once its modal overview has finished relinquishing focus.
+            this._openAfterOverview = true;
+            Main.overview.hide();
+            return;
+        }
+        this._openAfterOverview = false;
+        if (this._overviewOpenIdle) { GLib.source_remove(this._overviewOpenIdle); this._overviewOpenIdle = 0; }
         const focus = global.stage.get_key_focus();
         const restoreFocus = !expanded && focus && this._notch.contains(focus);
         if (!expanded) {
@@ -527,6 +550,7 @@ export default class LinuxDropExtension extends Extension {
         const locked = Main.sessionMode.isLocked || Main.sessionMode.isGreeter;
         const fullscreen = monitor && global.display.get_monitor_in_fullscreen(monitor.index);
         const enabled = this._settings.get_boolean('show-notch');
+        if (!enabled || locked) this._openAfterOverview = false;
         const blocked = locked || Main.overview.visible || (this._settings.get_boolean('hide-fullscreen') && fullscreen);
         this._panelButton.visible = enabled && !locked;
         this._notch.visible = this._expanded && !this._dropWindow && enabled && !blocked;
@@ -548,7 +572,7 @@ export default class LinuxDropExtension extends Extension {
     }
 
     _dismissFromEvent(event) {
-        if (!this._expanded) return Clutter.EVENT_PROPAGATE;
+        if (!this._expanded && !this._openAfterOverview) return Clutter.EVENT_PROPAGATE;
         if (event.type() === Clutter.EventType.KEY_PRESS && event.get_key_symbol() === Clutter.KEY_Escape) {
             this._setExpanded(false);
             this._panelButton.grab_key_focus();
@@ -657,6 +681,8 @@ export default class LinuxDropExtension extends Extension {
 
     disable() {
         this._alive = false;
+        this._openAfterOverview = false;
+        if (this._overviewOpenIdle) { GLib.source_remove(this._overviewOpenIdle); this._overviewOpenIdle = 0; }
         this._cancellable?.cancel();
         this._cancelDragHover();
         this._closeDropSurface();
