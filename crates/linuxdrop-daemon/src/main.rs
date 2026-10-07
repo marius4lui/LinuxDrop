@@ -108,38 +108,65 @@ impl Shared {
             }
         }
     }
-    async fn snapshot(&self) -> String {
+    async fn snapshot(&self) -> zbus::fdo::Result<String> {
+        use linuxdrop_ipc::{
+            KnownPeer, PeerView, SelectionMode, Snapshot, TransferView, IDENTITY_SCOPE,
+        };
         let d = self.data.lock().await;
         let mut peers: Vec<_> = d.peers.values().collect();
         peers.sort_by(|a, b| a.name.cmp(&b.name));
-        let peers:Vec<_>=peers.into_iter().map(|peer| {
-            let mut value=serde_json::to_value(peer).unwrap_or_default();
-            if let Some(prefs)=d.peer_preferences.get(&peer.id) {
-                for (key,field) in serde_json::to_value(prefs).unwrap().as_object().unwrap() {value[key]=field.clone();}
-                if prefs.blocked {value["available"]=json!(false);}
-            }
-            value["identity_scope"]=json!("Preferences apply to this protocol identifier; they do not authenticate a person. Discovery identifiers can change.");
-            value
-        }).collect();
-        let known_peers:Vec<_>=d.peer_preferences.iter().map(|(id,prefs)|json!({"id":id,"favorite":prefs.favorite,"display_name":prefs.display_name,"blocked":prefs.blocked,"preferred_protocol":prefs.preferred_protocol,"available":d.peers.contains_key(id)})).collect();
-        let transfers: Vec<_> = d
+        let peers = peers
+            .into_iter()
+            .map(|peer| {
+                let prefs = d.peer_preferences.get(&peer.id);
+                let mut peer = peer.clone();
+                if prefs.is_some_and(|prefs| prefs.blocked) {
+                    peer.available = false;
+                }
+                PeerView {
+                    peer,
+                    favorite: prefs.map(|p| p.favorite),
+                    display_name: prefs.map(|p| p.display_name.clone()),
+                    blocked: prefs.map(|p| p.blocked),
+                    preferred_protocol: prefs.map(|p| p.preferred_protocol.clone()),
+                    identity_scope: IDENTITY_SCOPE.into(),
+                }
+            })
+            .collect();
+        let known_peers = d
+            .peer_preferences
+            .iter()
+            .map(|(id, p)| KnownPeer {
+                id: id.clone(),
+                favorite: p.favorite,
+                display_name: p.display_name.clone(),
+                blocked: p.blocked,
+                preferred_protocol: p.preferred_protocol.clone(),
+                available: d.peers.contains_key(id),
+            })
+            .collect();
+        let transfers = d
             .transfer_order
             .iter()
             .rev()
             .filter_map(|id| d.transfers.get(id))
             .map(|transfer| {
-                let mut value = serde_json::to_value(transfer).unwrap_or_default();
-                if transfer.direction == "incoming" && !transfer.is_terminal() {
-                    if let Ok(options) = receive::options(&d.settings, transfer, None) {
-                        value["receive_directory"] = json!(options.directory);
-                    }
-                    value["selection_mode"] = json!(if transfer.protocol == "localsend" {
-                        "native"
+                let incoming = transfer.direction == "incoming" && !transfer.is_terminal();
+                TransferView {
+                    transfer: transfer.clone(),
+                    receive_directory: if incoming {
+                        receive::options(&d.settings, transfer, None)
+                            .ok()
+                            .and_then(|options| options.directory)
                     } else {
-                        "publish_selected"
-                    });
+                        None
+                    },
+                    selection_mode: incoming.then_some(if transfer.protocol == "localsend" {
+                        SelectionMode::Native
+                    } else {
+                        SelectionMode::PublishSelected
+                    }),
                 }
-                value
             })
             .collect();
         let download_link_active = self
@@ -148,8 +175,22 @@ impl Shared {
             .await
             .as_ref()
             .is_some_and(|offer| offer.is_active());
-        json!({"download_link_active":download_link_active,"restarting":d.restarting,"epoch":d.epoch,"revision":d.revision,"peers":peers,"known_peers":known_peers,"transfers":transfers,"backends":d.backends.values().collect::<Vec<_>>(),"hardware":d.hardware,"settings":d.settings}).to_string()
+        let snapshot = Snapshot {
+            download_link_active,
+            restarting: d.restarting,
+            epoch: d.epoch.clone(),
+            revision: d.revision,
+            peers,
+            known_peers,
+            transfers,
+            backends: d.backends.values().cloned().collect(),
+            hardware: d.hardware.clone(),
+            settings: linuxdrop_ipc::Settings::from_value(&d.settings).map_err(failed)?,
+        };
+        snapshot.validate().map_err(failed)?;
+        serde_json::to_string(&snapshot).map_err(failed)
     }
+
     async fn action(&self, id: &str, action: &str) -> zbus::fdo::Result<()> {
         if action == "accept" {
             return self.accept(id, None).await;
@@ -418,7 +459,7 @@ impl Manager {
         revision: u64,
     ) -> zbus::Result<()>;
 
-    async fn get_snapshot(&self) -> String {
+    async fn get_snapshot(&self) -> zbus::fdo::Result<String> {
         self.0.snapshot().await
     }
     async fn get_settings(&self) -> String {

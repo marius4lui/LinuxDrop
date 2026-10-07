@@ -2064,7 +2064,10 @@ dependencies = [
 name = "linuxdrop-ipc"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "futures-util",
+ "linuxdrop-core",
+ "serde",
  "serde_json",
  "tokio",
  "zbus",

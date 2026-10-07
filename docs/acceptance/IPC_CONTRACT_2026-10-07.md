@@ -33,3 +33,7 @@ JSON strings still carry settings, snapshots and diagnostics. This wire contract
 does not claim complete typing or field-level validation of those payloads;
 that remaining IPC work stays in the completion ledger. Packaged-daemon/live
 contract results belong in dist/BUILD_REPORT_0.1.0+review.20261007.24.json.
+
+Follow-up: shared Rust [settings/status payload types](IPC_PAYLOAD_TYPES_2026-10-07.md)
+now validate GTK inputs and construct daemon status. Hardware/diagnostics and
+GNOME JSON field validation remain separate work.

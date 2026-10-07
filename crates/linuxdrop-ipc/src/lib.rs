@@ -6,3 +6,9 @@ pub const MANAGER_XML: &str = include_str!("../manager1.xml");
 mod proxy;
 #[cfg(feature = "client")]
 pub use proxy::*;
+
+mod settings;
+pub use settings::*;
+
+mod snapshot;
+pub use snapshot::*;

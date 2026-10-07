@@ -8,12 +8,15 @@ license.workspace = true
 client = ["dep:zbus"]
 
 [dependencies]
+linuxdrop-core = { path = "../linuxdrop-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 zbus = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio.workspace = true
 futures-util.workspace = true
-serde_json.workspace = true
 
 [[example]]
 name = "check_contract"

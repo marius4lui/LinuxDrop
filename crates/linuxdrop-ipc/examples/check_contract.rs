@@ -7,7 +7,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bus = zbus::Connection::session().await?;
     let proxy = ManagerProxy::new(&bus).await?;
     let snapshot: serde_json::Value = serde_json::from_str(&proxy.get_snapshot().await?)?;
-    assert!(snapshot["epoch"].is_string());
+    linuxdrop_ipc::Snapshot::from_value(&snapshot)?;
     let mut changed = proxy.receive_changed().await?;
     assert!(proxy
         .set_visibility("invalid-contract-test".into())
@@ -18,7 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .ok_or("Missing Changed signal")?;
     assert!(*event.args()?.revision() > snapshot["revision"].as_u64().ok_or("Missing revision")?);
-    assert!(proxy.get_defaults().await?.contains("visibility"));
+    linuxdrop_ipc::Settings::from_value(&serde_json::from_str(&proxy.get_defaults().await?)?)?;
+    linuxdrop_ipc::Settings::from_value(&serde_json::from_str(&proxy.get_settings().await?)?)?;
     assert!(proxy
         .prepare_send_files(String::new(), Vec::new())
         .await

@@ -35,8 +35,11 @@ GTK supplies that description to GDBus and validates outgoing/reply signatures;
 GNOME supplies the same description and rejects malformed actions before sending.
 CI checks generated files and compares real daemon introspection with the entire
 contract. Native packages install the XML under `share/dbus-1/interfaces`.
-JSON payload field schemas remain a separate contract; wire signatures alone do
-not validate their contents.
+Settings and the status envelope now have shared Rust models and validators in
+`linuxdrop-ipc`; the daemon constructs typed status records and GTK validates
+settings/status before rendering. Hardware details, diagnostics and GNOME JSON
+field validation remain separate contract work; wire signatures alone do not
+validate their contents.
 
 
 Service `io.github.marius4lui.LinuxDrop`, object `/io/github/marius4lui/LinuxDrop`, interface `io.github.marius4lui.LinuxDrop.Manager1`:

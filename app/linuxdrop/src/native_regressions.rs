@@ -19,6 +19,47 @@ fn find(root: &impl IsA<gtk::Widget>, name: &str) -> Option<gtk::Widget> {
     None
 }
 
+// The visual fixtures omit irrelevant fields. Complete their wire envelopes with
+// valid defaults; explicitly supplied wrong types remain wrong for negative tests.
+fn wire_fixture(value: &Value) -> Value {
+    fn fill(value: &mut Value, defaults: Value) {
+        if let (Some(target), Some(defaults)) = (value.as_object_mut(), defaults.as_object()) {
+            for (key, fallback) in defaults {
+                if let Some(current) = target.get_mut(key) {
+                    fill(current, fallback.clone());
+                } else {
+                    target.insert(key.clone(), fallback.clone());
+                }
+            }
+        }
+    }
+    let mut value = value.clone();
+    fill(
+        &mut value,
+        json!({"epoch":"native-test","revision":1,"restarting":false,"download_link_active":false,"peers":[],"known_peers":[],"transfers":[],"backends":[],"hardware":{},"settings":{}}),
+    );
+    fill(
+        &mut value["settings"],
+        linuxdrop_ipc::Settings::defaults("/tmp").to_value(),
+    );
+    for peer in value["peers"].as_array_mut().unwrap() {
+        fill(
+            peer,
+            json!({"address":"","identity_scope":linuxdrop_ipc::IDENTITY_SCOPE}),
+        );
+    }
+    for transfer in value["transfers"].as_array_mut().unwrap() {
+        fill(
+            transfer,
+            json!({"peer_id":"fixture","peer_name":"Fixture","protocol":"localsend","direction":"incoming","total_bytes":0,"transferred_bytes":0,"files":[],"saved_paths":[],"error":null,"verification_code":null}),
+        );
+        for file in transfer["files"].as_array_mut().unwrap() {
+            fill(file, json!({"transferred":0}));
+        }
+    }
+    value
+}
+
 async fn settle() {
     glib::timeout_future(Duration::from_millis(120)).await;
 }
@@ -124,6 +165,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let fail_next_setting = Rc::new(Cell::new(false));
     let setting_calls = Rc::new(Cell::new(0));
     let hold_snapshot = Rc::new(Cell::new(false));
+    let malformed_next_snapshot = Rc::new(Cell::new(false));
     let pending_snapshots = Rc::new(RefCell::new(Vec::<(
         gio::DBusMethodInvocation,
         glib::Variant,
@@ -141,13 +183,20 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let fail_setting = fail_next_setting.clone();
     let setting_count = setting_calls.clone();
     let hold = hold_snapshot.clone();
+    let malformed = malformed_next_snapshot.clone();
     let pending = pending_snapshots.clone();
     let registration = bus
         .register_object(ipc::PATH, &info.interfaces()[0])
         .method_call(
             move |_, _, _, _, method, parameters, invocation| match method {
                 "GetSnapshot" => {
-                    let response = (state.borrow().to_string(),).to_variant();
+                    let mut wire = wire_fixture(&state.borrow());
+                    linuxdrop_ipc::Snapshot::from_value(&wire)
+                        .expect("Native fixture must honor the production snapshot contract");
+                    if malformed.replace(false) {
+                        wire["restarting"] = json!("false");
+                    }
+                    let response = (wire.to_string(),).to_variant();
                     if hold.get() {
                         pending.borrow_mut().push((invocation, response));
                     } else {
@@ -510,7 +559,14 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert!(!ui.settings_resetting.get() && ui.settings_body.is_sensitive());
         assert_eq!(ui.settings_drafts.borrow().get("general.device_name").map(String::as_str), Some("Keep after failed reset"), "An unsuccessful reset preserves unsaved work");
         if let Some(dialog) = ui.window.visible_dialog() { dialog.force_close(); }
-        ui.service_error("test settings offline with proxy");
+        malformed_next_snapshot.set(true);
+        ui.refresh();
+        for _ in 0..20 {
+            if !ui.service_ready.get() { break; }
+            glib::timeout_future(Duration::from_millis(50)).await;
+        }
+        assert!(!ui.service_ready.get(), "A malformed snapshot must disable remote actions");
+        assert!(!ui.send.is_sensitive());
         let calls = setting_calls.get();
         find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap().set_active(false);
         settle().await;
@@ -546,11 +602,25 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             assert_eq!(setting_calls.get(), numeric_calls, "Focus-only changes must not write or restart sharing");
         }
         let amount = find(&ui.settings_body, "setting:receive.max_bytes").unwrap().downcast::<adw::SpinRow>().unwrap();
-        amount.grab_focus();
+        assert!(ui.service_ready.get(), "Service must be ready for the numeric edit");
+        assert!(!ui.settings_rendering.get());
+        assert!(amount.is_sensitive());
+        assert!(amount.grab_focus(), "Numeric edit must actually acquire focus");
+        settle().await;
+        assert!(gtk::prelude::GtkWindowExt::focus(&ui.window).is_some_and(|focus| focus == amount.clone().upcast::<gtk::Widget>() || focus.is_ancestor(&amount)), "The edited row must own actual keyboard focus");
         amount.set_value(107_374.182_401);
+        assert_eq!((amount.value() * 1_000_000.0).round() as u64, 107_374_182_401);
         find(&ui.settings_body, "setting:search").unwrap().grab_focus();
-        glib::timeout_future(Duration::from_millis(400)).await;
+        // Wait for the actual receipt, not a rendering-speed dependent 400-ms
+        // window (the fixture deliberately delays writes by 250 ms).
+        for _ in 0..40 {
+            if snapshot.borrow()["settings"]["receive"]["max_bytes"] == json!(107_374_182_401_u64)
+                && ui.settings.borrow()["receive"]["max_bytes"] == json!(107_374_182_401_u64)
+                && !settings::writes_pending(&ui) { break; }
+            glib::timeout_future(Duration::from_millis(50)).await;
+        }
         assert_eq!(snapshot.borrow()["settings"]["receive"]["max_bytes"], json!(107_374_182_401_u64), "An explicit MB edit preserves the intended byte count");
+        assert!(!settings::writes_pending(&ui), "The successful numeric receipt must settle");
         let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
         search.set_text(&tr("Maximum request size (MB)"));
         settle().await;
@@ -735,7 +805,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             "protected":false, "rfkill":false, "active_connection":"<b>Home & guest</b>"
         }]);
         snapshot.borrow_mut()["hardware"]["bluetooth"] = json!([{
-            "id":"hci-test", "name":"Test Bluetooth", "powered":true
+            "id":"hci1", "name":"Test Bluetooth", "powered":true
         }]);
         snapshot.borrow_mut()["revision"] = json!(321);
         ui.refresh();
@@ -777,10 +847,10 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         prefer.emit_clicked();
         settle().await;
         assert_eq!(setting_calls.get(), writes, "Reactivating the preferred adapter must not repeat its write");
-        snapshot.borrow_mut()["settings"]["bluetooth"]["adapter"] = json!("hci-test");
+        snapshot.borrow_mut()["settings"]["bluetooth"]["adapter"] = json!("hci1");
         ui.refresh();
         settle().await;
-        assert_eq!(find(&ui.hardware, "hardware:bluetooth:hci-test:prefer").unwrap().downcast::<gtk::Button>().unwrap().icon_name().as_deref(),
+        assert_eq!(find(&ui.hardware, "hardware:bluetooth:hci1:prefer").unwrap().downcast::<gtk::Button>().unwrap().icon_name().as_deref(),
             Some("emblem-ok-symbolic"), "Bluetooth preferences must also follow confirmed settings-only changes");
         let details = find(&ui.hardware, "hardware:radios:radio-test:details").unwrap();
         assert!(details.grab_focus());
@@ -954,7 +1024,9 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         let hold = hold_snapshot.clone();
         let replacement_registration = replacement.register_object(ipc::PATH, &info.interfaces()[0]).method_call(move |_,_,_,_,method,_,invocation| {
             assert_eq!(method, "GetSnapshot", "Old consent must not reach the replacement owner");
-            let response = (state.borrow().to_string(),).to_variant();
+            let wire = wire_fixture(&state.borrow());
+                    linuxdrop_ipc::Snapshot::from_value(&wire).expect("Native fixture must honor the production snapshot contract");
+                    let response = (wire.to_string(),).to_variant();
             if hold.get() { pending.borrow_mut().push((invocation,response)); } else { invocation.return_value(Some(&response)); }
         }).build().unwrap();
         replacement.call_sync(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", Some(&(ipc::BUS,0_u32).to_variant()), None, gio::DBusCallFlags::NONE, 2000, gio::Cancellable::NONE).unwrap();
