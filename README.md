@@ -15,7 +15,7 @@ This repository contains real protocol implementations. Ubuntu 24.04 amd64 is th
 | Quick Share / Nearby Share | One backend: LAN discovery, UKEY2, code comparison in both directions, send/receive, BlueZ and negotiated direct upgrade | Actual TCP handshake/file tests; physical Android, Bluetooth and direct-Wi-Fi tests pending |
 | AirDrop | AWDL helper, discovery, TLS Discover/Ask/Upload, send/receive, consent, strict archives and optional BLE wake | Actual TLS protocol tests; dedicated radio and Apple-device tests pending; Everyone mode only |
 
-Quick Share direct upgrade requires an explicitly selected idle adapter. AirDrop requires a suitable dedicated idle adapter and administrator authorization. The current Internet adapter is protected. A VM with virtual Ethernet correctly reports no Wi-Fi/Bluetooth; it can still run the app and LAN transports where the network permits discovery.
+Quick Share direct upgrade and AirDrop use jointly selected idle adapters; you can set a preferred adapter in Settings. With only one suitable AWDL radio, AirDrop gets it and Quick Share retains LAN sharing. Automatic USB use can be disabled. Radio access requires administrator authorization, and the current Internet adapter stays protected. A VM with virtual Ethernet correctly reports no Wi-Fi/Bluetooth; it can still run the app and LAN transports where the network permits discovery.
 
 ## Install
 
