@@ -385,3 +385,25 @@ Both private-bus suites and all-target workspace Clippy passed. These tests prov
 advertisement lifecycle behavior, not complete scanner/GATT/L2CAP recovery or
 physical hardware interoperability; those broader rows remain open. Demo and
 installed packages are unchanged.
+
+
+## Bluetooth server task ownership, 2026-10-07
+
+GATT and L2CAP now retain all connection/notify, inbound, and advertisement-cycle
+work in bounded per-server task groups. Ending a BLE bridge preserves an inbound
+session that has migrated to Wi-Fi; backend shutdown closes admission, cancels
+all owned work, and waits for resources to be dropped. Late callbacks cannot
+reopen a drained group. GATT acknowledges StartNotify immediately, limits queued
+writes and message assembly, and rejects payloads for other service hashes.
+
+GATT application cleanup also waits for BlueZ acknowledgement and local exported
+object removal. Its registration worker survives cancellation while a method
+reply is outstanding and cleans uncertain failed registrations; cleanup remains
+bound to the original unique daemon owner. The private-bus test exercises the
+real GATT callbacks, queue exhaustion, oversized writes, immediate notification
+setup, held unregister acknowledgements, removed objects, abandoned registration,
+failed registration and successful scanning after shutdown. Two additional task
+ownership tests cover migrated-session lifetime and cancellation of stalled work.
+Workspace all-target Clippy passed. Real Bluetooth transport/Wi-Fi migration and
+controller loss recovery across all roles remain separate acceptance/implementation
+items; these tests do not mark those broader rows complete.

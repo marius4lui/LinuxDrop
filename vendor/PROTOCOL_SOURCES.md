@@ -45,8 +45,8 @@ The upstream library and CLI sources are retained for attribution and reproducib
 
 `vendor/bluer` contains the crates.io 0.17.4 source snapshot identified by its
 original `.cargo_vcs_info.json`. The workspace patches that exact package locally.
-Only `src/adv.rs` and `src/session.rs` differ from the published source (including
-Rust formatting). The normalized upstream Cargo.toml and original Cargo.toml.orig
+Only `src/adv.rs`, `src/session.rs` and `src/gatt/local.rs` differ from the
+published source (including Rust formatting). The normalized upstream Cargo.toml and original Cargo.toml.orig
 are retained. Registry cache markers and its package lockfile are omitted.
 
 - `AdvertisementHandle::unregister()` waits for the BlueZ method reply and local
@@ -114,3 +114,15 @@ reports scan start/stop failures, and awaits bounded cleanup after cancellation
 or an uncertain start reply. A private BlueZ test uses read-only Powered properties
 to ensure no implicit power writes, checks exact-controller discovery, held stop
 acknowledgements, failed-start cleanup and failed-stop reporting.
+
+
+GATT application lifecycle now has the same explicit cleanup receipt: registration
+is retained across caller cancellation, uncertain registration replies trigger
+cleanup, and unregister stays pinned to the unique registering BlueZ owner.
+Local service/characteristic objects are removed only after confirmed absence.
+Quick Share awaits this receipt and drains all owned GATT/L2CAP callback, bridge,
+inbound and advertisement-refresh tasks. Migrated inbound sessions remain owned
+by the server after the original BLE bridge ends. Shutdown closes task admission
+before waiting, and each server permits at most 32 tasks. GATT packet queues are
+bounded to 128 writes of at most 512 bytes; reassembly is capped at 1 MiB and
+foreign service payloads are not forwarded to the Quick Share parser.

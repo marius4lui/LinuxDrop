@@ -1,3 +1,8 @@
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+mod bluetooth_tasks;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+#[doc(hidden)]
+pub use bluetooth_tasks::BluetoothTasks;
 use std::collections::HashMap;
 
 use info::{InternalFileInfo, TransferMetadata};

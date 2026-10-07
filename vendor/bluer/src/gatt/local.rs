@@ -1296,8 +1296,22 @@ pub struct Application {
 
 impl Application {
     pub(crate) async fn register(
-        mut self, inner: Arc<SessionInner>, adapter_name: Arc<String>,
+        mut self,
+        inner: Arc<SessionInner>,
+        adapter_name: Arc<String>,
     ) -> crate::Result<ApplicationHandle> {
+        // Pin all lifecycle calls to the registering daemon, never a replacement
+        // that subsequently acquires org.bluez.
+        let bus = Proxy::new(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            std::time::Duration::from_secs(15),
+            inner.connection.clone(),
+        );
+        let (owner,): (String,) = bus
+            .method_call("org.freedesktop.DBus", "GetNameOwner", (SERVICE_NAME,))
+            .await?;
+        let adapter_path = Adapter::dbus_path(&adapter_name)?;
         let mut reg_paths = Vec::new();
         let app_path = format!("{}{}", GATT_APP_PREFIX, Uuid::new_v4().as_simple());
         let app_path = dbus::Path::new(app_path).unwrap();
@@ -1319,7 +1333,11 @@ impl Application {
                 let service_path = dbus::Path::new(service_path).unwrap();
                 log::trace!("Publishing service at {}", &service_path);
                 reg_paths.push(service_path.clone());
-                cr.insert(service_path.clone(), &[inner.gatt_reg_service_token], Arc::new(reg_service));
+                cr.insert(
+                    service_path.clone(),
+                    &[inner.gatt_reg_service_token],
+                    Arc::new(reg_service),
+                );
 
                 for (char_idx, mut char) in chars.into_iter().enumerate() {
                     let descs = take(&mut char.descriptors);
@@ -1329,7 +1347,11 @@ impl Application {
                     let char_path = dbus::Path::new(char_path).unwrap();
                     log::trace!("Publishing characteristic at {}", &char_path);
                     reg_paths.push(char_path.clone());
-                    cr.insert(char_path.clone(), &[inner.gatt_reg_characteristic_token], Arc::new(reg_char));
+                    cr.insert(
+                        char_path.clone(),
+                        &[inner.gatt_reg_characteristic_token],
+                        Arc::new(reg_char),
+                    );
 
                     for (desc_idx, desc) in descs.into_iter().enumerate() {
                         let reg_desc = RegisteredDescriptor::new(desc);
@@ -1347,39 +1369,117 @@ impl Application {
             }
         }
 
-        log::trace!("Registering application at {}", &app_path);
-        let proxy =
-            Proxy::new(SERVICE_NAME, Adapter::dbus_path(&adapter_name)?, TIMEOUT, inner.connection.clone());
-        let () = proxy
-            .method_call(MANAGER_INTERFACE, "RegisterApplication", (app_path.clone(), PropMap::new()))
-            .await?;
-
+        let proxy = Proxy::new(
+            owner,
+            adapter_path,
+            std::time::Duration::from_secs(15),
+            inner.connection.clone(),
+        );
         let (drop_tx, drop_rx) = oneshot::channel();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        let (finished, completion) = watch::channel(None);
         let app_path_unreg = app_path.clone();
+        // Own even an in-flight registration whose calling future is cancelled.
         tokio::spawn(async move {
-            let _ = drop_rx.await;
-
-            log::trace!("Unregistering application at {}", &app_path_unreg);
-            let _: std::result::Result<(), dbus::Error> =
-                proxy.method_call(MANAGER_INTERFACE, "UnregisterApplication", (app_path_unreg,)).await;
-
+            let registered: Result<()> = proxy
+                .method_call(
+                    MANAGER_INTERFACE,
+                    "RegisterApplication",
+                    (app_path_unreg.clone(), PropMap::new()),
+                )
+                .await
+                .map_err(Into::into);
+            let mut registered_tx = Some(registered_tx);
+            if registered.is_ok() {
+                let _ = registered_tx.take().unwrap().send(Ok(()));
+                let _ = drop_rx.await;
+            }
+            // A failed reply can still have left a server-side registration.
+            // Keep the exported objects until absence is acknowledged.
+            loop {
+                let result: std::result::Result<(), dbus::Error> = proxy
+                    .method_call(
+                        MANAGER_INTERFACE,
+                        "UnregisterApplication",
+                        (app_path_unreg.clone(),),
+                    )
+                    .await;
+                match result {
+                    Ok(()) => break,
+                    Err(error)
+                        if matches!(
+                            error.name(),
+                            Some(
+                                "org.bluez.Error.DoesNotExist"
+                                    | "org.freedesktop.DBus.Error.ServiceUnknown"
+                                    | "org.freedesktop.DBus.Error.NameHasNoOwner"
+                                    | "org.freedesktop.DBus.Error.UnknownObject"
+                                    | "org.freedesktop.DBus.Error.UnknownMethod"
+                            )
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "GATT application cleanup pending at {}: {}",
+                            app_path_unreg,
+                            error
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
             let mut cr = inner.crossroads.lock().await;
             for reg_path in reg_paths.into_iter().rev() {
                 log::trace!("Unpublishing {}", &reg_path);
                 let _: Option<Self> = cr.remove(&reg_path);
             }
+            finished.send_replace(Some(Ok(())));
+            if let Some(reply) = registered_tx {
+                let _ = reply.send(registered);
+            }
         });
-
-        Ok(ApplicationHandle { name: app_path, _drop_tx: drop_tx })
+        registered_rx.await.map_err(|_| Error {
+            kind: ErrorKind::Failed,
+            message: "GATT registration worker stopped".into(),
+        })??;
+        Ok(ApplicationHandle {
+            name: app_path,
+            drop_tx: Some(drop_tx),
+            completion,
+        })
     }
 }
 
 /// Handle to local GATT application published over Bluetooth.
 ///
 /// Drop this handle to unpublish.
+#[must_use = "Hold the application handle while its services are published"]
 pub struct ApplicationHandle {
     name: dbus::Path<'static>,
-    _drop_tx: oneshot::Sender<()>,
+    drop_tx: Option<oneshot::Sender<()>>,
+    completion: watch::Receiver<Option<Result<()>>>,
+}
+
+impl ApplicationHandle {
+    /// Wait for daemon acknowledgement and local object removal. Cancelling
+    /// this wait does not cancel cleanup; subsequent waits see the same receipt.
+    pub async fn unregister(&mut self) -> Result<()> {
+        if let Some(stop) = self.drop_tx.take() {
+            let _ = stop.send(());
+        }
+        let mut completion = self.completion.clone();
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            completion.changed().await.map_err(|_| Error {
+                kind: ErrorKind::Failed,
+                message: "GATT cleanup worker stopped".into(),
+            })?;
+        }
+    }
 }
 
 impl Drop for ApplicationHandle {

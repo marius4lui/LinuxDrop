@@ -1,6 +1,8 @@
 //! Real Quick Share advertisement actors against the isolated BlueZ mock.
 #[path = "../../linuxdrop-network/tests/support/bluez.rs"]
 mod bluez;
+#[path = "support/gatt.rs"]
+mod gatt;
 #[path = "support/scanner.rs"]
 mod scanner;
 use bluez::{Adapter, Advertising, State};
@@ -147,6 +149,123 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
     assert!(error.to_string().contains("no longer active"));
     assert!(second.active.lock().unwrap().is_empty());
     assert_eq!(first.registrations.load(Ordering::SeqCst), 0);
+
+    // StartNotify must acknowledge registration immediately, not await a peer's
+    // handshake. A cancelled server must release its scan suppressor before the
+    // real scanner below is started.
+    let gatt_state = Arc::new(gatt::State::default());
+    bus.object_server()
+        .at("/org/bluez/hci1", gatt::Gatt(gatt_state.clone()))
+        .await
+        .unwrap();
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let server = rqs_lib::hdl::ReceiverGattServer::new(vec![1, 2, 3], events, 53318)
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let stopping = cancel.clone();
+    let running = tokio::spawn(async move { server.run(stopping).await });
+    wait_for(|| gatt_state.active.lock().unwrap().is_some()).await;
+    let (path, owner) = gatt_state.active.lock().unwrap().clone().unwrap();
+    let writer_path = format!("{path}/service0/char1");
+    let writer = zbus::Proxy::new(
+        &bus,
+        owner.as_str(),
+        writer_path.as_str(),
+        "org.bluez.GattCharacteristic1",
+    )
+    .await
+    .unwrap();
+    let device =
+        zbus::zvariant::OwnedObjectPath::try_from("/org/bluez/hci1/dev_00_11_22_33_44_55").unwrap();
+    let options = std::collections::HashMap::from([
+        ("device", zbus::zvariant::Value::from(device)),
+        ("mtu", zbus::zvariant::Value::from(512_u16)),
+    ]);
+    let oversized = writer
+        .call::<_, _, ()>("WriteValue", &(vec![0_u8; 513], &options))
+        .await;
+    assert!(
+        oversized
+            .unwrap_err()
+            .to_string()
+            .contains("InvalidValueLength")
+    );
+    for _ in 0..128 {
+        writer
+            .call::<_, _, ()>("WriteValue", &(vec![0_u8], &options))
+            .await
+            .unwrap();
+    }
+    let full = writer
+        .call::<_, _, ()>("WriteValue", &(vec![0_u8], &options))
+        .await;
+    assert!(full.unwrap_err().to_string().contains("InProgress"));
+    let notify_path = format!("{path}/service0/char2");
+    let notify = zbus::Proxy::new(
+        &bus,
+        owner.as_str(),
+        notify_path.as_str(),
+        "org.bluez.GattCharacteristic1",
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        notify.call::<_, _, ()>("StartNotify", &()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    gatt_state.hold_unregister.store(true, Ordering::SeqCst);
+    cancel.cancel();
+    wait_for(|| gatt_state.removals.load(Ordering::SeqCst) == 1).await;
+    assert!(
+        !running.is_finished(),
+        "GATT server must wait for BlueZ removal acknowledgement"
+    );
+    gatt_state.hold_unregister.store(false, Ordering::SeqCst);
+    gatt_state.wake.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(1), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(gatt_state.active.lock().unwrap().is_none());
+    assert!(
+        notify.call::<_, _, ()>("StartNotify", &()).await.is_err(),
+        "Removed GATT objects must reject late callbacks"
+    );
+
+    // Abandon an in-flight registration after BlueZ processed it. The owned
+    // registration worker must still remove the late successful registration.
+    gatt_state.hold_register.store(true, Ordering::SeqCst);
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let server = rqs_lib::hdl::ReceiverGattServer::new(vec![1], events, 53318)
+        .await
+        .unwrap();
+    let running = tokio::spawn(async move { server.run(CancellationToken::new()).await });
+    wait_for(|| gatt_state.active.lock().unwrap().is_some()).await;
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    gatt_state.hold_register.store(false, Ordering::SeqCst);
+    gatt_state.wake.notify_waiters();
+    wait_for(|| {
+        gatt_state.removals.load(Ordering::SeqCst) == 2
+            && gatt_state.active.lock().unwrap().is_none()
+    })
+    .await;
+
+    // A failed reply is also uncertain: cleanup must complete before returning
+    // the registration error to the backend.
+    gatt_state.fail_register.store(true, Ordering::SeqCst);
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let server = rqs_lib::hdl::ReceiverGattServer::new(vec![1], events, 53318)
+        .await
+        .unwrap();
+    assert!(server.run(CancellationToken::new()).await.is_err());
+    assert!(gatt_state.active.lock().unwrap().is_none());
+    assert_eq!(gatt_state.removals.load(Ordering::SeqCst), 3);
 
     // Exercise the real btleplug/bluez-async scanner against the same private
     // bus, with the full Adapter1 property schema that it reads.

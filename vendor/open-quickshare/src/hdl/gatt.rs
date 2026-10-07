@@ -4,19 +4,19 @@ use std::time::Duration;
 use bluer::gatt::local::{
     Application, Characteristic, CharacteristicNotifier, CharacteristicNotify,
     CharacteristicNotifyMethod, CharacteristicRead, CharacteristicWrite, CharacteristicWriteMethod,
-    Service,
+    ReqError, Service,
 };
 use bluer::{Adapter, Address, Uuid, UuidExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::Sender;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender as PacketSender, channel};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::channel::ChannelMessage;
 use crate::errors::AppError;
-use crate::hdl::{BleScanSuppressor, InboundRequest, request_advert_cycle};
+use crate::hdl::{BleScanSuppressor, BluetoothTasks, InboundRequest, request_advert_cycle};
 
 const INNER_NAME: &str = "ReceiverGattServer";
 
@@ -73,15 +73,15 @@ const PEER_GONE_FALLBACK: Duration = Duration::from_secs(2);
 /// than being fed to the next connection's weave parser as if it were the start
 /// of its stream.
 struct WeaveChannel {
-    tx: UnboundedSender<(Address, Vec<u8>)>,
-    rx: Option<UnboundedReceiver<(Address, Vec<u8>)>>,
+    tx: PacketSender<(Address, Vec<u8>)>,
+    rx: Option<Receiver<(Address, Vec<u8>)>>,
     /// Cancels whichever session currently holds `rx`.
     ctk: CancellationToken,
 }
 
 impl WeaveChannel {
     fn new() -> Self {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = channel(128);
         Self {
             tx,
             rx: Some(rx),
@@ -117,6 +117,11 @@ impl ReceiverGattServer {
     }
 
     pub async fn run(&self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+        let tasks = BluetoothTasks::new(&ctk);
+        let _cancel_on_drop = tasks.cancellation().drop_guard();
+        let slot0_tasks = tasks.clone();
+        let notify_tasks = tasks.clone();
+        let write_cancel = tasks.cancellation();
         let service_uuid = Uuid::from_u16(QS_GATT_SERVICE);
         let slot0: Uuid = QS_ADV_SLOT0_UUID.parse()?;
         let weave_write: Uuid = QS_WEAVE_TO_PERIPHERAL.parse()?;
@@ -149,6 +154,7 @@ impl ReceiverGattServer {
                                 let advert = advert.clone();
                                 let adapter = slot0_adapter.clone();
                                 let pending = slot0_pending.clone();
+                                let tasks = slot0_tasks.clone();
                                 Box::pin(async move {
                                     let addr = req.device_address;
                                     debug!(
@@ -163,11 +169,14 @@ impl ReceiverGattServer {
                                     // phone comes back to connect for the transfer.
                                     let fresh = pending.lock().unwrap().insert(addr);
                                     if fresh {
-                                        let pending = pending.clone();
-                                        tokio::spawn(async move {
+                                        let waiting = pending.clone();
+                                        if !tasks.spawn(async move {
                                             cycle_advert_when_peer_gone(adapter, Some(addr)).await;
+                                            waiting.lock().unwrap().remove(&addr);
+                                        }) {
                                             pending.lock().unwrap().remove(&addr);
-                                        });
+                                            return Err(ReqError::InProgress);
+                                        }
                                     }
                                     Ok(advert)
                                 })
@@ -185,15 +194,23 @@ impl ReceiverGattServer {
                             write_without_response: false,
                             method: CharacteristicWriteMethod::Fun(Box::new(move |value, req| {
                                 let write_chan = write_chan.clone();
+                                let cancel = write_cancel.clone();
                                 Box::pin(async move {
+                                    if cancel.is_cancelled() {
+                                        return Err(ReqError::NotPermitted);
+                                    }
+                                    if value.len() > 512 {
+                                        return Err(ReqError::InvalidValueLength);
+                                    }
                                     // Tag with the writer so a session can tell
                                     // its own peer's packets from a second
                                     // device's.
-                                    let _ = write_chan
+                                    write_chan
                                         .lock()
                                         .await
                                         .tx
-                                        .send((req.device_address, value));
+                                        .try_send((req.device_address, value))
+                                        .map_err(|_| ReqError::InProgress)?;
                                     Ok(())
                                 })
                             })),
@@ -210,8 +227,15 @@ impl ReceiverGattServer {
                                 let chan = chan.clone();
                                 let sender = sender.clone();
                                 let adapter = adapter.clone();
+                                let tasks = notify_tasks.clone();
                                 Box::pin(async move {
-                                    weave_session(notifier, chan, sender, tcp_port, adapter).await;
+                                    let sessions = tasks.clone();
+                                    tasks.spawn(async move {
+                                        weave_session(
+                                            notifier, chan, sender, tcp_port, adapter, sessions,
+                                        )
+                                        .await;
+                                    });
                                 })
                             })),
                             ..Default::default()
@@ -228,10 +252,17 @@ impl ReceiverGattServer {
             "{INNER_NAME}: registering GATT service 0x{QS_GATT_SERVICE:04X} (slot0 {} bytes + weave socket)",
             self.advertisement.len()
         );
-        let handle = self.adapter.serve_gatt_application(app).await?;
+        let mut handle = match self.adapter.serve_gatt_application(app).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                tasks.shutdown().await;
+                return Err(error.into());
+            }
+        };
         ctk.cancelled().await;
         info!("{INNER_NAME}: tracker cancelled, returning");
-        drop(handle);
+        tasks.shutdown().await;
+        handle.unregister().await?;
 
         Ok(())
     }
@@ -246,6 +277,7 @@ async fn weave_session(
     sender: Sender<ChannelMessage>,
     tcp_port: u16,
     adapter: Arc<Adapter>,
+    tasks: BluetoothTasks,
 ) {
     // Claim the packet stream for this session. A notification session starting
     // while another still holds it means the phone reconnected, so evict the
@@ -281,7 +313,7 @@ async fn weave_session(
     // pauses our advertisement outright.
     let _suppressor = BleScanSuppressor::new();
 
-    let peer = weave_session_inner(notifier, &mut rx, ctk, sender, tcp_port).await;
+    let peer = weave_session_inner(notifier, &mut rx, ctk, sender, tcp_port, tasks.clone()).await;
 
     // Hand a fresh channel back, dropping anything this connection left queued
     // along with the old one.
@@ -289,10 +321,9 @@ async fn weave_session(
     info!("{INNER_NAME}: weave: session ended");
 
     // This session existing at all means a central connected to us, and that
-    // connection consumed the connectable advertisement. Spawned rather than
-    // awaited: this future is the body of BlueZ's StartNotify call, and its
-    // D-Bus reply shouldn't wait out a disconnect.
-    tokio::spawn(cycle_advert_when_peer_gone(adapter, peer));
+    // connection consumed the connectable advertisement. Keep the peer-disconnect
+    // wait owned by the server, without holding up a replacement notify session.
+    tasks.spawn(cycle_advert_when_peer_gone(adapter, peer));
 }
 
 /// Waits for the finished session's peer to drop its LE connection, then asks
@@ -335,10 +366,11 @@ pub(crate) async fn cycle_advert_when_peer_gone(adapter: Arc<Adapter>, peer: Opt
 /// Returns the peer's address once the weave handshake has identified it.
 async fn weave_session_inner(
     mut notifier: CharacteristicNotifier,
-    rx: &mut UnboundedReceiver<(Address, Vec<u8>)>,
+    rx: &mut Receiver<(Address, Vec<u8>)>,
     ctk: CancellationToken,
     sender: Sender<ChannelMessage>,
     tcp_port: u16,
+    tasks: BluetoothTasks,
 ) -> Option<Address> {
     info!("{INNER_NAME}: weave: notify session open");
 
@@ -415,7 +447,7 @@ async fn weave_session_inner(
     let (inbound_side, weave_side) = tokio::io::duplex(64 * 1024);
     let (mut weave_rd, mut weave_wr) = tokio::io::split(weave_side);
     let isender = sender.clone();
-    tokio::spawn(async move {
+    if !tasks.spawn(async move {
         let mut ir = InboundRequest::new(
             crate::hdl::MigratableStream::Ble(inbound_side),
             uuid::Uuid::new_v4().to_string(),
@@ -439,7 +471,7 @@ async fn weave_session_inner(
                 }
             }
         }
-    });
+    }) { return Some(peer); }
 
     // 3. Shuttle loop.
     let mut reasm: Vec<u8> = Vec::new(); // reassembles fragmented weave messages
@@ -488,6 +520,11 @@ async fn weave_session_inner(
                     continue;
                 }
                 // Data weave packet: reassemble first..last into a message.
+                if hdr & WEAVE_FIRST_BIT != 0 { reasm.clear(); }
+                if reasm.len().saturating_add(pkt.len() - 1) > (1 << 20) {
+                    warn!("{INNER_NAME}: weave message exceeded the receive limit");
+                    break;
+                }
                 reasm.extend_from_slice(&pkt[1..]);
                 if hdr & WEAVE_LAST_BIT == 0 {
                     continue;
@@ -510,6 +547,7 @@ async fn weave_session_inner(
                     }
                     continue;
                 }
+                if msg[..3] != QS_SVC_HASH { continue; }
                 // Data packet: strip 3-byte hash, forward [len][frame] to inbound.
                 let inner = &msg[3..];
                 let len_field = if inner.len() >= 4 {

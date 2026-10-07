@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::channel::ChannelMessage;
 use crate::errors::AppError;
-use crate::hdl::{BleScanSuppressor, InboundRequest, cycle_advert_when_peer_gone};
+use crate::hdl::{BleScanSuppressor, BluetoothTasks, InboundRequest, cycle_advert_when_peer_gone};
 
 const INNER_NAME: &str = "L2capServer";
 
@@ -160,11 +160,13 @@ impl L2capServer {
         ctk: CancellationToken,
     ) {
         info!("{INNER_NAME}: accepting Quick Share connections");
+        let tasks = BluetoothTasks::new(&ctk);
+        let _cancel_on_drop = tasks.cancellation().drop_guard();
         loop {
             tokio::select! {
                 _ = ctk.cancelled() => {
                     info!("{INNER_NAME}: tracker cancelled, returning");
-                    return;
+                    break;
                 }
                 accepted = self.listener.accept() => match accepted {
                     Ok((stream, peer)) => {
@@ -172,12 +174,13 @@ impl L2capServer {
                         let advert = advert.clone();
                         let sender = sender.clone();
                         let adapter = self.adapter.clone();
-                        tokio::spawn(async move {
+                        let sessions = tasks.clone();
+                        tasks.spawn(async move {
                             // Scanning steals airtime from the link, exactly
                             // as it does from GATT sessions.
                             let _suppressor = BleScanSuppressor::new();
                             if let Err(e) =
-                                serve_connection(stream, &advert, sender, tcp_port).await
+                                serve_connection(stream, &advert, sender, tcp_port, sessions).await
                             {
                                 debug!("{INNER_NAME}: connection from {} ended: {e}", peer.addr);
                             }
@@ -190,13 +193,14 @@ impl L2capServer {
                     Err(e) => {
                         warn!("{INNER_NAME}: accept failed: {e}");
                         tokio::select! {
-                            _ = ctk.cancelled() => return,
+                            _ = ctk.cancelled() => break,
                             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                         }
                     }
                 },
             }
         }
+        tasks.shutdown().await;
     }
 }
 
@@ -222,6 +226,7 @@ async fn serve_connection(
     advert: &[u8],
     sender: Sender<ChannelMessage>,
     tcp_port: u16,
+    tasks: BluetoothTasks,
 ) -> Result<(), anyhow::Error> {
     // Sniff the dialect from the first four bytes (see the type-level docs).
     let mut head = [0u8; 4];
@@ -232,7 +237,7 @@ async fn serve_connection(
     if head[0] == 0x00 && head[1] == 0x00 {
         // u32-BE frame lengths: the GmsCore BLE-socket stream.
         debug!("{INNER_NAME}: client speaks u32-framed packets");
-        serve_ble_socket(stream, leftover, advert, sender, tcp_port).await
+        serve_ble_socket(stream, leftover, advert, sender, tcp_port, tasks).await
     } else if head[0] == 0x00 {
         // u16-BE packet lengths around the command protocol.
         debug!("{INNER_NAME}: client speaks length-prefixed command packets");
@@ -256,6 +261,7 @@ async fn serve_ble_socket(
     advert: &[u8],
     sender: Sender<ChannelMessage>,
     tcp_port: u16,
+    tasks: BluetoothTasks,
 ) -> Result<(), anyhow::Error> {
     loop {
         let Some(msg) = read_frame(&mut stream, &mut leftover).await? else {
@@ -268,7 +274,8 @@ async fn serve_ble_socket(
 
         // Weave-style messages: [00 00 00|service_hash][data].
         if msg.len() >= 3 && (msg[..3] == [0, 0, 0] || msg[..3] == SVC_HASH) {
-            return serve_weave_messages(stream, leftover, Some(msg), sender, tcp_port).await;
+            return serve_weave_messages(stream, leftover, Some(msg), sender, tcp_port, tasks)
+                .await;
         }
 
         // Otherwise: a u32-framed BleL2capPacket command.
@@ -303,7 +310,7 @@ async fn serve_ble_socket(
                 // weave-style messages (INTRODUCTION control frame first, then
                 // service-hash-tagged entries) -- not the bare endpoint
                 // channel.
-                return serve_weave_messages(stream, leftover, None, sender, tcp_port).await;
+                return serve_weave_messages(stream, leftover, None, sender, tcp_port, tasks).await;
             }
             other => anyhow::bail!("unsupported framed command {other:?}"),
         }
@@ -327,14 +334,17 @@ async fn serve_weave_messages(
     first_msg: Option<Vec<u8>>,
     sender: Sender<ChannelMessage>,
     tcp_port: u16,
+    tasks: BluetoothTasks,
 ) -> Result<(), anyhow::Error> {
     let (inbound_side, local) = tokio::io::duplex(64 * 1024);
     let (mut local_rd, mut local_wr) = tokio::io::split(local);
-    tokio::spawn(run_inbound(
+    if !tasks.spawn(run_inbound(
         crate::hdl::MigratableStream::Ble(inbound_side),
         sender,
         tcp_port,
-    ));
+    )) {
+        anyhow::bail!("Bluetooth session capacity exhausted or server stopping");
+    }
 
     // Introduce ourselves right away; the phone waits ~4s for this.
     stream.write_all(&build_intro_frame()).await?;
