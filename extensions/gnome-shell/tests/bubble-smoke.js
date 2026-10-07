@@ -86,6 +86,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     find(this._body, 'Cancel').grab_key_focus();
                     this._actionPending = true; this._render();
                     check(!find(this._body, 'Cancel').reactive, 'Mutation must be disabled while pending');
+                    check(this._indicator.toggle.subtitle === t('Working…') && !this._indicator.toggle.reactive, 'Quick Settings must expose pending state and prevent repeated mutations');
                     check(find(this._body, 'Details').reactive, 'Details must remain available while pending');
                     check(global.stage.get_key_focus() === this._header, 'Status rebuild must retain focus inside the bubble');
                     this._actionPending = false;
@@ -106,6 +107,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         this.openApp('--transfers');
                         check(this._expanded && this._notch.visible && this._selectedTransfer === current.id, 'Launch failure must restore the bubble and selected transfer');
                         check(this._body.get_children().some(child => child instanceof St.Label && child.text === 'Launch failure for smoke test'), 'Launch failure must remain visible with retry navigation');
+                        check(this._indicator.toggle.subtitle === t('Needs attention'), 'Quick Settings must expose action failures');
                         check(find(this._body, 'Details').reactive, 'Failed launch must allow retry');
                     } finally { this._launchApp = launchApp; }
                     this._actionPending = false; this._serviceState = 'offline'; this._snapshot = null; this._render();
@@ -118,7 +120,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     this._proxy = {
                         get_name_owner: () => owner,
                         call: (method, _parameters, _flags, _timeout, _cancellable, callback) => requests.push({method, callback}),
-                        call_finish: result => result,
+                        call_finish: result => { if (result instanceof Error) throw result; return result; },
                     };
                     try {
                         this._ownerChanged();
@@ -146,18 +148,48 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         this._snapshot.transfers[0].id = 'replacement-request'; this._selectedTransfer = null; this._render();
                         check(global.stage.get_key_focus() === this._header, 'A different request must never inherit consent focus');
                         this._snapshot.transfers[0].id = 'reconnect'; this._selectedTransfer = null; this._render();
+                        this._refresh();
+                        const preActionRead = requests.shift();
                         this.call('AcceptTransfer', new GLib.Variant('(s)', ['reconnect']));
                         const newAction = requests.shift();
                         oldAction.callback(this._proxy, {deep_unpack: () => []});
                         check(this._actionPending && requests.length === 0, 'Old action completion must not unlock a new owner action');
                         newAction.callback(this._proxy, {deep_unpack: () => []});
-                        check(!this._actionPending && requests.length === 1, 'Current action completion must refresh normally');
+                        check(this._actionPending && requests.length === 0 && !find(this._body, 'Codes match').reactive, 'Successful receipt must keep consent disabled while an older read is in flight');
+                        this.call('AcceptTransfer', new GLib.Variant('(s)', ['reconnect']));
+                        check(requests.length === 0, 'Repeated consent must not be sent before the post-action snapshot');
+                        reply(preActionRead, snapshot(1));
+                        check(this._actionPending && requests.length === 1, 'A pre-action snapshot must not unlock consent and must start a fresh read');
+                        reply(requests.shift(), snapshot(1));
+                        check(!this._actionPending && find(this._body, 'Codes match').reactive && this._indicator.toggle.reactive, 'A post-action snapshot must settle controls even when revision is unchanged');
+                        this._refresh();
                         reply(requests.shift(), {...snapshot(2), transfers: []});
                         check(!find(this._body, 'Codes match') && find(this._body, 'Drop files'), 'Fresh empty state must retire the completed request');
+                        this.call('SetVisibility', new GLib.Variant('(s)', ['everyone']));
+                        requests.shift().callback(this._proxy, new Error('Visibility change failed'));
+                        check(!this._actionPending && this._indicator.toggle.reactive && !this._indicator.toggle.checked && this._indicator.toggle.subtitle === t('Needs attention'), 'Failed visibility change must restore retry and show attention without claiming the requested mode');
+                        this.call('SetVisibility', new GLib.Variant('(s)', ['everyone']));
+                        requests.shift().callback(this._proxy, {deep_unpack: () => []});
+                        check(this._actionPending && requests.length === 1, 'Successful visibility change must wait for its own snapshot');
+                        requests.shift().callback(this._proxy, new Error('Snapshot unavailable'));
+                        check(!this._actionPending && !this._actionAwaitingSnapshot && this._serviceState === 'offline' && !this._indicator.toggle.reactive, 'Failed post-action snapshot must leave the UI recoverable and remote actions unavailable');
+                        this._refresh();
+                        reply(requests.shift(), {...snapshot(3), transfers: []});
+                        check(this._serviceState === 'ready' && this._indicator.toggle.reactive, 'Recovery must restore actions without a stuck pending flag');
+                        this.call('SetVisibility', new GLib.Variant('(s)', ['everyone']));
+                        const pendingVisibility = requests.shift();
+                        this._refresh();
+                        requests.shift().callback(this._proxy, new Error('Concurrent snapshot unavailable'));
+                        this._refresh();
+                        reply(requests.shift(), {...snapshot(4), transfers: []});
+                        check(this._actionPending && !this._indicator.toggle.reactive, 'An unrelated read failure and recovery must not unlock a mutation still in flight');
+                        pendingVisibility.callback(this._proxy, {deep_unpack: () => []});
+                        reply(requests.shift(), {...snapshot(5), transfers: []});
+                        check(!this._actionPending && this._indicator.toggle.reactive, 'An in-flight mutation must settle after recovery and its post-action read');
                     } finally { this._proxy = realProxy; }
                     this._setExpanded(false);
                     check(!this._notch.visible && global.stage.get_key_focus() === this._panelButton, 'Close must hide and restore panel focus');
-                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, stable action focus, consent focus isolation, literal external names, persistent send/settings, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, focus');
+                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, stable action focus, consent focus isolation, literal external names, persistent send/settings, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, post-action snapshot gating, Quick Settings feedback, focus');
                 });
             });
         });

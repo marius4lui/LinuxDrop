@@ -185,6 +185,17 @@ fn export(ui: &Rc<Ui>) {
 
 impl Ui {
     pub fn run_hardware_diagnostic(self: &Rc<Self>, radio_id: &str) {
+        let Some(proxy) = self
+            .proxy
+            .borrow()
+            .clone()
+            .filter(|proxy| self.service_is_ready() && proxy.g_name_owner().is_some())
+        else {
+            self.toast("The sharing service is not connected yet");
+            return;
+        };
+        let generation = self.service_generation();
+        let owner = proxy.g_name_owner();
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.append(&label("This active test may briefly create a monitor interface and change its channel. It never runs automatically. The daemon refuses tests on protected or busy adapters.","compact-note"));
         let channel = adw::SpinRow::builder()
@@ -213,20 +224,34 @@ impl Ui {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let Some(proxy) = ui.proxy.borrow().clone() else {
+            if !ui.service_is_ready()
+                || generation != ui.service_generation()
+                || proxy.g_name_owner() != owner
+            {
                 return;
-            };
+            }
+            let proxy = proxy.clone();
+            let owner = owner.clone();
             let id = id.clone();
             let channel = channel.value() as u16;
             glib::MainContext::default().spawn_local(async move {
-                match ipc::call(
+                if !ui.service_is_ready()
+                    || generation != ui.service_generation()
+                    || proxy.g_name_owner() != owner
+                {
+                    return;
+                }
+                let result = ipc::call(
                     &proxy,
                     "RunHardwareDiagnostic",
                     Some((id, channel).to_variant()),
                 )
                 .await
-                .and_then(ipc::string_result)
-                {
+                .and_then(ipc::string_result);
+                if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+                    return;
+                }
+                match result {
                     Ok(text) => match serde_json::from_str(&text) {
                         Ok(report) => report_dialog(&ui, "Hardware diagnostic", &report),
                         Err(error) => ui.toast(&error.to_string()),
@@ -236,6 +261,7 @@ impl Ui {
                 ui.refresh();
             });
         });
+        self.track_service_dialog(&dialog);
         dialog.present(Some(&self.window));
     }
 }

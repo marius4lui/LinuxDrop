@@ -1794,6 +1794,28 @@ impl Ui {
         container.append(&button);
     }
     fn render_hardware(self: &Rc<Self>) {
+        // Inventory changes must not interrupt a user inspecting an adapter.
+        fn expanded_rows(root: &gtk::Widget, expanded: &mut HashMap<String, bool>) {
+            if let Some(row) = root.downcast_ref::<adw::ExpanderRow>() {
+                expanded.insert(row.widget_name().to_string(), row.is_expanded());
+            }
+            let mut child = root.first_child();
+            while let Some(widget) = child {
+                expanded_rows(&widget, expanded);
+                child = widget.next_sibling();
+            }
+        }
+        let mut expanded = HashMap::new();
+        expanded_rows(self.hardware.upcast_ref(), &mut expanded);
+        let focus_name = gtk::prelude::GtkWindowExt::focus(&self.window)
+            .filter(|widget| widget.is_ancestor(&self.hardware))
+            .and_then(|mut widget| loop {
+                let name = widget.widget_name();
+                if name.starts_with("hardware:") {
+                    break Some(name.to_string());
+                }
+                widget = widget.parent()?;
+            });
         clear(&self.hardware);
         let snapshot = self.snapshot.borrow();
         for backend in array(&snapshot, "backends") {
@@ -1808,10 +1830,9 @@ impl Ui {
             } else {
                 tr(detail)
             };
-            let row = adw::ActionRow::builder()
-                .title(protocol_name(text(&backend, "id")))
-                .subtitle(summary)
-                .build();
+            let row = adw::ActionRow::builder().use_markup(false).build();
+            row.set_title(protocol_name(text(&backend, "id")));
+            row.set_subtitle(&summary);
             row.set_tooltip_text(Some(detail));
             row.add_prefix(&gtk::Image::from_icon_name(
                 if matches!(text(&backend, "state"), "ready" | "running") {
@@ -1845,12 +1866,14 @@ impl Ui {
                     .iter()
                     .find_map(|k| item[*k].as_str())
                     .unwrap_or("Adapter");
-                let row = adw::ExpanderRow::builder()
-                    .title(name)
-                    .subtitle(tr(item["driver"]
-                        .as_str()
-                        .unwrap_or("Detected by the system")))
-                    .build();
+                let row = adw::ExpanderRow::builder().use_markup(false).build();
+                row.set_title(name);
+                row.set_subtitle(&tr(item["driver"]
+                    .as_str()
+                    .unwrap_or("Detected by the system")));
+                let identity = format!("hardware:{key}:{}", item["id"].as_str().unwrap_or(name));
+                row.set_widget_name(&identity);
+                row.set_expanded(expanded.get(&identity).copied().unwrap_or(false));
                 row.add_prefix(&gtk::Image::from_icon_name(icon));
                 if let Some(fields) = item.as_object() {
                     for (key, value) in fields {
@@ -1895,10 +1918,9 @@ impl Ui {
                             ),
                             _ => value.to_string(),
                         };
-                        let detail = adw::ActionRow::builder()
-                            .title(tr(title))
-                            .subtitle(content)
-                            .build();
+                        let detail = adw::ActionRow::builder().use_markup(false).build();
+                        detail.set_title(&tr(title));
+                        detail.set_subtitle(&content);
                         detail.set_subtitle_selectable(true);
                         row.add_row(&detail);
                     }
@@ -1913,6 +1935,11 @@ impl Ui {
                     let button = gtk::Button::from_icon_name("system-run-symbolic");
                     button.set_valign(gtk::Align::Center);
                     button.set_tooltip_text(Some(&tr("Run active hardware test")));
+                    button.set_widget_name(&format!("{identity}:test"));
+                    button.update_property(&[gtk::accessible::Property::Label(&format!(
+                        "{}: {name}",
+                        tr("Run active hardware test")
+                    ))]);
                     button.set_sensitive(
                         !item["protected"].as_bool().unwrap_or(false)
                             && !item["rfkill"].as_bool().unwrap_or(false)
@@ -1942,6 +1969,11 @@ impl Ui {
                     let button = gtk::Button::from_icon_name("emblem-favorite-symbolic");
                     button.set_valign(gtk::Align::Center);
                     button.set_tooltip_text(Some(&tr("Use as preferred adapter")));
+                    button.set_widget_name(&format!("{identity}:prefer"));
+                    button.update_property(&[gtk::accessible::Property::Label(&format!(
+                        "{}: {name}",
+                        tr("Use as preferred adapter")
+                    ))]);
                     let id = text(&item, "id").to_owned();
                     let kind = key.to_owned();
                     let weak = Rc::downgrade(self);
@@ -1968,6 +2000,11 @@ impl Ui {
                 let button = gtk::Button::from_icon_name("go-next-symbolic");
                 button.set_valign(gtk::Align::Center);
                 button.set_tooltip_text(Some(&tr("Full adapter details")));
+                button.set_widget_name(&format!("{identity}:details"));
+                button.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "{}: {name}",
+                    tr("Full adapter details")
+                ))]);
                 let weak = Rc::downgrade(self);
                 let report = item.clone();
                 button.connect_clicked(move |_| {
@@ -1994,5 +2031,8 @@ impl Ui {
                 .append(&label("No Bluetooth controllers detected", "compact-note"));
         }
         self.hardware.append(&label("Hardware checks are passive. Your active Internet connection stays protected; monitor mode is never enabled just because a USB adapter is inserted.","compact-note"));
+        if let Some(name) = focus_name {
+            restore_focus(&self.hardware, &name);
+        }
     }
 }

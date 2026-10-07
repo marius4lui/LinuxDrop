@@ -95,7 +95,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         gio::DBusMethodInvocation,
         glib::Variant,
     )>::new()));
-    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='StopDownloadOffer'/><method name='ResetSettings'/><method name='UpdateSettings'><arg type='s' direction='in'/></method><method name='UpdatePeerPreferences'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
+    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='RunHardwareDiagnostic'><arg type='s' direction='in'/><arg type='q' direction='in'/><arg type='s' direction='out'/></method><method name='StopDownloadOffer'/><method name='ResetSettings'/><method name='UpdateSettings'><arg type='s' direction='in'/></method><method name='UpdatePeerPreferences'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
     let accepted = accepted_options.clone();
@@ -431,6 +431,37 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap().set_text("");
         let require_pin = find(&ui.settings_body, "setting:localsend.require_pin").unwrap();
         assert!(!require_pin.is_sensitive(), "A receiving PIN must be saved before it can be required");
+        // Numeric controls must faithfully show every valid saved value and
+        // must never change settings just because the user visits the field.
+        let numeric_calls = setting_calls.get();
+        for saved_bytes in [1_u64, 10_995_116_277_760, 107_374_182_400] {
+            let mut numeric_config = ui.settings.borrow().clone();
+            numeric_config["receive"]["max_bytes"] = json!(saved_bytes);
+            numeric_config["visibility"]["duration_minutes"] = json!(0);
+            *ui.settings.borrow_mut() = numeric_config.clone();
+            snapshot.borrow_mut()["settings"] = numeric_config.clone();
+            settings::render(&ui, &numeric_config);
+            let amount = find(&ui.settings_body, "setting:receive.max_bytes").unwrap().downcast::<adw::SpinRow>().unwrap();
+            assert_eq!((amount.value() * 1_000_000.0).round() as u64, saved_bytes, "Receive size must not clamp or round an accepted persisted byte count");
+            assert_eq!(amount.digits(), 6, "Decimal MB must preserve individual bytes");
+            assert_eq!(find(&ui.settings_body, "setting:visibility.duration_minutes").unwrap().downcast::<adw::SpinRow>().unwrap().value(), 0.0, "Unlimited visibility is a valid saved value");
+            amount.grab_focus();
+            settle().await;
+            find(&ui.settings_body, "setting:search").unwrap().grab_focus();
+            settle().await;
+            assert_eq!(setting_calls.get(), numeric_calls, "Focus-only changes must not write or restart sharing");
+        }
+        let amount = find(&ui.settings_body, "setting:receive.max_bytes").unwrap().downcast::<adw::SpinRow>().unwrap();
+        amount.grab_focus();
+        amount.set_value(107_374.182_401);
+        find(&ui.settings_body, "setting:search").unwrap().grab_focus();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(snapshot.borrow()["settings"]["receive"]["max_bytes"], json!(107_374_182_401_u64), "An explicit MB edit preserves the intended byte count");
+        let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
+        search.set_text(&tr("Maximum request size (MB)"));
+        settle().await;
+        capture(&ui, "settings-numeric-precision.png");
+        search.set_text("");
         config["localsend"]["pin"] = json!("1234");
         config["transfers"]["history_limit"] = json!(5000);
         settings::render(&ui, &config);
@@ -590,7 +621,46 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         capture(&ui, "settings-apply-error.png");
         ui.settings_status_details.emit_clicked();
         assert_eq!(ui.stack.visible_child_name().as_deref(), Some("hardware"));
+        snapshot.borrow_mut()["hardware"]["radios"] = json!([{
+            "id":"radio-test", "name":"<b>USB & Wi-Fi</b>", "driver":"test <driver>",
+            "protected":false, "rfkill":false, "active_connection":"<b>Home & guest</b>"
+        }]);
+        snapshot.borrow_mut()["revision"] = json!(321);
+        ui.refresh();
+        settle().await;
+        let adapter = find(&ui.hardware, "hardware:radios:radio-test").unwrap().downcast::<adw::ExpanderRow>().unwrap();
+        assert!(!adapter.uses_markup(), "External adapter and driver names must be literal");
+        adapter.set_expanded(true);
+        settle().await;
+        for (action, title) in [("test", "Run active hardware test"), ("prefer", "Use as preferred adapter"), ("details", "Full adapter details")] {
+            let button = find(&ui.hardware, &format!("hardware:radios:radio-test:{action}")).unwrap();
+            let expected = std::ffi::CString::new(format!("{}: <b>USB & Wi-Fi</b>", tr(title))).unwrap();
+            let mismatch: Option<glib::GString> = unsafe {
+                glib::translate::from_glib_full(gtk::ffi::gtk_test_accessible_check_property(
+                    glib::translate::ToGlibPtr::<*mut gtk::ffi::GtkWidget>::to_glib_none(&button).0.cast(),
+                    gtk::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL, expected.as_ptr(),
+                ))
+            };
+            assert!(mismatch.is_none(), "Adapter action needs its translated name and adapter: {mismatch:?}");
+        }
+        let details = find(&ui.hardware, "hardware:radios:radio-test:details").unwrap();
+        assert!(details.grab_focus());
+        snapshot.borrow_mut()["hardware"]["radios"][0]["rfkill"] = json!(true);
+        snapshot.borrow_mut()["revision"] = json!(322);
+        ui.refresh();
+        settle().await;
+        let adapter = find(&ui.hardware, "hardware:radios:radio-test").unwrap().downcast::<adw::ExpanderRow>().unwrap();
+        assert!(adapter.is_expanded(), "Inventory updates preserve adapter inspection");
+        let details = find(&ui.hardware, "hardware:radios:radio-test:details").unwrap();
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&ui.window), Some(details), "Inventory updates preserve keyboard focus");
+        assert!(!find(&ui.hardware, "hardware:radios:radio-test:test").unwrap().is_sensitive(), "A newly blocked adapter cannot be tested");
+        capture(&ui, "hardware-inspection.png");
+        ui.run_hardware_diagnostic("radio-test");
+        settle().await;
+        assert!(ui.window.visible_dialog().is_some());
         ui.service_error("test owner loss");
+        settle().await;
+        assert!(ui.window.visible_dialog().is_none(), "Service loss dismisses active-test confirmation");
         assert_eq!(ui.settings_status_row.title(), tr("Sharing service is offline"));
         assert!(!ui.settings_status_details.is_visible());
         snapshot.borrow_mut()["backends"] = json!([{"id":"localsend","state":"ready","detail":"test listener active"}]);
@@ -715,6 +785,9 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         let draft = ui.files.borrow().clone();
         let review = ui.accept_request(&incoming);
         settle().await;
+        ui.run_hardware_diagnostic("radio-test");
+        let old_hardware_consent = ui.window.visible_dialog().unwrap().downcast::<adw::AlertDialog>().unwrap();
+        settle().await;
         assert!(find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").unwrap().is_sensitive());
         hold_snapshot.set(true);
         ui.refresh();
@@ -757,6 +830,7 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert!(find(&ui.transfers, "transfer:stale-consent:AcceptTransfer").is_none());
         assert_eq!(*ui.files.borrow(), draft, "Owner replacement preserves local file drafts");
         review.emit_by_name::<()>("response", &[&"accept"]);
+        old_hardware_consent.emit_by_name::<()>("response", &[&"run"]);
         settle().await;
         replacement.unregister_object(replacement_registration).unwrap();
         ui.allow_close.set(true);

@@ -66,6 +66,7 @@ export default class LinuxDropExtension extends Extension {
         this._snapshot = null;
         this._serviceState = 'connecting';
         this._actionPending = false;
+        this._actionAwaitingSnapshot = false;
         this._actionError = null;
         this._pending = null;
         this._refreshDirty = false;
@@ -161,9 +162,22 @@ export default class LinuxDropExtension extends Extension {
         this._actionPending = true; this._actionError = null; this._render();
         this._proxy.call(method, parameters, Gio.DBusCallFlags.NONE, 30000, this._cancellable, (proxy, result) => {
             if (!this._alive || this._cancellable !== session || generation !== this._ownerGeneration) return;
-            this._actionPending = false;
-            try { const value = proxy.call_finish(result); if (callback) callback(value.deep_unpack()); else this._refresh(); }
-            catch (error) { this._error(error.message); }
+            try {
+                const value = proxy.call_finish(result);
+                if (callback) {
+                    this._actionPending = false;
+                    callback(value.deep_unpack());
+                } else {
+                    // A successful receipt is not the new transfer state. Keep
+                    // consent/cancel disabled until a read started after it returns.
+                    this._actionAwaitingSnapshot = true;
+                    this._refresh();
+                }
+            } catch (error) {
+                this._actionPending = false;
+                this._actionAwaitingSnapshot = false;
+                this._error(error.message);
+            }
             this._render();
         });
     }
@@ -178,6 +192,7 @@ export default class LinuxDropExtension extends Extension {
         this._revision = '';
         this._selectedTransfer = null;
         this._actionPending = false;
+        this._actionAwaitingSnapshot = false;
         this._actionError = null;
         this._serviceState = this._proxy.get_name_owner() ? 'connecting' : 'offline';
         this._render();
@@ -187,7 +202,7 @@ export default class LinuxDropExtension extends Extension {
     _refresh() {
         if (!this._proxy || !this._alive || !this._proxy.get_name_owner()) return;
         if (this._pending) { this._refreshDirty = true; return; }
-        const request = {};
+        const request = {afterAction: this._actionAwaitingSnapshot};
         const session = this._cancellable;
         this._pending = request;
         this._refreshDirty = false;
@@ -198,9 +213,18 @@ export default class LinuxDropExtension extends Extension {
                 const [json] = proxy.call_finish(result).deep_unpack();
                 const snapshot = JSON.parse(json);
                 const revision = `${snapshot.epoch}:${snapshot.revision}`;
+                const actionSettled = request.afterAction;
+                if (actionSettled) {
+                    this._actionPending = false;
+                    this._actionAwaitingSnapshot = false;
+                }
                 this._serviceState = 'ready';
-                if (revision !== this._revision) { this._snapshot = snapshot; this._revision = revision; this._render(); }
+                if (revision !== this._revision || actionSettled) { this._snapshot = snapshot; this._revision = revision; this._render(); }
             } catch (_error) {
+                if (this._actionAwaitingSnapshot) {
+                    this._actionPending = false;
+                    this._actionAwaitingSnapshot = false;
+                }
                 this._snapshot = null; this._revision = ''; this._serviceState = 'offline'; this._actionError = null; this._render();
             }
             // Changed can arrive while GetSnapshot is in flight. Read again so
@@ -249,8 +273,13 @@ export default class LinuxDropExtension extends Extension {
             this._indicator.toggle.subtitle = status;
             this._panelIcon.icon_name = 'network-offline-symbolic';
             this._panelButton.accessible_name = `LinuxDrop · ${status}`;
-        } else if (this._actionError) this._detail.text = t('Needs attention');
-        else if (this._actionPending) this._detail.text = t('Working…');
+        } else if (this._actionError) {
+            this._detail.text = t('Needs attention');
+            this._indicator.toggle.subtitle = t('Needs attention');
+        } else if (this._actionPending) {
+            this._detail.text = t('Working…');
+            this._indicator.toggle.subtitle = t('Working…');
+        }
         // Rebuild only expanded contents. Compact progress has a stable actor/focus tree.
         if (this._expanded) this._renderBody(current, active);
         this._position();

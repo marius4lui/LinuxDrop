@@ -96,3 +96,13 @@ scenario and app all-target Clippy passed; parent inspected the German 480x600
 failure/retry rendering. See
 [GTK settings acceptance](../acceptance/UI_GTK_SETTINGS_2026-10-07.md) for exact
 coverage and the bounded reset timeout during owner loss.
+
+2026-10-07 further bounded Astra/high pass: the Shell holds remote actions
+pending until a snapshot started after the action receipt completes, including
+unchanged revisions; Quick Settings now exposes pending/error feedback. See
+[asynchronous Shell acceptance](../acceptance/UI_SHELL_ASYNC_2026-10-07.md).
+The parent also compared the current daemon settings defaults/validation with
+all GTK categories. Every user-facing schema field has a control; schema_version
+is internal metadata. Two numeric mismatches were corrected: zero-minute
+visibility and the full byte-precise receiving limit. This source inventory does
+not prove that every setting has passed an installed-session end-to-end test.

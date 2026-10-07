@@ -300,7 +300,7 @@ pub fn tr(message: &str) -> String {
         "Nobody" => "Niemanden",
         "Everyone nearby" => "Alle in der Nähe",
         "Visibility window (minutes)" => "Sichtbarkeitsdauer (Minuten)",
-        "How long a temporary public session lasts" => "Dauer einer vorübergehenden öffentlichen Sitzung",
+        "Automatically hide after this many minutes; zero keeps visibility on until you hide it" => "Nach dieser Zeit automatisch verbergen; bei null bleibst du sichtbar, bis du die Sichtbarkeit ausschaltest",
         "Hide when the screen locks" => "Bei Bildschirmsperre verbergen",
         "Keep requests and device details private" => "Anfragen und Gerätedetails privat halten",
         "Share with the LocalSend app on any platform" => "Mit der LocalSend-App auf jeder Plattform teilen",

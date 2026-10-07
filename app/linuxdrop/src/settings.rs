@@ -141,7 +141,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     key: "max_bytes",
                     title: "Maximum request size (MB)",
                     detail: "Total uncompressed size allowed in one request",
-                    kind: Kind::Number(1.0, 10_000_000.0, 100.0),
+                    kind: Kind::Number(0.000_001, 10_995_116.277_760, 100.0),
                 },
             ],
         ),
@@ -159,8 +159,8 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                 Field {
                     key: "duration_minutes",
                     title: "Visibility window (minutes)",
-                    detail: "How long a temporary public session lasts",
-                    kind: Kind::Number(1.0, 1440.0, 1.0),
+                    detail: "Automatically hide after this many minutes; zero keeps visibility on until you hide it",
+                    kind: Kind::Number(0.0, 1440.0, 1.0),
                 },
                 Field {
                     key: "hide_on_lock",
@@ -436,8 +436,13 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                         .title(tr(field.title))
                         .subtitle(tr(field.detail))
                         .adjustment(&adjustment)
-                        .digits(0)
+                        .digits(if field.key == "max_bytes" { 6 } else { 0 })
                         .build();
+                    if field.key == "max_bytes" {
+                        // Keep the complete largest accepted decimal-MB value
+                        // readable, including its byte precision, on compact screens.
+                        row.set_width_chars(16);
+                    }
                     let weak = Rc::downgrade(ui);
                     let draft_key = draft_key.clone();
                     row.connect_value_notify(move |row| {
@@ -459,7 +464,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                                 &ui,
                                 &section,
                                 &key,
-                                json!((row_copy.value() * scale) as u64),
+                                json!((row_copy.value() * scale).round() as u64),
                             );
                         }
                     });
@@ -670,15 +675,10 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                                     .parse::<f64>()
                                     .ok()
                                     .map(|number| {
-                                        json!(
-                                            (number
-                                                * if key == "max_bytes" {
-                                                    1_000_000.0
-                                                } else {
-                                                    1.0
-                                                })
-                                                as u64
-                                        )
+                                        json!((number
+                                            * if key == "max_bytes" { 1_000_000.0 } else { 1.0 })
+                                        .round()
+                                            as u64)
                                     })
                                     .unwrap_or_else(|| write.value.clone()),
                                 _ => write.value.clone(),
