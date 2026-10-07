@@ -128,3 +128,9 @@ ManagerMethod; redacted exports use a field projection, and malformed successful
 download-offer replies trigger owner-bound revocation before retry. Helper and
 daemon share diagnostic step/report types without changing their socket shape.
 See [diagnostic/offer acceptance](acceptance/DIAGNOSTIC_OFFER_TYPES_2026-10-07.md).
+
+Full netd lease retirement uses one persistent worker and a shared completion
+receipt. Retiring reservations remain allocated until restoration and journal
+publication succeed; status queries do not wait behind its process/network I/O.
+Partial group cleanup and producer cancellation are tracked separately in
+[helper lifecycle work](completion/NETD_LIFECYCLE.md).

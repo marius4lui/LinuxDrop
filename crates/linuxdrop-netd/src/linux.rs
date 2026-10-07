@@ -34,8 +34,120 @@ struct State {
     attached: std::collections::HashSet<String>,
     pending_p2p: HashMap<String, PendingP2p>,
     cancelled_p2p: std::collections::HashSet<String>,
+    cleanups: HashMap<String, CleanupReceipt>,
 }
+impl State {
+    fn record_recovery_error(&mut self, error: String) {
+        self.recovery_errors.push(error);
+        let excess = self.recovery_errors.len().saturating_sub(128);
+        self.recovery_errors.drain(..excess);
+    }
+}
+
 type Shared = Arc<Mutex<State>>;
+
+type CleanupReceipt = tokio::sync::watch::Receiver<Option<Result<(), String>>>;
+
+async fn wait_cleanup(mut receipt: CleanupReceipt) -> Result<(), String> {
+    loop {
+        if let Some(result) = receipt.borrow().clone() {
+            return result;
+        }
+        receipt
+            .changed()
+            .await
+            .map_err(|_| "Cleanup worker stopped without a receipt".to_owned())?;
+    }
+}
+
+async fn restore_child_and_lease(
+    lease: Lease,
+    child: Option<tokio::process::Child>,
+) -> Result<(), String> {
+    if let Some(mut child) = child {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    restore(&lease).await
+}
+
+async fn begin_cleanup(shared: &Shared, id: &str) -> CleanupReceipt {
+    begin_cleanup_with(shared, id, restore_child_and_lease, persist).await
+}
+
+// One persistent worker owns each retiring lease. Client cancellation only drops
+// a waiter, never the worker or the reservation. Tests inject delayed operations
+// and journal failures here without touching a radio or the production journal.
+async fn begin_cleanup_with<F, Fut, P>(
+    shared: &Shared,
+    id: &str,
+    operation: F,
+    journal: P,
+) -> CleanupReceipt
+where
+    F: FnOnce(Lease, Option<tokio::process::Child>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    P: FnOnce(&State) -> io::Result<()> + Send + 'static,
+{
+    let mut state = shared.lock().await;
+    if let Some(receipt) = state.cleanups.get(id) {
+        return receipt.clone();
+    }
+    let (sender, receipt) = tokio::sync::watch::channel(None);
+    let Some(lease) = state.leases.get(id).cloned() else {
+        let _ = sender.send(Some(Ok(())));
+        return receipt;
+    };
+    state.attached.remove(id);
+    state.cancelled_p2p.remove(id);
+    if let Some(pending) = state.pending_p2p.remove(id) {
+        pending.cancel.cancel();
+    }
+    let child = state.children.remove(id);
+    state.cleanups.insert(id.to_owned(), receipt.clone());
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let original = lease.clone();
+        // Observe panics/cancellation of the I/O task too: the supervisor retains
+        // the lease and publishes a failed receipt, allowing explicit recovery.
+        let mut result = tokio::spawn(async move { operation(lease, child).await })
+            .await
+            .unwrap_or_else(|error| Err(format!("Cleanup operation stopped: {error}")));
+        let mut state = shared.lock().await;
+        if result.is_ok() {
+            state.leases.remove(&original.id);
+            if let Err(error) = journal(&state) {
+                state.leases.insert(original.id.clone(), original.clone());
+                result = Err(format!("Cleanup journal update failed: {error}"));
+            }
+        }
+        if let Err(error) = &result {
+            state.record_recovery_error(format!("{}: {error}", original.interface));
+        }
+        state.cleanups.remove(&original.id);
+        let _ = sender.send(Some(result));
+    });
+    receipt
+}
+
+async fn cleanup_lease(shared: &Shared, id: &str) -> Result<(), String> {
+    wait_cleanup(begin_cleanup(shared, id).await).await
+}
+
+async fn cleanup_all(shared: &Shared, ids: Vec<String>) -> Vec<(String, Result<(), String>)> {
+    // Retire every owned radio before waiting for the first slow one. A dead
+    // client must not leave its second adapter advertised as healthy meanwhile.
+    let mut receipts = Vec::new();
+    for id in ids {
+        let receipt = begin_cleanup(shared, &id).await;
+        receipts.push((id, receipt));
+    }
+    let mut results = Vec::new();
+    for (id, receipt) in receipts {
+        results.push((id, wait_cleanup(receipt).await));
+    }
+    results
+}
 
 struct PendingP2p {
     cancel: tokio_util::sync::CancellationToken,
@@ -118,9 +230,7 @@ pub async fn run() -> io::Result<()> {
         let leases: Vec<Lease> = serde_json::from_slice(&data).map_err(io::Error::other)?;
         for lease in leases {
             if let Err(e) = restore(&lease).await {
-                state
-                    .recovery_errors
-                    .push(format!("{}: {e}", lease.interface));
+                state.record_recovery_error(format!("{}: {e}", lease.interface));
                 state.leases.insert(lease.id.clone(), lease);
             }
         }
@@ -145,56 +255,38 @@ pub async fn run() -> io::Result<()> {
                     linuxdrop_network::p2p::service_instance(&connection).await
                 }).await.ok().and_then(Result::ok)
             } else { None };
-            let mut state = monitor.lock().await;
-            let leases: Vec<_> = state.leases.values().cloned().collect();
+            let leases: Vec<_> = monitor.lock().await.leases.values().cloned().collect();
             for lease in leases {
-                // Orphaned/revoked leases remain visible through RecoveryStatus,
-                // never as healthy actors. Explicit recovery owns further retries.
-                if !state.attached.contains(&lease.id) { continue; }
-                let owner_lost = lease.p2p_group.as_ref().is_some_and(|group| {
-                    supplicant.as_ref().is_none_or(|(owner, bus)| group.service_owner != *owner || group.bus_guid != *bus)
-                });
-                let dead = state
-                    .children
-                    .get_mut(&lease.id)
-                    .is_some_and(|child| !matches!(child.try_wait(), Ok(None)));
-                // DHCP is optional on a group with an assigned IPv6 link-local
-                // address. Its exit must not tear down an active IPv6 transfer.
+                let dead = {
+                    let mut state = monitor.lock().await;
+                    if !state.attached.contains(&lease.id) { continue; }
+                    state.children.get_mut(&lease.id).is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
+                };
+                // Address inspection can wait on an external process. It must
+                // not block status or cancellation on unrelated radios.
                 let ipv6_survives = dead
                     && lease.p2p_group.as_ref().is_some_and(|group| group.peer_object != "/")
                     && p2p_addresses(&lease).await.is_ok_and(|a| a.ipv6.is_some());
-                if ipv6_survives {
-                    state.children.remove(&lease.id);
-                }
-                let dead = dead && !ipv6_survives;
-                let radio_gone = !inventory.radios.iter().any(|r| r.phy == lease.phy);
-                let regulatory_change = inventory
-                    .radios
-                    .iter()
-                    .find(|r| r.phy == lease.phy)
-                    .is_some_and(|radio| {
-                        lease.allowed_frequencies.iter().any(|frequency| {
-                            !radio.channels.iter().any(|c| {
-                                c.frequency_mhz == *frequency && !c.disabled && !c.no_ir && !c.radar
-                            })
-                        })
+                let retire = {
+                    let mut state = monitor.lock().await;
+                    if !state.attached.contains(&lease.id) { continue; }
+                    if ipv6_survives { state.children.remove(&lease.id); }
+                    let owner_lost = lease.p2p_group.as_ref().is_some_and(|group| {
+                        supplicant.as_ref().is_none_or(|(owner, bus)| group.service_owner != *owner || group.bus_guid != *bus)
                     });
-                let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.pending_p2p.get(&lease.id)));
-                if dead || radio_gone || unsafe_use || regulatory_change || owner_lost {
-                    state.attached.remove(&lease.id);
-                    if let Some(operation) = state.pending_p2p.remove(&lease.id) { operation.cancel.cancel(); }
-                    stop_child(&mut state, &lease.id).await;
-                    match restore(&lease).await {
-                        Ok(()) => {
-                            state.leases.remove(&lease.id);
-                        }
-                        Err(e) => state.recovery_errors.push(e),
-                    }
-                    state.recovery_errors.push(format!(
-                        "{}: lease stopped after helper exit, supplicant owner loss, unplug, regulatory change, or competing radio use",
-                        lease.interface
-                    ));
-                    let _ = persist(&state);
+                    let radio_gone = !inventory.radios.iter().any(|r| r.phy == lease.phy);
+                    let regulatory_change = inventory.radios.iter().find(|r| r.phy == lease.phy).is_some_and(|radio| {
+                        lease.allowed_frequencies.iter().any(|frequency| !radio.channels.iter().any(|c| c.frequency_mhz == *frequency && !c.disabled && !c.no_ir && !c.radar))
+                    });
+                    let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.pending_p2p.get(&lease.id)));
+                    (dead && !ipv6_survives) || radio_gone || unsafe_use || regulatory_change || owner_lost
+                };
+                if retire {
+                    // The worker publishes its eventual outcome. Do not stop
+                    // monitoring other radios while this lease is being retired.
+                    let _ = begin_cleanup(&monitor, &lease.id).await;
+                    monitor.lock().await.record_recovery_error(format!(
+                        "{}: lease stopped after helper exit, supplicant owner loss, unplug, regulatory change, or competing radio use", lease.interface));
                 }
             }
         }
@@ -215,17 +307,13 @@ pub async fn run() -> io::Result<()> {
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    let mut state = state.lock().await;
-    for lease in state.leases.values().cloned().collect::<Vec<_>>() {
-        stop_child(&mut state, &lease.id).await;
-        match restore(&lease).await {
-            Ok(()) => {
-                state.leases.remove(&lease.id);
-            }
-            Err(e) => eprintln!("Recovery failed for {}: {e}", lease.interface),
+    let leases: Vec<_> = state.lock().await.leases.keys().cloned().collect();
+    for (id, result) in cleanup_all(&state, leases).await {
+        if let Err(error) = result {
+            eprintln!("Recovery failed for {id}: {error}");
         }
     }
-    persist(&state)?;
+    persist(&*state.lock().await)?;
     std::fs::remove_file(SOCKET_PATH)?;
     Ok(())
 }
@@ -302,26 +390,8 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
         Ok(())
     }
     .await;
-    let mut state = state.lock().await;
-    for id in owned {
-        state.cancelled_p2p.remove(&id);
-        if let Some(operation) = state.pending_p2p.remove(&id) {
-            operation.cancel.cancel();
-        }
-        state.attached.remove(&id);
-        stop_child(&mut state, &id).await;
-        if let Some(lease) = state.leases.get(&id).cloned() {
-            match restore(&lease).await {
-                Ok(()) => {
-                    state.leases.remove(&id);
-                }
-                Err(e) => state
-                    .recovery_errors
-                    .push(format!("{}: {e}", lease.interface)),
-            }
-        }
-    }
-    persist(&state)?;
+    let _ = cleanup_all(&state, owned).await;
+
     result
 }
 
@@ -582,6 +652,7 @@ async fn join_p2p(
     };
     let mut state = shared.lock().await;
     let lease_exists = state.leases.contains_key(&lease_id);
+    let cleanup_running = state.cleanups.contains_key(&lease_id);
     let still_owned = lease_exists && !cancel.is_cancelled();
     match network {
         Ok((child, addresses)) if still_owned && (!host || addresses.ipv4.is_some()) => {
@@ -618,7 +689,7 @@ async fn join_p2p(
                 .unwrap_or_else(|| "P2P radio lease ended during address acquisition".into());
             state.pending_p2p.remove(&lease_id);
             drop(state);
-            if lease_exists && restore_p2p(&lease).await.is_ok() {
+            if lease_exists && !cleanup_running && restore_p2p(&lease).await.is_ok() {
                 let mut state = shared.lock().await;
                 if let Some(current) = state.leases.get_mut(&lease_id) {
                     current.p2p_group = None;
@@ -717,6 +788,26 @@ async fn apply(
         }
         return join_p2p(shared, lease_id, peer_name, pin, frequency, None).await;
     }
+    if let Request::Release { ref lease_id } = request {
+        if !owned.contains(lease_id) {
+            return Err("lease does not belong to this connection".into());
+        }
+        cleanup_lease(shared, lease_id).await?;
+        owned.retain(|id| id != lease_id);
+        return Ok(Response::Ok);
+    }
+    if matches!(request, Request::RetryRecovery) {
+        let abandoned: Vec<_> = {
+            let state = shared.lock().await;
+            state
+                .leases
+                .values()
+                .filter(|l| l.uid == uid && !state.attached.contains(&l.id))
+                .map(|l| l.id.clone())
+                .collect()
+        };
+        let _ = cleanup_all(shared, abandoned).await;
+    }
     let mut state = shared.lock().await;
     let awdl = matches!(request, Request::AcquireAwdl { .. });
     match request {
@@ -745,6 +836,9 @@ async fn apply(
             if !owned.contains(&lease_id) {
                 return Err("lease does not belong to this connection".into());
             }
+            if state.cleanups.contains_key(&lease_id) {
+                return Err("lease cleanup is in progress".into());
+            }
             let mut lease = state
                 .leases
                 .get(&lease_id)
@@ -762,25 +856,6 @@ async fn apply(
             Ok(Response::Ok)
         }
         Request::RecoveryStatus | Request::RetryRecovery => {
-            if matches!(request, Request::RetryRecovery) {
-                let abandoned: Vec<_> = state
-                    .leases
-                    .values()
-                    .filter(|l| l.uid == uid && !state.attached.contains(&l.id))
-                    .cloned()
-                    .collect();
-                for lease in abandoned {
-                    match restore(&lease).await {
-                        Ok(()) => {
-                            state.leases.remove(&lease.id);
-                        }
-                        Err(error) => state
-                            .recovery_errors
-                            .push(format!("{}: {error}", lease.interface)),
-                    }
-                }
-                persist(&state).map_err(|e| e.to_string())?;
-            }
             let issues = state
                 .leases
                 .values()
@@ -795,10 +870,11 @@ async fn apply(
                         lease_id: l.id.clone(),
                         interface: l.interface.clone(),
                         ownership_verified: check.is_ok(),
-                        detail: check.err().unwrap_or_else(|| {
-                            "Orphaned lease; authorized retry restores only this owned resource"
-                                .into()
-                        }),
+                        detail: if state.cleanups.contains_key(&l.id) {
+                            "Cleanup is in progress; the radio remains reserved".into()
+                        } else { check.err().unwrap_or_else(|| {
+                            "Orphaned lease; authorized retry restores only this owned resource".into()
+                        }) },
                     }
                 })
                 .collect();
@@ -1003,7 +1079,7 @@ async fn apply(
                     Ok(()) => {
                         state.leases.remove(&id);
                     }
-                    Err(e) => state.recovery_errors.push(e),
+                    Err(e) => state.record_recovery_error(e),
                 }
                 persist(&state).map_err(|e| e.to_string())?;
                 return Err(error);
@@ -1043,7 +1119,7 @@ async fn apply(
                             Ok(()) => {
                                 state.leases.remove(&id);
                             }
-                            Err(error) => state.recovery_errors.push(error),
+                            Err(error) => state.record_recovery_error(error),
                         }
                         persist(&state).map_err(|e| e.to_string())?;
                         return Err(format!("AWDL helper unavailable: {e}"));
@@ -1132,24 +1208,7 @@ async fn apply(
             persist(&state).map_err(|e| e.to_string())?;
             Ok(Response::Ok)
         }
-        Request::Release { lease_id } => {
-            if !owned.contains(&lease_id) {
-                return Err("lease does not belong to this connection".into());
-            }
-            let lease = state
-                .leases
-                .get(&lease_id)
-                .ok_or("lease not found")?
-                .clone();
-            stop_child(&mut state, &lease_id).await;
-            restore(&lease).await?;
-            state.leases.remove(&lease_id);
-            state.attached.remove(&lease_id);
-            state.cancelled_p2p.remove(&lease_id);
-            owned.retain(|id| id != &lease_id);
-            persist(&state).map_err(|e| e.to_string())?;
-            Ok(Response::Ok)
-        }
+        Request::Release { .. } => unreachable!(),
     }
 }
 
@@ -1562,6 +1621,181 @@ async fn restore_connection(lease: &Lease) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cleanup_receipt_preserves_reservation_without_blocking_status() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lease = direct_lease();
+        let id = lease.id.clone();
+        let uid = lease.uid;
+        let shared = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = shared.lock().await;
+            state.leases.insert(id.clone(), lease);
+            state.attached.insert(id.clone());
+        }
+        let runs = Arc::new(AtomicUsize::new(0));
+        let count = runs.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, held) = tokio::sync::oneshot::channel();
+        let first = begin_cleanup_with(
+            &shared,
+            &id,
+            move |_, _| async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                let _ = started.send(());
+                held.await.unwrap()
+            },
+            |_| Ok(()),
+        )
+        .await;
+        timeout(Duration::from_secs(1), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        let duplicate = begin_cleanup_with(
+            &shared,
+            &id,
+            |_, _| async { panic!("Duplicate cleanup must share the existing receipt") },
+            |_| Ok(()),
+        )
+        .await;
+        let status = timeout(
+            Duration::from_millis(250),
+            apply(Request::Status, uid, &mut vec![], &shared),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(status, Response::State { leases, .. } if leases.is_empty()),
+            "Retiring lease must not appear healthy"
+        );
+        let recovery = timeout(
+            Duration::from_millis(250),
+            apply(Request::RecoveryStatus, uid, &mut vec![], &shared),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(recovery, Response::Recovery { issues, .. } if issues[0].detail.contains("in progress"))
+        );
+        assert!(
+            shared.lock().await.leases.contains_key(&id),
+            "Retiring radio cannot be reallocated"
+        );
+        assert!(apply(
+            Request::Release {
+                lease_id: id.clone()
+            },
+            uid + 1,
+            &mut vec![],
+            &shared
+        )
+        .await
+        .is_err());
+        assert!(apply(
+            Request::LeaveP2p {
+                lease_id: id.clone()
+            },
+            uid,
+            &mut vec![id.clone()],
+            &shared
+        )
+        .await
+        .unwrap_err()
+        .contains("cleanup"));
+        let mut retained_ownership = vec![id.clone()];
+        let mut release_request = Box::pin(apply(
+            Request::Release {
+                lease_id: id.clone(),
+            },
+            uid,
+            &mut retained_ownership,
+            &shared,
+        ));
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::future::Future::poll(release_request.as_mut(), cx).is_pending(),
+            )
+        })
+        .await;
+        assert!(pending, "Release must wait on the already-started fake cleanup; never run production journal I/O in this test");
+        let waiting = tokio::spawn(wait_cleanup(first));
+        waiting.abort();
+        let _ = waiting.await;
+        release.send(Err("delayed cleanup failure".into())).unwrap();
+        assert!(wait_cleanup(duplicate)
+            .await
+            .unwrap_err()
+            .contains("delayed cleanup"));
+        let result = release_request.await;
+        assert!(result.is_err());
+        assert_eq!(retained_ownership, vec![id.clone()]);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(shared.lock().await.leases.contains_key(&id));
+        assert!(!shared.lock().await.attached.contains(&id));
+
+        let receipt = begin_cleanup_with(
+            &shared,
+            &id,
+            |_, _| async { Ok(()) },
+            |_| Err(io::Error::other("test journal unavailable")),
+        )
+        .await;
+        assert!(wait_cleanup(receipt).await.unwrap_err().contains("journal"));
+        assert!(
+            shared.lock().await.leases.contains_key(&id),
+            "A failed durable receipt must retain recovery state"
+        );
+        let expected = id.clone();
+        let receipt = begin_cleanup_with(
+            &shared,
+            &id,
+            |_, _| async { Ok(()) },
+            move |state| {
+                assert!(!state.leases.contains_key(&expected));
+                Ok(())
+            },
+        )
+        .await;
+        wait_cleanup(receipt).await.unwrap();
+        let state = shared.lock().await;
+        assert!(state.leases.is_empty() && state.cleanups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_receipt_waits_for_owned_child_exit() {
+        let mut lease = direct_lease();
+        lease.kind = LeaseKind::Monitor;
+        // A previous-boot synthetic record cannot authorize network mutation.
+        lease.boot_id = "synthetic-previous-boot".into();
+        let id = lease.id.clone();
+        let child = Command::new("/usr/bin/sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let shared = Arc::new(Mutex::new(State::default()));
+        {
+            let mut state = shared.lock().await;
+            state.leases.insert(id.clone(), lease);
+            state.attached.insert(id.clone());
+            state.children.insert(id.clone(), child);
+        }
+        let receipt = begin_cleanup_with(&shared, &id, restore_child_and_lease, |_| Ok(())).await;
+        timeout(Duration::from_secs(2), wait_cleanup(receipt))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "Child must be reaped before cleanup success"
+        );
+        assert!(shared.lock().await.leases.is_empty());
+    }
+
     #[test]
     fn reserved_capabilities_exclude_unsupported_and_regulatory_blocked_roles() {
         use linuxdrop_hardware::Channel;
