@@ -5,7 +5,7 @@ import {snapshotSchema} from './snapshot-schema.js';
 
 const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
-const keywords = new Set(['$schema', '$defs', '$ref', 'title', 'type', 'properties', 'required', 'items', 'anyOf', 'enum', 'const', 'minimum', 'maximum', 'minLength', 'format']);
+const keywords = new Set(['$schema', '$defs', '$ref', 'title', 'description', 'default', 'type', 'properties', 'required', 'items', 'anyOf', 'enum', 'const', 'minimum', 'maximum', 'minLength', 'format']);
 const types = new Set(['object', 'array', 'string', 'integer', 'boolean', 'null']);
 const full = (pattern, value) => pattern.exec(value)?.[0] === value;
 const invalid = () => { throw new Error('Invalid sharing service status'); };
@@ -23,7 +23,7 @@ export function snapshotValidator(schema) {
             if (!keywords.has(key)) throw new Error(`Unsupported status schema keyword: ${key}`);
         }
         if (node.$ref) resolve(node.$ref);
-        if (node.format && node.format !== 'uint64') throw new Error('Unsupported status format');
+        if (node.format && !['uint64', 'uint32', 'uint16', 'uint8', 'int32'].includes(node.format)) throw new Error('Unsupported status format');
         if (node.type && ![node.type].flat().every(type => types.has(type))) throw new Error('Unsupported status type');
         for (const child of Object.values(node.$defs ?? {})) inspect(child);
         for (const child of Object.values(node.properties ?? {})) inspect(child);
@@ -90,6 +90,15 @@ function validateSemantics(snapshot) {
             if (ids.has(record.id)) invalid();
             ids.add(record.id);
         }
+    }
+    const hardware = snapshot.hardware;
+    for (const ids of [hardware.radios.map(view => view.id), hardware.radios.map(view => view.phy), hardware.interfaces.map(item => item.name), hardware.bluetooth.map(item => item.id)]) {
+        if (ids.some(id => !id) || new Set(ids).size !== ids.length) invalid();
+    }
+    for (const radio of hardware.radios) {
+        if (!radio.protected && hardware.interfaces.some(item =>
+            (item.phy === radio.phy || radio.interfaces.includes(item.name)) &&
+            (item.default_route || item.active_connection != null || item.state === 'up' || (item.nm_state >= 40 && item.nm_state <= 100)))) invalid();
     }
     for (const transfer of snapshot.transfers) {
         if (transfer.transferred_bytes > transfer.total_bytes || transfer.files.some(file => file.transferred > file.size)) invalid();

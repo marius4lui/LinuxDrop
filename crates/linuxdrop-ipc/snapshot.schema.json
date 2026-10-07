@@ -42,6 +42,71 @@
       ],
       "type": "object"
     },
+    "BluetoothController": {
+      "properties": {
+        "active_advertisements": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "discovering": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "powered": {
+          "type": "boolean"
+        },
+        "remaining_advertisements": {
+          "default": null,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supported_advertisements": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supported_includes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "supported_secondary_channels": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "powered",
+        "discovering"
+      ],
+      "type": "object"
+    },
     "BluetoothSettings": {
       "properties": {
         "adapter": {
@@ -50,6 +115,65 @@
       },
       "required": [
         "adapter"
+      ],
+      "type": "object"
+    },
+    "Capability": {
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/CapabilityValue"
+        }
+      },
+      "required": [
+        "value",
+        "source",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "CapabilityValue": {
+      "enum": [
+        "yes",
+        "no",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "Channel": {
+      "properties": {
+        "disabled": {
+          "type": "boolean"
+        },
+        "frequency_mhz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "no_ir": {
+          "type": "boolean"
+        },
+        "number": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "radar": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "frequency_mhz",
+        "number",
+        "disabled",
+        "no_ir",
+        "radar"
       ],
       "type": "object"
     },
@@ -66,6 +190,57 @@
       },
       "required": [
         "log_level"
+      ],
+      "type": "object"
+    },
+    "DriverDetails": {
+      "properties": {
+        "bus_info": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firmware": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "EvidenceProfile": {
+      "properties": {
+        "limitations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "qualification": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "qualification",
+        "limitations"
       ],
       "type": "object"
     },
@@ -138,6 +313,101 @@
       ],
       "type": "object"
     },
+    "HardwareStatus": {
+      "properties": {
+        "bluetooth": {
+          "items": {
+            "$ref": "#/$defs/BluetoothController"
+          },
+          "type": "array"
+        },
+        "interfaces": {
+          "items": {
+            "$ref": "#/$defs/NetworkInterface"
+          },
+          "type": "array"
+        },
+        "observed_unix": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "radios": {
+          "items": {
+            "$ref": "#/$defs/RadioView"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "observed_unix",
+        "radios",
+        "interfaces",
+        "bluetooth",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "InterfaceCombination": {
+      "properties": {
+        "different_channels": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "limits": {
+          "items": {
+            "$ref": "#/$defs/InterfaceLimit"
+          },
+          "type": "array"
+        },
+        "raw": {
+          "type": "string"
+        },
+        "total": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "limits",
+        "raw"
+      ],
+      "type": "object"
+    },
+    "InterfaceLimit": {
+      "properties": {
+        "maximum": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "modes",
+        "maximum"
+      ],
+      "type": "object"
+    },
     "KnownPeer": {
       "properties": {
         "available": {
@@ -200,6 +470,64 @@
         "multicast",
         "require_pin",
         "pin"
+      ],
+      "type": "object"
+    },
+    "NetworkInterface": {
+      "properties": {
+        "active_connection": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active_connection_uuid": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default_route": {
+          "type": "boolean"
+        },
+        "ifindex": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nm_managed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "nm_state": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "phy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "ifindex",
+        "state",
+        "default_route"
       ],
       "type": "object"
     },
@@ -333,6 +661,144 @@
       ],
       "type": "object"
     },
+    "RadioView": {
+      "properties": {
+        "awdl": {
+          "$ref": "#/$defs/Capability"
+        },
+        "bands": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "bus": {
+          "type": "string"
+        },
+        "channels": {
+          "items": {
+            "$ref": "#/$defs/Channel"
+          },
+          "type": "array"
+        },
+        "combinations": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/InterfaceCombination"
+          },
+          "type": "array"
+        },
+        "data_injection": {
+          "$ref": "#/$defs/Capability"
+        },
+        "device_path": {
+          "type": "string"
+        },
+        "driver": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "driver_details": {
+          "$ref": "#/$defs/DriverDetails",
+          "default": {
+            "bus_info": null,
+            "firmware": null,
+            "source": "",
+            "version": null
+          }
+        },
+        "evidence_profile": {
+          "$ref": "#/$defs/EvidenceProfile",
+          "default": {
+            "limitations": [],
+            "name": "",
+            "qualification": ""
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "interface_combinations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "interfaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kernel": {
+          "type": "string"
+        },
+        "management_injection": {
+          "$ref": "#/$defs/Capability"
+        },
+        "modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "monitor": {
+          "$ref": "#/$defs/Capability"
+        },
+        "phy": {
+          "type": "string"
+        },
+        "product_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protected": {
+          "type": "boolean"
+        },
+        "reserved_for": {
+          "$ref": "#/$defs/Reservation"
+        },
+        "rfkill": {
+          "type": "boolean"
+        },
+        "serial": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vendor_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "phy",
+        "bus",
+        "device_path",
+        "kernel",
+        "rfkill",
+        "interfaces",
+        "channels",
+        "modes",
+        "interface_combinations",
+        "monitor",
+        "management_injection",
+        "data_injection",
+        "awdl",
+        "protected",
+        "reserved_for"
+      ],
+      "type": "object"
+    },
     "ReceiveSettings": {
       "properties": {
         "ask_directory": {
@@ -387,6 +853,14 @@
         "subfolders"
       ],
       "type": "object"
+    },
+    "Reservation": {
+      "enum": [
+        "AirDrop",
+        "Quick Share",
+        "Not reserved"
+      ],
+      "type": "string"
     },
     "SelectionMode": {
       "enum": [
@@ -648,7 +1122,7 @@
       "type": "string"
     },
     "hardware": {
-      "type": "object"
+      "$ref": "#/$defs/HardwareStatus"
     },
     "known_peers": {
       "items": {

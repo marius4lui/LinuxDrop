@@ -14,7 +14,7 @@ snapshot = dict(epoch='shell-review-fixture', revision=1, peers=[], backends=[],
                 transfers=[dict(id='verification', peer_name='Prüfgerät · keine echte Verbindung', state='verification', direction='incoming', protocol='quickshare', verification_code='1234', files=[dict(name='A' * 100 + '.jpg', size=120)], total_bytes=120, transferred_bytes=0),
                            dict(id='other-transfer', peer_name='Zweites Prüfgerät', state='transferring', direction='outgoing', protocol='localsend', files=[dict(name='fixture.txt', size=100)], total_bytes=100, transferred_bytes=43)])
 # Use the real settings schema and complete transfer records on the wire.
-snapshot.update(restarting=False, download_link_active=False, known_peers=[], hardware={})
+snapshot.update(restarting=False, download_link_active=False, known_peers=[], hardware=dict(observed_unix=0, radios=[], interfaces=[], bluetooth=[], warnings=[]))
 snapshot['settings'] = json.loads((Path(__file__).resolve().parents[3] / 'crates/linuxdrop-ipc/settings.defaults.json').read_text())
 for transfer in snapshot['transfers']:
     transfer.update(peer_id='fixture-peer', saved_paths=[])

@@ -35,7 +35,7 @@ struct Data {
     transfer_order: Vec<String>,
     completed_at: HashMap<String, u64>,
     backends: HashMap<String, BackendState>,
-    hardware: Value,
+    hardware: linuxdrop_ipc::HardwareStatus,
     drafts: HashMap<String, Draft>,
     commands: HashMap<String, CommandSender>,
     retiring: HashMap<String, CommandSender>,
@@ -520,7 +520,7 @@ impl Manager {
             .values()
             .map(|b| json!({"id":b.id,"state":b.state}))
             .collect();
-        let radios:Vec<_>=d.hardware["radios"].as_array().into_iter().flatten().map(|r|json!({"driver":r["driver"],"firmware":r["firmware"],"bands":r["bands"],"rfkill":r["rfkill"],"protected":r["protected"],"monitor":r["monitor"]})).collect();
+        let radios: Vec<_> = d.hardware.radios.iter().map(|view| { let r = &view.radio; json!({"driver":r.driver,"firmware":r.driver_details.firmware,"bands":r.bands,"rfkill":r.rfkill,"protected":r.protected,"monitor":r.monitor}) }).collect();
         json!({"version":env!("CARGO_PKG_VERSION"),"platform":"linux","backends":backends,"radios":radios,"active_transfers":d.transfers.values().filter(|t|!t.is_terminal()).count(),"redacted":true,"omitted":["names","addresses","serials","paths","keys","PINs","file names","error details"]}).to_string()
     }
     async fn restart_backends(&self) -> zbus::fdo::Result<()> {
@@ -1671,7 +1671,7 @@ async fn main() -> Result<()> {
             transfer_order,
             completed_at,
             backends: HashMap::new(),
-            hardware: json!({"radios":[],"interfaces":[],"bluetooth":[],"warnings":[]}),
+            hardware: linuxdrop_ipc::HardwareStatus::default(),
             drafts: HashMap::new(),
             commands: HashMap::new(),
             retiring: HashMap::new(),
@@ -1753,7 +1753,6 @@ async fn main() -> Result<()> {
                 result = inventories.changed() => { if result.is_err() { break; } }
             }
             let inventory = inventories.borrow_and_update().clone();
-            let mut value = serde_json::to_value(&inventory).unwrap_or_default();
             // Read lease ownership before Data; helper I/O never runs under Data.
             let awdl_phy = hardware
                 .helper
@@ -1767,17 +1766,11 @@ async fn main() -> Result<()> {
                 .await
                 .as_ref()
                 .map(|lease| lease.expected.phy.clone());
-            if let Some(radios) = value["radios"].as_array_mut() {
-                for radio in radios {
-                    radio["reserved_for"] = if radio["phy"].as_str() == awdl_phy.as_deref() {
-                        json!("AirDrop")
-                    } else if radio["phy"].as_str() == direct_phy.as_deref() {
-                        json!("Quick Share")
-                    } else {
-                        json!("Not reserved")
-                    };
-                }
-            }
+            let value = linuxdrop_ipc::HardwareStatus::from_inventory(
+                inventory.clone(),
+                awdl_phy.as_deref(),
+                direct_phy.as_deref(),
+            );
             let link_active = hardware
                 .download_offer
                 .lock()
@@ -1789,18 +1782,14 @@ async fn main() -> Result<()> {
             let show_adapter = initialized
                 && d.settings["hardware"]["open_on_adapter"] == true
                 && !hardware.locked.load(std::sync::atomic::Ordering::Relaxed)
-                && value["radios"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|radio| {
-                        radio["bus"] == "usb"
-                            && !d.hardware["radios"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .any(|old| old["id"] == radio["id"])
-                    });
+                && value.radios.iter().any(|view| {
+                    view.radio.bus == "usb"
+                        && !d
+                            .hardware
+                            .radios
+                            .iter()
+                            .any(|old| old.radio.id == view.radio.id)
+                });
             let mut missing = radio_allocation_request(&d.settings);
             missing.airdrop &= awdl_phy.is_none();
             missing.quickshare &= direct_phy.is_none();

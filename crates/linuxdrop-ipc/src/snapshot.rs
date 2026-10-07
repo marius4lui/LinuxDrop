@@ -1,5 +1,5 @@
 //! Typed status envelope; hardware detail and diagnostics have separate schemas.
-use crate::Settings;
+use crate::{HardwareStatus, Settings};
 use anyhow::{bail, Result};
 use linuxdrop_core::{BackendState, Peer, Transfer};
 use serde::{Deserialize, Serialize};
@@ -62,8 +62,7 @@ pub struct Snapshot {
     pub transfers: Vec<TransferView>,
     pub backends: Vec<BackendState>,
     pub settings: Settings,
-    /// Inventory and helper annotations are still owned by the hardware schema.
-    pub hardware: Value,
+    pub hardware: HardwareStatus,
 }
 impl Snapshot {
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -73,7 +72,8 @@ impl Snapshot {
         Ok(snapshot)
     }
     pub fn validate(&self) -> Result<()> {
-        if self.epoch.is_empty() || !self.hardware.is_object() {
+        self.hardware.validate()?;
+        if self.epoch.is_empty() {
             bail!("Invalid status envelope");
         }
         let mut peers = std::collections::HashSet::new();

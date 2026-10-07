@@ -107,6 +107,8 @@ with tempfile.TemporaryDirectory(prefix="linuxdrop-session-") as root:
         assert snapshot()["settings"]["visibility"]["mode"] == "hidden"
         if probe := os.environ.get("LINUXDROP_CONTRACT_PROBE"):
             subprocess.run([probe], check=True, timeout=15)
+        if os.environ.get("LINUXDROP_TEST_GJS_STATUS") == "1":
+            wait(lambda: snapshot()["hardware"]["observed_unix"] > 0)
         first = snapshot()
         assert first["settings"]["visibility"]["mode"] == "hidden"
         # The test client deliberately accepts the generated certificate. Product

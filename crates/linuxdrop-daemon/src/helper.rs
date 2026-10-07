@@ -201,7 +201,7 @@ pub(crate) mod tests {
                     transfer_order: Vec::new(),
                     completed_at: HashMap::new(),
                     backends: HashMap::new(),
-                    hardware: json!({}),
+                    hardware: linuxdrop_ipc::HardwareStatus::default(),
                     drafts: HashMap::new(),
                     commands: HashMap::new(),
                     retiring: HashMap::new(),

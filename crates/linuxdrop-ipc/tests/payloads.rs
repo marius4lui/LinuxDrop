@@ -1,7 +1,7 @@
 use linuxdrop_ipc::{Settings, Snapshot};
 use serde_json::{json, Value};
 fn snapshot() -> Value {
-    json!({"epoch":"test","revision":1,"restarting":false,"download_link_active":false,"peers":[],"known_peers":[],"transfers":[],"backends":[],"hardware":{},"settings":Settings::defaults("/tmp/received")})
+    json!({"epoch":"test","revision":1,"restarting":false,"download_link_active":false,"peers":[],"known_peers":[],"transfers":[],"backends":[],"hardware":linuxdrop_ipc::HardwareStatus::default(),"settings":Settings::defaults("/tmp/received")})
 }
 #[test]
 fn every_settings_leaf_rejects_the_wrong_wire_type() {
@@ -83,4 +83,55 @@ fn additive_fields_survive_validation_without_becoming_permissions() {
     assert!(!typed.settings.receive.open_after);
     assert_eq!(typed.settings.visibility.mode, "hidden");
     assert!(value["future"]["trusted"].as_bool().unwrap());
+}
+
+#[test]
+fn hardware_preserves_evidence_and_rejects_unsafe_shapes() {
+    let mut value = snapshot();
+    value["hardware"] = serde_json::from_str(include_str!("hardware.fixture.json")).unwrap();
+    let valid = value.clone();
+    let typed = Snapshot::from_value(&value).unwrap();
+    assert_eq!(
+        typed.hardware.radios[0]
+            .radio
+            .driver_details
+            .firmware
+            .as_deref(),
+        Some("test-firmware")
+    );
+    for key in [
+        "protected",
+        "rfkill",
+        "monitor",
+        "awdl",
+        "reserved_for",
+        "phy",
+    ] {
+        let mut bad = valid.clone();
+        bad["hardware"]["radios"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(Snapshot::from_value(&bad).is_err(), "missing {key}");
+    }
+    value["hardware"]["radios"][0]["protected"] = json!("false");
+    assert!(Snapshot::from_value(&value).is_err());
+    value = valid.clone();
+    value["hardware"]["radios"][0]["awdl"]["value"] = json!("supported");
+    assert!(Snapshot::from_value(&value).is_err());
+    value = valid.clone();
+    value["hardware"]["interfaces"] = json!([{"name":"wlan-test","ifindex":3,"phy":"phy-test","state":"up","default_route":true,"nm_state":100,"nm_managed":true,"active_connection":"active"}]);
+    assert!(
+        Snapshot::from_value(&value).is_err(),
+        "Active interface falsely declared unprotected"
+    );
+    value["hardware"]["radios"][0]["protected"] = json!(true);
+    Snapshot::from_value(&value).unwrap();
+    value = valid;
+    let radio = value["hardware"]["radios"][0].clone();
+    value["hardware"]["radios"]
+        .as_array_mut()
+        .unwrap()
+        .push(radio);
+    assert!(Snapshot::from_value(&value).is_err(), "Duplicate radio");
 }

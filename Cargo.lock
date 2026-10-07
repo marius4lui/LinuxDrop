@@ -2061,6 +2061,7 @@ dependencies = [
 name = "linuxdrop-hardware"
 version = "0.1.0"
 dependencies = [
+ "schemars",
  "serde",
  "serde_json",
  "tokio",
@@ -2074,6 +2075,7 @@ dependencies = [
  "anyhow",
  "futures-util",
  "linuxdrop-core",
+ "linuxdrop-hardware",
  "schemars",
  "serde",
  "serde_json",

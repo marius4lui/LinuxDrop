@@ -30,7 +30,6 @@ pub fn snapshot_schema() -> Value {
     }
     setting(&mut schema, "hardware", "protect_active_connection")["const"] = json!(true);
     schema["$defs"]["Settings"]["properties"]["schema_version"]["const"] = json!(1);
-    schema["properties"]["hardware"] = json!({"type":"object"});
     schema["properties"]["epoch"]["minLength"] = json!(1);
     schema["$defs"]["TransferView"]["properties"]["direction"]["enum"] =
         json!(["incoming", "outgoing"]);

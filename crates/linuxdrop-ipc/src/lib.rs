@@ -17,3 +17,6 @@ pub use snapshot::*;
 mod schema;
 #[cfg(feature = "schema")]
 pub use schema::snapshot_schema;
+
+mod hardware;
+pub use hardware::*;

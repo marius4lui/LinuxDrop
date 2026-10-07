@@ -152,7 +152,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     const realProxy = this._proxy;
                     const requests = [];
                     let owner = ':smoke.old';
-                    const snapshot = revision => ({epoch: owner, revision, restarting: false, download_link_active: false, hardware: {}, settings: fixtureSettings, known_peers: [], peers: [], backends: [], transfers: [{id: 'reconnect', peer_id: 'fixture-peer', protocol: 'quickshare', state: 'verification', direction: 'incoming', peer_name: 'Reconnect peer', verification_code: '123456', saved_paths: [], total_bytes: 10, transferred_bytes: 0, files: [{name: 'review.txt', size: 10, transferred: 0}]}]});
+                    const snapshot = revision => ({epoch: owner, revision, restarting: false, download_link_active: false, hardware: {observed_unix: 0, radios: [], interfaces: [], bluetooth: [], warnings: []}, settings: fixtureSettings, known_peers: [], peers: [], backends: [], transfers: [{id: 'reconnect', peer_id: 'fixture-peer', protocol: 'quickshare', state: 'verification', direction: 'incoming', peer_name: 'Reconnect peer', verification_code: '123456', saved_paths: [], total_bytes: 10, transferred_bytes: 0, files: [{name: 'review.txt', size: 10, transferred: 0}]}]});
                     const reply = (request, value) => request.callback(this._proxy, {deep_unpack: () => [JSON.stringify(value)]});
                     this._proxy = {
                         get_name_owner: () => owner,

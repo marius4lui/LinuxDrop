@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DriverDetails {
     pub version: Option<String>,
@@ -23,11 +24,13 @@ pub fn parse_ethtool(text: &str) -> DriverDetails {
     }
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceLimit {
     pub modes: Vec<String>,
     pub maximum: u32,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceCombination {
     pub limits: Vec<InterfaceLimit>,
@@ -79,6 +82,7 @@ pub fn parse_combinations(lines: &[String]) -> Vec<InterfaceCombination> {
         .collect()
 }
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceProfile {
     pub name: String,

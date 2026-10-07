@@ -14,6 +14,7 @@ use tokio::{
     time::{timeout, Duration},
 };
 
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityValue {
@@ -22,6 +23,7 @@ pub enum CapabilityValue {
     #[default]
     Unknown,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capability {
     pub value: CapabilityValue,
@@ -37,6 +39,7 @@ impl Capability {
         }
     }
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub frequency_mhz: u32,
@@ -45,6 +48,7 @@ pub struct Channel {
     pub no_ir: bool,
     pub radar: bool,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Radio {
     pub id: String,
@@ -75,6 +79,7 @@ pub struct Radio {
     pub awdl: Capability,
     pub protected: bool,
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkInterface {
     pub name: String,
@@ -99,6 +104,7 @@ impl NetworkInterface {
                 .is_some_and(|state| (40..=100).contains(&state))
     }
 }
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BluetoothController {
     pub id: String,

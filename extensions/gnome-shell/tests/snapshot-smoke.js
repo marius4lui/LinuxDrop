@@ -7,7 +7,7 @@ const settingsPath = ARGV[0] ?? 'crates/linuxdrop-ipc/settings.defaults.json';
 const [, data] = Gio.File.new_for_path(settingsPath).load_contents(null);
 const defaults = JSON.parse(new TextDecoder().decode(data));
 const fresh = () => ({epoch: 'test', revision: 1, restarting: false, download_link_active: false,
-    settings: JSON.parse(JSON.stringify(defaults)), peers: [], known_peers: [], hardware: {}, backends: [],
+    settings: JSON.parse(JSON.stringify(defaults)), peers: [], known_peers: [], hardware: {observed_unix: 0, radios: [], interfaces: [], bluetooth: [], warnings: []}, backends: [],
     transfers: [{id: 'transfer', peer_id: 'peer', peer_name: 'Phone', protocol: 'quickshare', direction: 'incoming', state: 'verification',
         files: [{name: 'file.txt', size: 10, transferred: 0}], total_bytes: 10, transferred_bytes: 0, saved_paths: [], verification_code: '1234'}]});
 let assertions = 0;
@@ -49,6 +49,23 @@ rejected(s => { s.settings.visibility.mode = 'contacts'; }, 'unsupported visibil
 const future = fresh(); future.future = {trusted: true}; future.settings.future = {auto_accept: true};
 future.transfers[0].selection_mode = null;
 check(parseSnapshot(JSON.stringify(future)).future.trusted === true, 'Opaque additive data preserved');
+const hardwarePath = Gio.File.new_for_path(settingsPath).get_parent().get_child('tests/hardware.fixture.json');
+const [, hardwareBytes] = hardwarePath.load_contents(null);
+const hardwareFixture = JSON.parse(new TextDecoder().decode(hardwareBytes));
+const withHardware = fresh(); withHardware.hardware = hardwareFixture;
+check(parseSnapshot(JSON.stringify(withHardware)).hardware.radios[0].driver_details.firmware === 'test-firmware', 'Hardware evidence survives validation');
+const badHardware = (mutate, label) => rejected(s => {
+    s.hardware = JSON.parse(JSON.stringify(hardwareFixture)); mutate(s.hardware);
+}, label);
+for (const key of ['protected', 'rfkill', 'monitor', 'awdl', 'reserved_for', 'phy']) {
+    badHardware(h => { delete h.radios[0][key]; }, `missing radio ${key}`);
+}
+badHardware(h => { h.radios[0].protected = 'false'; }, 'protected type');
+badHardware(h => { h.radios[0].awdl.value = 'supported'; }, 'unknown capability enum');
+badHardware(h => { h.radios[0].reserved_for = 'anything'; }, 'unknown reservation');
+badHardware(h => { h.bluetooth[0].supported_advertisements = 256; }, 'u8 bound');
+badHardware(h => { h.radios.push({...h.radios[0]}); }, 'duplicate radio');
+badHardware(h => { h.interfaces = [{name: 'wlan-test', ifindex: 3, phy: 'phy-test', state: 'up', default_route: true, nm_state: 100, nm_managed: true, active_connection: 'active'}]; }, 'active radio must stay protected');
 const schema = JSON.parse(JSON.stringify(snapshotSchema)); schema.pattern = '.*';
 let unsupported = false;
 try { snapshotValidator(schema); } catch (_) { unsupported = true; }

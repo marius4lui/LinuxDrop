@@ -118,5 +118,7 @@ The Shell consumes generated Snapshot/Settings schemas from linuxdrop-ipc.
 Run `python3 tools/sync-ipc-schema.py` after model changes; CI checks the output.
 Its bounded GJS reader validates structure and cross-field invariants before
 publishing status. Invalid replies clear consent/remote actions and recover on a
-valid subsequent snapshot. Hardware detail remains an opaque object until its
-separate model migration. See [status acceptance](acceptance/SHELL_STATUS_SCHEMA_2026-10-07.md).
+valid subsequent snapshot. Hardware inventory and reservation annotations now use shared typed models,
+including capability evidence and active-interface protection. See
+[status acceptance](acceptance/SHELL_STATUS_SCHEMA_2026-10-07.md) and
+[hardware payload acceptance](acceptance/HARDWARE_PAYLOAD_2026-10-07.md).

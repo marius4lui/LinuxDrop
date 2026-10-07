@@ -42,6 +42,20 @@ fn wire_fixture(value: &Value) -> Value {
         &mut value["settings"],
         linuxdrop_ipc::Settings::defaults("/tmp").to_value(),
     );
+    let hardware: Value = serde_json::from_str(include_str!(
+        "../../../crates/linuxdrop-ipc/tests/hardware.fixture.json"
+    ))
+    .unwrap();
+    fill(
+        &mut value["hardware"],
+        serde_json::to_value(linuxdrop_ipc::HardwareStatus::default()).unwrap(),
+    );
+    for radio in value["hardware"]["radios"].as_array_mut().unwrap() {
+        fill(radio, hardware["radios"][0].clone());
+    }
+    for controller in value["hardware"]["bluetooth"].as_array_mut().unwrap() {
+        fill(controller, hardware["bluetooth"][0].clone());
+    }
     for peer in value["peers"].as_array_mut().unwrap() {
         fill(
             peer,
