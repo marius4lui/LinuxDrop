@@ -35,8 +35,6 @@ const SERVICE_DATA: Bytes = Bytes::from_static(&[
     252, 18, 142, 1, 66, 0, 0, 0, 0, 0, 0, 0, 0, 0, 191, 45, 91, 160, 225, 216, 117, 36, 202, 0,
 ]);
 
-const INNER_NAME: &str = "BleAdvertiser";
-
 #[derive(Debug, Clone)]
 pub struct BleAdvertiser {
     adapter: Arc<bluer::Adapter>,
@@ -54,36 +52,111 @@ impl BleAdvertiser {
         })
     }
 
-    pub async fn run(&self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
-        info!(
-            "{INNER_NAME}: advertising on Bluetooth adapter {} with address {}",
-            self.adapter.name(),
-            self.adapter.address().await?
-        );
+    pub async fn run(&self, ctk: CancellationToken) -> anyhow::Result<()> {
+        self.run_window(ctk, None, None).await
+    }
 
-        // Nothing needs the BLE scanner while we're the one sharing -- targets
-        // are found over mDNS -- and scanning would take airtime away from this
-        // advertisement and pause it outright under LL privacy.
-        let _suppressor = BleScanSuppressor::new();
-
-        let service_uuid = Uuid::from_u16(0xFE2C);
-        let mut handle = linuxdrop_network::advertise(
-            &self.adapter,
-            self.get_advertisement(service_uuid, SERVICE_DATA),
-        )
-        .await?;
-        let released = tokio::select! {
-            _ = ctk.cancelled() => false,
-            _ = handle.released() => true,
+    async fn run_window(
+        &self,
+        ctk: CancellationToken,
+        window: Option<Duration>,
+        status: Option<&tokio::sync::broadcast::Sender<crate::channel::ChannelMessage>>,
+    ) -> anyhow::Result<()> {
+        let monitor =
+            linuxdrop_network::bluetooth_lifetime::ControllerMonitor::new(self.adapter.name())
+                .await?;
+        let turn = tokio::select! {
+            turn = super::advertisement_turn::Turn::acquire(true, &ctk) => turn?,
+            error = monitor.lost() => return Err(error),
         };
-        handle
-            .unregister()
-            .await
-            .map_err(crate::lifecycle::cleanup_failure)?;
-        if released {
-            anyhow::bail!("Bluetooth sender advertisement is no longer active");
+        let Some(mut turn) = turn else {
+            return Ok(());
+        };
+        monitor.check().await?;
+        if ctk.is_cancelled() {
+            return Ok(());
         }
-        Ok(())
+        // Suppress background scanning only during this advertising window;
+        // receiver handshakes must finish before their advertising turn yields.
+        let _suppressor = BleScanSuppressor::new();
+        turn.registering();
+        let registered = acknowledged_registration(
+            &self.adapter,
+            self.get_advertisement(Uuid::from_u16(0xFE2C), SERVICE_DATA),
+        )
+        .await;
+        let mut handle = match registered {
+            Ok(handle) => handle,
+            Err(error) => {
+                if !crate::lifecycle::cleanup_unconfirmed(&error) {
+                    turn.cleared();
+                }
+                return Err(error);
+            }
+        };
+        if !ctk.is_cancelled()
+            && let Some(status) = status
+        {
+            let _ = status.send(crate::channel::ChannelMessage {
+                id: "backend".into(),
+                msg: crate::channel::Message::BluetoothServiceReady {
+                    component: "bluetooth-discovery".into(),
+                },
+            });
+        }
+        let outcome = tokio::select! {
+            _ = ctk.cancelled() => Ok(()),
+            _ = handle.released() => Err(anyhow::anyhow!("Bluetooth sender advertisement is no longer active")),
+            error = monitor.lost() => Err(error),
+            _ = async { match window { Some(window) => tokio::time::sleep(window).await, None => std::future::pending::<()>().await } } => Ok(()),
+        };
+        let cleanup = tokio::time::timeout(Duration::from_secs(15), handle.unregister())
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.map_err(anyhow::Error::from));
+        if cleanup.is_ok() {
+            turn.cleared();
+        }
+        crate::lifecycle::finish(outcome, cleanup)
+    }
+
+    /// Nudge nearby phones in short windows, then leave airtime for receiver
+    /// advertisements and recipient discovery. Payload workers are independent.
+    pub async fn supervise(
+        status: tokio::sync::broadcast::Sender<crate::channel::ChannelMessage>,
+        ctk: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let mut retry = Duration::from_secs(2);
+        loop {
+            let created = tokio::select! {
+                _ = ctk.cancelled() => return Ok(()),
+                result = tokio::time::timeout(Duration::from_secs(5), Self::new()) => result.map_err(anyhow::Error::from).and_then(|r| r),
+            };
+            let result = match created {
+                Ok(advertiser) => {
+                    advertiser
+                        .run_window(ctk.clone(), Some(Duration::from_secs(3)), Some(&status))
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            let pause = match result {
+                Ok(()) => {
+                    retry = Duration::from_secs(2);
+                    Duration::from_secs(7)
+                }
+                Err(error) => {
+                    crate::backend_failure(&status, "bluetooth-discovery", &error);
+                    if crate::lifecycle::cleanup_unconfirmed(&error) {
+                        return Err(error);
+                    }
+                    let pause = retry;
+                    retry = (retry * 2).min(Duration::from_secs(15));
+                    pause
+                }
+            };
+            tokio::select! { _ = ctk.cancelled() => return Ok(()), _ = tokio::time::sleep(pause) => {} }
+        }
     }
 
     fn get_advertisement(&self, service_uuid: Uuid, adv_data: Bytes) -> Advertisement {
@@ -556,7 +629,7 @@ impl ReceiverAdvertiser {
             self.adapter.address().await?
         );
 
-        loop {
+        'receiver: loop {
             // Honour the visibility toggle. While "Hidden from everyone"
             // (Invisible), keep no advertisement on the air -- the same way
             // mDNS unregisters -- so the device is genuinely undiscoverable.
@@ -580,14 +653,29 @@ impl ReceiverAdvertiser {
                 }
             }
 
+            let Some(mut turn) = super::advertisement_turn::Turn::acquire(false, &ctk).await?
+            else {
+                return Ok(());
+            };
             // Register, retrying failures (some controllers refuse a new
             // connectable set while a previous LE connection is still winding
             // down).
             let mut failures = 0;
             let mut handles = loop {
+                if ctk.is_cancelled() {
+                    return Ok(());
+                }
+                if *visibility.borrow() == Visibility::Invisible {
+                    continue 'receiver;
+                }
+                turn.registering();
                 match self.register_all().await {
                     Ok(handles) => break handles,
                     Err(e) => {
+                        if crate::lifecycle::cleanup_unconfirmed(&e) {
+                            return Err(e);
+                        }
+                        turn.cleared();
                         failures += 1;
                         if failures >= 3 {
                             return Err(e);
@@ -611,11 +699,15 @@ impl ReceiverAdvertiser {
                 tokio::select! {
                     _ = ctk.cancelled() => {
                         info!("{RX_INNER_NAME}: tracker cancelled, returning");
-                        unregister_all(&mut handles).await?;
+                        unregister_all(&mut handles, &mut turn).await?;
                         return Ok(());
                     }
                     _ = async { futures::future::select_all(handles.iter().map(|handle| Box::pin(handle.released()))).await; } => {
                         warn!("{RX_INNER_NAME}: Bluetooth advertisement ended; registering again");
+                        break;
+                    }
+                    _ = super::advertisement_turn::sender_requested() => {
+                        // A queued sender gets the next fair turn after cleanup.
                         break;
                     }
                     _ = ADV_CYCLE.notified() => {
@@ -624,7 +716,7 @@ impl ReceiverAdvertiser {
                     }
                     changed = visibility.changed() => {
                         if changed.is_err() {
-                            unregister_all(&mut handles).await?;
+                            unregister_all(&mut handles, &mut turn).await?;
                         return Ok(());
                         }
                         if *visibility.borrow() == Visibility::Invisible {
@@ -662,7 +754,7 @@ impl ReceiverAdvertiser {
             // bluetoothd yet may never be enabled by the controller, and
             // nothing ever retries the enable. The sub-second gap of a clean
             // cycle is invisible next to the phone's scan interval.
-            unregister_all(&mut handles).await?;
+            unregister_all(&mut handles, &mut turn).await?;
             drop(handles);
             if ctk.is_cancelled() {
                 return Ok(());
@@ -677,6 +769,7 @@ impl ReceiverAdvertiser {
         for (name, data) in &self.payloads {
             match self.register(data).await {
                 Ok(handle) => handles.push(handle),
+                Err(e) if crate::lifecycle::cleanup_unconfirmed(&e) => return Err(e),
                 Err(e) => warn!("{RX_INNER_NAME}: couldn't register the {name} advertisement: {e}"),
             }
         }
@@ -707,6 +800,7 @@ impl ReceiverAdvertiser {
 
         match self.advertise_acknowledged(build(true)).await {
             Ok(handle) => Ok(handle),
+            Err(e) if crate::lifecycle::cleanup_unconfirmed(&e) => Err(e),
             Err(e) => {
                 // Min/MaxInterval are experimental in BlueZ and a daemon
                 // started without `-E` may refuse them. Advertising slowly
@@ -719,13 +813,12 @@ impl ReceiverAdvertiser {
         }
     }
 
-    /// BlueR owns the bounded D-Bus request and cleanup even if registration
-    /// fails. Do not abandon the registration future with an outer timeout.
+    /// BlueR keeps cleanup after timeout; uncertainty prevents another turn.
     async fn advertise_acknowledged(
         &self,
         adv: Advertisement,
     ) -> Result<bluer::adv::AdvertisementHandle, anyhow::Error> {
-        linuxdrop_network::advertise(&self.adapter, adv).await
+        acknowledged_registration(&self.adapter, adv).await
     }
 }
 
@@ -810,19 +903,40 @@ mod tests {
     }
 }
 
-async fn unregister_all(handles: &mut [bluer::adv::AdvertisementHandle]) -> anyhow::Result<()> {
+async fn unregister_all(
+    handles: &mut [bluer::adv::AdvertisementHandle],
+    turn: &mut super::advertisement_turn::Turn,
+) -> anyhow::Result<()> {
     // One failed registration must not prevent the remaining handles from
     // starting their cleanup. Await every receipt before reporting failure.
-    let outcomes =
-        futures::future::join_all(handles.iter_mut().map(|handle| handle.unregister())).await;
+    let outcomes = futures::future::join_all(handles.iter_mut().map(|handle| async move {
+        tokio::time::timeout(Duration::from_secs(15), handle.unregister())
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.map_err(anyhow::Error::from))
+    }))
+    .await;
     let errors: Vec<_> = outcomes
         .into_iter()
         .filter_map(Result::err)
         .map(|e| e.to_string())
         .collect();
     if errors.is_empty() {
+        turn.cleared();
         Ok(())
     } else {
         Err(crate::lifecycle::cleanup_failure(errors.join("; ")))
     }
+}
+
+async fn acknowledged_registration(
+    adapter: &bluer::Adapter,
+    adv: Advertisement,
+) -> anyhow::Result<bluer::adv::AdvertisementHandle> {
+    tokio::time::timeout(
+        Duration::from_secs(35),
+        linuxdrop_network::advertise(adapter, adv),
+    )
+    .await
+    .map_err(crate::lifecycle::cleanup_failure)?
 }

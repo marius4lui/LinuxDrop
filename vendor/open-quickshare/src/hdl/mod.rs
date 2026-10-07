@@ -1,4 +1,6 @@
 #[cfg(all(feature = "experimental", target_os = "linux"))]
+mod advertisement_turn;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
 mod bluetooth_tasks;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 #[doc(hidden)]

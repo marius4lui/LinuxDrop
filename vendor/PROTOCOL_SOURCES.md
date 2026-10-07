@@ -216,3 +216,9 @@ component readiness and bounded registration/cleanup waits with terminal
 uncertainty. BlueR keeps original-owner cleanup after deadline expiry. Private
 BlueZ and duplex lifetime fixtures cover recovery and preserved payload ownership.
 See docs/acceptance/BLUETOOTH_RECEIVER_RECOVERY_2026-10-07.md. No upstream code copied.
+
+2026-10-07 local FastInit sender supervision and cooperative advertisement turns:
+selected-controller retries, acknowledged readiness, short sender windows,
+receiver visibility recheck after queued admission, and terminal uncertain cleanup.
+Private BlueZ single-slot tests cover both directions without GATT recreation and
+prevent replacement after timeout. No new upstream implementation code copied.

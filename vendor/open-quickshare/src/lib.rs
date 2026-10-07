@@ -325,20 +325,7 @@ impl RQS {
             let ctk_blea = ctk.clone();
             let status = self.message_sender.clone();
             tracker.spawn("bluetooth-discovery", async move {
-                let blea = match BleAdvertiser::new().await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!("Couldn't init BleAdvertiser: {}", e);
-                        backend_failure(&status, "bluetooth-discovery", &e);
-                        return Err(e);
-                    }
-                };
-
-                let result = blea.run(ctk_blea).await;
-                if let Err(e) = &result {
-                    backend_failure(&status, "bluetooth-discovery", e);
-                }
-                result
+                BleAdvertiser::supervise(status, ctk_blea).await
             });
 
             // Discover phones on their Quick Share receive screen over BLE, so
