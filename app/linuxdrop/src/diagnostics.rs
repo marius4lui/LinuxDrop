@@ -74,6 +74,8 @@ pub fn add_actions(ui: &Rc<Ui>, group: &adw::PreferencesGroup) -> Vec<(gtk::Widg
 }
 
 fn confirm(ui: &Rc<Ui>, method: &'static str, title: &str, description: &str) {
+    let writing = method == "ResetSettings"
+        && (crate::settings::writes_pending(ui) || ui.settings_resetting.get());
     let link_active = ui.snapshot.borrow()["download_link_active"] == true;
     let active = link_active
         || ui.snapshot.borrow()["transfers"]
@@ -88,7 +90,9 @@ fn confirm(ui: &Rc<Ui>, method: &'static str, title: &str, description: &str) {
             });
     let dialog = adw::AlertDialog::builder()
         .heading(tr(title))
-        .body(tr(if link_active {
+        .body(tr(if writing {
+            "Wait for the current settings change to finish"
+        } else if link_active {
             "Stop the download link before restarting sharing or changing network settings"
         } else {
             description
@@ -97,14 +101,11 @@ fn confirm(ui: &Rc<Ui>, method: &'static str, title: &str, description: &str) {
     dialog.add_responses(&[("cancel", &tr("Cancel")), ("apply", &tr(title))]);
     dialog.set_close_response("cancel");
     dialog.set_response_appearance("apply", adw::ResponseAppearance::Destructive);
-    dialog.set_response_enabled("apply", !active);
+    dialog.set_response_enabled("apply", !active && !writing);
     let weak = Rc::downgrade(ui);
     dialog.connect_response(None, move |_, response| {
         if response == "apply" {
             if let Some(ui) = weak.upgrade() {
-                if method == "ResetSettings" {
-                    ui.settings_drafts.borrow_mut().clear();
-                }
                 ui.mutate(method, ().to_variant());
             }
         }

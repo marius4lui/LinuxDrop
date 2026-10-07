@@ -44,6 +44,7 @@ pub struct Ui {
     refreshing: Cell<bool>,
     refresh_again: Cell<bool>,
     service_generation: Cell<u64>,
+    settings_generation: Cell<u64>,
     service_ready: Cell<bool>,
     remote_transfer_actions: RefCell<Vec<gtk::Box>>,
     service_dialogs: RefCell<Vec<glib::WeakRef<adw::AlertDialog>>>,
@@ -52,6 +53,9 @@ pub struct Ui {
     pub settings_query: RefCell<String>,
     pub settings_category: Cell<u32>,
     pub settings_drafts: RefCell<HashMap<String, String>>,
+    pub settings_writes: RefCell<HashMap<String, settings::WriteState>>,
+    pub settings_rendering: Cell<bool>,
+    pub settings_resetting: Cell<bool>,
     rendered_settings: RefCell<Value>,
     revision: RefCell<String>,
     rendered_peers: RefCell<Value>,
@@ -392,6 +396,7 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         refreshing: Cell::new(false),
         refresh_again: Cell::new(false),
         service_generation: Cell::new(0),
+        settings_generation: Cell::new(0),
         service_ready: Cell::new(false),
         remote_transfer_actions: RefCell::new(Vec::new()),
         service_dialogs: RefCell::new(Vec::new()),
@@ -400,6 +405,9 @@ pub fn build(app: &adw::Application, initial_page: &str, initial_files: Vec<gio:
         settings_query: RefCell::new(String::new()),
         settings_category: Cell::new(0),
         settings_drafts: RefCell::new(HashMap::new()),
+        settings_writes: RefCell::new(HashMap::new()),
+        settings_rendering: Cell::new(false),
+        settings_resetting: Cell::new(false),
         rendered_settings: RefCell::new(Value::Null),
         revision: RefCell::new(String::new()),
         rendered_peers: RefCell::new(Value::Null),
@@ -737,11 +745,16 @@ impl Ui {
         ));
     }
     pub fn track_service_dialog(&self, dialog: &adw::AlertDialog) {
-        self.service_dialogs.borrow_mut().retain(|dialog| dialog.upgrade().is_some());
+        self.service_dialogs
+            .borrow_mut()
+            .retain(|dialog| dialog.upgrade().is_some());
         self.service_dialogs.borrow_mut().push(dialog.downgrade());
     }
     pub fn service_generation(&self) -> u64 {
         self.service_generation.get()
+    }
+    pub fn service_is_ready(&self) -> bool {
+        self.service_ready.get()
     }
     fn update_settings_status(&self) {
         let snapshot = self.snapshot.borrow();
@@ -790,7 +803,8 @@ impl Ui {
                 if ui.proxy.borrow().as_ref() != Some(proxy) {
                     return;
                 }
-                ui.service_generation.set(ui.service_generation.get().wrapping_add(1));
+                ui.service_generation
+                    .set(ui.service_generation.get().wrapping_add(1));
                 ui.revision.borrow_mut().clear();
                 ui.service_error("Service owner changed");
                 // A replacement owner must not wait for the old owner's reply.
@@ -817,6 +831,7 @@ impl Ui {
                 },
             };
             let generation = ui.service_generation.get();
+            let settings_generation = ui.settings_generation.get();
             let snapshot_proxy = proxy.as_ref().ok().cloned();
             let owner = snapshot_proxy.as_ref().and_then(|proxy| proxy.g_name_owner());
             let result = match proxy {
@@ -839,6 +854,13 @@ impl Ui {
                 return;
             }
             ui.refreshing.set(false);
+            if settings_generation != ui.settings_generation.get() {
+                // A write completed after this read began. Read again before
+                // publishing settings that predate a confirmed user choice.
+                ui.refresh_again.set(false);
+                ui.refresh();
+                return;
+            }
             match result {
                 Ok(snapshot) => {
                     ui.service_ready.set(true);
@@ -919,7 +941,21 @@ impl Ui {
             }
         });
     }
+    pub fn invalidate_settings(&self) {
+        *self.rendered_settings.borrow_mut() = Value::Null;
+    }
+    pub fn confirm_settings_write(&self) {
+        self.settings_generation
+            .set(self.settings_generation.get().wrapping_add(1));
+        self.invalidate_settings();
+    }
     pub fn mutate(self: &Rc<Self>, method: &str, params: glib::Variant) {
+        if method == "ResetSettings"
+            && (self.settings_resetting.get() || settings::writes_pending(self))
+        {
+            self.toast("Wait for the current settings change to finish");
+            return;
+        }
         if !self.service_ready.get() {
             self.toast("The sharing service is not connected yet");
             return;
@@ -930,10 +966,39 @@ impl Ui {
         };
         let ui = self.clone();
         let method = method.to_owned();
+        let generation = self.service_generation();
+        let owner = proxy.g_name_owner();
+        if method == "ResetSettings" {
+            self.settings_resetting.set(true);
+            self.settings_body.set_sensitive(false);
+            self.toast("Restoring default settings…");
+        }
         glib::MainContext::default().spawn_local(async move {
-            if let Err(error) = ipc::call(&proxy, &method, Some(params)).await {
+            if generation != ui.service_generation()
+                || proxy.g_name_owner() != owner
+                || !ui.service_is_ready()
+            {
+                if method == "ResetSettings" {
+                    ui.settings_resetting.set(false);
+                    ui.settings_body.set_sensitive(true);
+                }
+                return;
+            }
+            let result = ipc::call(&proxy, &method, Some(params)).await;
+            if method == "ResetSettings" {
+                ui.settings_resetting.set(false);
+                ui.settings_body.set_sensitive(true);
+            }
+            if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+                return;
+            }
+            if let Err(error) = result {
                 ui.toast(&error);
                 *ui.rendered_settings.borrow_mut() = Value::Null;
+            } else if method == "ResetSettings" {
+                ui.settings_drafts.borrow_mut().clear();
+                ui.settings_writes.borrow_mut().clear();
+                ui.confirm_settings_write();
             }
             ui.refresh();
         });
@@ -1570,7 +1635,9 @@ impl Ui {
             actions.set_halign(gtk::Align::End);
             if state != "completed" {
                 actions.set_sensitive(self.service_ready.get());
-                self.remote_transfer_actions.borrow_mut().push(actions.clone());
+                self.remote_transfer_actions
+                    .borrow_mut()
+                    .push(actions.clone());
             }
             let pending = (state == "waiting" && incoming) || state == "verification";
             if state == "pin_required" {

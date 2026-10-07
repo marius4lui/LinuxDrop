@@ -5,6 +5,19 @@ use gtk::{gio, glib};
 use serde_json::{json, Value};
 use std::rc::Rc;
 
+#[derive(Clone)]
+pub struct WriteState {
+    value: Value,
+    error: Option<String>,
+}
+
+pub fn writes_pending(ui: &Ui) -> bool {
+    ui.settings_writes
+        .borrow()
+        .values()
+        .any(|write| write.error.is_none())
+}
+
 struct Field {
     key: &'static str,
     title: &'static str,
@@ -31,6 +44,8 @@ const fn field(key: &'static str, title: &'static str, detail: &'static str, kin
 }
 
 pub fn render(ui: &Rc<Ui>, config: &Value) {
+    // Removing a focused SpinRow emits focus-leave. Rebuilding is not an edit.
+    ui.settings_rendering.set(true);
     let mut focused = gtk::prelude::GtkWindowExt::focus(&ui.window);
     let mut focus_name = None;
     while let Some(widget) = focused {
@@ -322,6 +337,12 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                 continue;
             };
             let draft_key = format!("{section}.{}", field.key);
+            let write = ui.settings_writes.borrow().get(&draft_key).cloned();
+            let value = write
+                .as_ref()
+                .filter(|write| write.error.is_none())
+                .map(|write| &write.value)
+                .unwrap_or(value);
             if field.key == "protect_active_connection" {
                 let row = adw::ActionRow::builder()
                     .title(tr(field.title))
@@ -393,12 +414,13 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                         1.0
                     };
                     let persisted = value.as_f64().unwrap_or(*min) / scale;
-                    if ui
-                        .settings_drafts
-                        .borrow()
-                        .get(&draft_key)
-                        .and_then(|text| text.parse::<f64>().ok())
-                        == Some(persisted)
+                    if write.is_none()
+                        && ui
+                            .settings_drafts
+                            .borrow()
+                            .get(&draft_key)
+                            .and_then(|text| text.parse::<f64>().ok())
+                            == Some(persisted)
                     {
                         ui.settings_drafts.borrow_mut().remove(&draft_key);
                     }
@@ -460,7 +482,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     } else {
                         value.as_str().unwrap_or("").to_owned()
                     };
-                    if ui.settings_drafts.borrow().get(&draft_key) == Some(&current) {
+                    if write.is_none()
+                        && ui.settings_drafts.borrow().get(&draft_key) == Some(&current)
+                    {
                         ui.settings_drafts.borrow_mut().remove(&draft_key);
                     }
                     let initial = ui
@@ -506,7 +530,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                 }
                 Kind::Secret => {
                     let current = value.as_str().unwrap_or("").to_owned();
-                    if ui.settings_drafts.borrow().get(&draft_key) == Some(&current) {
+                    if write.is_none()
+                        && ui.settings_drafts.borrow().get(&draft_key) == Some(&current)
+                    {
                         ui.settings_drafts.borrow_mut().remove(&draft_key);
                     }
                     let initial = ui
@@ -544,6 +570,7 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                     let row = adw::ActionRow::builder()
                         .title(tr(field.title))
                         .subtitle(value.as_str().unwrap_or("Choose a folder"))
+                        .use_markup(false)
                         .build();
                     let button = gtk::Button::from_icon_name("folder-open-symbolic");
                     button.set_valign(gtk::Align::Center);
@@ -590,6 +617,9 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                 }
             };
             widget.set_widget_name(&format!("setting:{draft_key}"));
+            if write.as_ref().is_some_and(|write| write.error.is_none()) {
+                widget.set_sensitive(false);
+            }
             group.add(&widget);
             let mut terms = format!("{} {} {}", tr(title), tr(field.title), tr(field.detail));
             if let Kind::Choice(choices) = &field.kind {
@@ -599,6 +629,73 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
                 }
             }
             rows.push((widget, terms.to_lowercase()));
+            if let Some(write) = write {
+                let status = adw::ActionRow::builder()
+                    .title(tr(if write.error.is_some() {
+                        "Could not confirm this setting"
+                    } else {
+                        "Saving setting…"
+                    }))
+                    .subtitle(write.error.as_deref().unwrap_or_default())
+                    .use_markup(false)
+                    .build();
+                status.set_widget_name(&format!("setting-status:{draft_key}"));
+                if write.error.is_some() {
+                    let retry = gtk::Button::with_label(&tr("Try again"));
+                    retry.set_widget_name(&format!("setting:retry:{draft_key}"));
+                    retry.set_valign(gtk::Align::Center);
+                    retry.update_property(&[gtk::accessible::Property::Label(&format!(
+                        "{}: {}",
+                        tr("Try again"),
+                        tr(field.title)
+                    ))]);
+                    let weak = Rc::downgrade(ui);
+                    let section = section.to_string();
+                    let key = field.key.to_owned();
+                    let draft_key = draft_key.clone();
+                    let text_input = matches!(field.kind, Kind::Text | Kind::Secret);
+                    let interfaces = matches!(field.kind, Kind::Interfaces);
+                    let numeric = matches!(field.kind, Kind::Number(..));
+                    retry.connect_clicked(move |_| {
+                        if let Some(ui) = weak.upgrade() {
+                            let draft = ui.settings_drafts.borrow().get(&draft_key).cloned();
+                            let value = match draft {
+                                Some(text) if text_input => json!(text),
+                                Some(text) if interfaces => json!(text
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|name| !name.is_empty())
+                                    .collect::<Vec<_>>()),
+                                Some(text) if numeric => text
+                                    .parse::<f64>()
+                                    .ok()
+                                    .map(|number| {
+                                        json!(
+                                            (number
+                                                * if key == "max_bytes" {
+                                                    1_000_000.0
+                                                } else {
+                                                    1.0
+                                                })
+                                                as u64
+                                        )
+                                    })
+                                    .unwrap_or_else(|| write.value.clone()),
+                                _ => write.value.clone(),
+                            };
+                            update(&ui, &section, &key, value);
+                        }
+                    });
+                    status.add_suffix(&retry);
+                    status.set_activatable_widget(Some(&retry));
+                } else {
+                    let spinner = gtk::Spinner::new();
+                    spinner.start();
+                    status.add_prefix(&spinner);
+                }
+                group.add(&status);
+                rows.push((status.upcast(), terms.to_lowercase()));
+            }
         }
         if !rows.is_empty() {
             if *section == "transfers" {
@@ -823,23 +920,97 @@ pub fn render(ui: &Rc<Ui>, config: &Value) {
     if let Some(name) = focus_name {
         crate::ui::restore_focus(&ui.settings_body, &name);
     }
+    ui.settings_rendering.set(false);
 }
 
 fn update(ui: &Rc<Ui>, section: &str, key: &str, value: Value) {
+    let draft_key = format!("{section}.{key}");
+    if ui.settings_rendering.get()
+        || ui.settings_resetting.get()
+        || ui
+            .settings_writes
+            .borrow()
+            .get(&draft_key)
+            .is_some_and(|write| write.error.is_none())
+    {
+        return;
+    }
     if ui.settings.borrow()[section][key] == value {
+        if ui.settings_writes.borrow_mut().remove(&draft_key).is_some() {
+            let ui = ui.clone();
+            glib::idle_add_local_once(move || {
+                let config = ui.settings.borrow().clone();
+                render(&ui, &config);
+            });
+        }
         return;
     }
-    if ui.proxy.borrow().is_none() {
-        ui.toast("The sharing service is not connected yet");
-        let ui = ui.clone();
-        // Restore switches and choices even when no D-Bus call can be attempted.
-        // Entry drafts remain available for a retry after reconnecting.
-        glib::idle_add_local_once(move || {
-            let config = ui.settings.borrow().clone();
-            render(&ui, &config);
-        });
-        return;
-    }
+    ui.settings_writes.borrow_mut().insert(
+        draft_key.clone(),
+        WriteState {
+            value: value.clone(),
+            error: None,
+        },
+    );
+    let proxy = ui
+        .proxy
+        .borrow()
+        .clone()
+        .filter(|proxy| ui.service_is_ready() && proxy.g_name_owner().is_some());
+    let owner = proxy.as_ref().and_then(|proxy| proxy.g_name_owner());
+    let generation = ui.service_generation();
     let patch = json!({ section: { key: value } });
-    ui.mutate("UpdateSettings", (patch.to_string(),).to_variant());
+    let ui = ui.clone();
+    // Leave the originating GTK signal before rebuilding its row.
+    glib::idle_add_local_once(move || {
+        let config = ui.settings.borrow().clone();
+        render(&ui, &config);
+        glib::MainContext::default().spawn_local(async move {
+            let result = match proxy {
+                Some(proxy)
+                    if ui.service_is_ready()
+                        && generation == ui.service_generation()
+                        && proxy.g_name_owner() == owner =>
+                {
+                    let result = crate::ipc::call(
+                        &proxy,
+                        "UpdateSettings",
+                        Some((patch.to_string(),).to_variant()),
+                    )
+                    .await;
+                    if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+                        Err(tr("Could not confirm this change. Try again."))
+                    } else {
+                        result.map(|_| ())
+                    }
+                }
+                _ => Err(tr("Background service unavailable")),
+            };
+            match result {
+                Ok(()) => {
+                    ui.settings_writes.borrow_mut().remove(&draft_key);
+                    // A successful receipt confirms persistence. Reflect it before
+                    // fetching effective backend state, so an older in-flight
+                    // snapshot cannot leave the control stuck in its pending row.
+                    let mut config = ui.settings.borrow().clone();
+                    for (section, values) in patch.as_object().unwrap() {
+                        for (key, value) in values.as_object().unwrap() {
+                            config[section][key] = value.clone();
+                        }
+                    }
+                    *ui.settings.borrow_mut() = config.clone();
+                    render(&ui, &config);
+                    ui.confirm_settings_write();
+                    ui.refresh();
+                }
+                Err(error) => {
+                    if let Some(write) = ui.settings_writes.borrow_mut().get_mut(&draft_key) {
+                        write.error = Some(error);
+                    }
+                    let config = ui.settings.borrow().clone();
+                    render(&ui, &config);
+                }
+            }
+        });
+    });
 }

@@ -88,9 +88,14 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let fail_next_stop = Rc::new(Cell::new(true));
     let fail_next_preference = Rc::new(Cell::new(false));
     let preference_calls = Rc::new(Cell::new(0));
+    let fail_next_setting = Rc::new(Cell::new(false));
+    let setting_calls = Rc::new(Cell::new(0));
     let hold_snapshot = Rc::new(Cell::new(false));
-    let pending_snapshots = Rc::new(RefCell::new(Vec::<(gio::DBusMethodInvocation, glib::Variant)>::new()));
-    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='StopDownloadOffer'/><method name='UpdatePeerPreferences'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
+    let pending_snapshots = Rc::new(RefCell::new(Vec::<(
+        gio::DBusMethodInvocation,
+        glib::Variant,
+    )>::new()));
+    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='StopDownloadOffer'/><method name='ResetSettings'/><method name='UpdateSettings'><arg type='s' direction='in'/></method><method name='UpdatePeerPreferences'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
     let accepted = accepted_options.clone();
@@ -100,6 +105,8 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let fail_stop = fail_next_stop.clone();
     let fail_preference = fail_next_preference.clone();
     let preference_count = preference_calls.clone();
+    let fail_setting = fail_next_setting.clone();
+    let setting_count = setting_calls.clone();
     let hold = hold_snapshot.clone();
     let pending = pending_snapshots.clone();
     let registration = bus
@@ -124,6 +131,34 @@ fn native_draft_focus_protocol_and_settings_regressions() {
                         state.borrow_mut()["download_link_active"] = json!(false);
                         invocation.return_value(None);
                     }
+                }
+                "ResetSettings" => {
+                    glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                        invocation
+                            .return_dbus_error("io.github.marius4lui.Error", "Test reset refused");
+                    });
+                }
+                "UpdateSettings" => {
+                    setting_count.set(setting_count.get() + 1);
+                    let (patch,) = parameters.get::<(String,)>().unwrap();
+                    let patch: Value = serde_json::from_str(&patch).unwrap();
+                    let fail = fail_setting.replace(false);
+                    let state = state.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                        if fail {
+                            invocation.return_dbus_error(
+                                "io.github.marius4lui.Error",
+                                "Test setting save failed",
+                            );
+                        } else {
+                            for (section, values) in patch.as_object().unwrap() {
+                                for (key, value) in values.as_object().unwrap() {
+                                    state.borrow_mut()["settings"][section][key] = value.clone();
+                                }
+                            }
+                            invocation.return_value(None);
+                        }
+                    });
                 }
                 "UpdatePeerPreferences" => {
                     preference_count.set(preference_count.get() + 1);
@@ -300,6 +335,100 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             "Unapplied text survives another setting update"
         );
         capture(&ui, "settings-compact-review.png");
+        let search = find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap();
+        search.set_text(&tr("Start at login"));
+        // Render the actual persisted value before simulating a failed change.
+        settings::render(&ui, &ui.settings.borrow().clone());
+        fail_next_setting.set(true);
+        let autostart = find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap();
+        autostart.set_active(true);
+        settle().await;
+        let pending = find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap();
+        assert!(!pending.is_sensitive() && pending.is_active(), "A pending setting shows the requested value and prevents duplicate writes");
+        assert_eq!(find(&ui.settings_body, "setting-status:general.autostart").unwrap().downcast::<adw::ActionRow>().unwrap().title(), tr("Saving setting…"));
+        glib::timeout_future(Duration::from_millis(350)).await;
+        let saved = find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap();
+        assert!(!saved.is_active() && saved.is_sensitive(), "Failed switches restore the confirmed value");
+        let status = find(&ui.settings_body, "setting-status:general.autostart").unwrap().downcast::<adw::ActionRow>().unwrap();
+        assert!(status.subtitle().unwrap().contains("Test setting save failed"));
+        assert_eq!(setting_calls.get(), 1, "Rebuilding and rollback must not send writes");
+        let retry = find(&ui.settings_body, "setting:retry:general.autostart").unwrap();
+        assert!(retry.grab_focus(), "Retry must be keyboard focusable");
+        let name = std::ffi::CString::new(format!("{}: {}", tr("Try again"), tr("Start at login"))).unwrap();
+        let mismatch: Option<glib::GString> = unsafe {
+            glib::translate::from_glib_full(gtk::ffi::gtk_test_accessible_check_property(
+                retry.as_ptr().cast(), gtk::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL, name.as_ptr(),
+            ))
+        };
+        assert!(mismatch.is_none(), "Retry exposes the setting-specific translated name");
+        settle().await;
+        capture(&ui, "settings-save-failed.png");
+        hold_snapshot.set(true);
+        ui.refresh();
+        settle().await;
+        assert_eq!(pending_snapshots.borrow().len(), 1);
+        find(&ui.settings_body, "setting:retry:general.autostart").unwrap().downcast::<gtk::Button>().unwrap().emit_clicked();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert!(find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap().is_active());
+        assert!(find(&ui.settings_body, "setting-status:general.autostart").is_none());
+        hold_snapshot.set(false);
+        let (call, old_settings) = pending_snapshots.borrow_mut().remove(0);
+        call.return_value(Some(&old_settings));
+        settle().await;
+        assert!(find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap().is_active(), "A read begun before success cannot revert a confirmed setting");
+        assert_eq!(setting_calls.get(), 2);
+        assert_eq!(ui.settings_drafts.borrow().get("general.device_name").map(String::as_str), Some("Unapplied device name"));
+        // The Apply button's internal dirty state is reset when a row is rebuilt;
+        // a separate retry must retain and resend the exact text after failure.
+        find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap().set_text(&tr("Device name"));
+        fail_next_setting.set(true);
+        find(&ui.settings_body, "setting:general.device_name").unwrap().downcast::<adw::EntryRow>().unwrap().emit_by_name::<()>("apply", &[]);
+        ui.mutate("ResetSettings", ().to_variant());
+        assert!(!ui.settings_resetting.get(), "Reset cannot race a pending field write");
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(find(&ui.settings_body, "setting:general.device_name").unwrap().downcast::<adw::EntryRow>().unwrap().text(), "Unapplied device name");
+        find(&ui.settings_body, "setting:general.device_name").unwrap().downcast::<adw::EntryRow>().unwrap().set_text("Revised device name");
+        find(&ui.settings_body, "setting:retry:general.device_name").unwrap().downcast::<gtk::Button>().unwrap().emit_clicked();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(ui.settings.borrow()["general"]["device_name"], "Revised device name", "Retry uses the most recently edited text");
+        fail_next_setting.set(true);
+        let entry = find(&ui.settings_body, "setting:general.device_name").unwrap().downcast::<adw::EntryRow>().unwrap();
+        entry.set_text("Discard this failed edit");
+        entry.emit_by_name::<()>("apply", &[]);
+        glib::timeout_future(Duration::from_millis(400)).await;
+        let entry = find(&ui.settings_body, "setting:general.device_name").unwrap().downcast::<adw::EntryRow>().unwrap();
+        entry.set_text("Revised device name");
+        let calls = setting_calls.get();
+        entry.emit_by_name::<()>("apply", &[]);
+        settle().await;
+        assert_eq!(setting_calls.get(), calls);
+        assert!(find(&ui.settings_body, "setting-status:general.device_name").is_none(), "Restoring the saved value clears the previous error without writing");
+        let entry = find(&ui.settings_body, "setting:general.device_name").unwrap().downcast::<adw::EntryRow>().unwrap();
+        entry.set_text("Keep after failed reset");
+        find(&ui.settings_body, "diagnostic:reset").unwrap().downcast::<gtk::Button>().unwrap().emit_clicked();
+        ui.window.visible_dialog().unwrap().emit_by_name::<()>("response", &[&"apply"]);
+        assert!(ui.settings_resetting.get() && !ui.settings_body.is_sensitive(), "Reset prevents new edits until its receipt");
+        let calls = setting_calls.get();
+        find(&ui.settings_body, "setting:general.device_name").unwrap().downcast::<adw::EntryRow>().unwrap().emit_by_name::<()>("apply", &[]);
+        settle().await;
+        assert_eq!(setting_calls.get(), calls);
+        glib::timeout_future(Duration::from_millis(300)).await;
+        assert!(!ui.settings_resetting.get() && ui.settings_body.is_sensitive());
+        assert_eq!(ui.settings_drafts.borrow().get("general.device_name").map(String::as_str), Some("Keep after failed reset"), "An unsuccessful reset preserves unsaved work");
+        if let Some(dialog) = ui.window.visible_dialog() { dialog.force_close(); }
+        ui.service_error("test settings offline with proxy");
+        let calls = setting_calls.get();
+        find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap().set_active(false);
+        settle().await;
+        assert_eq!(setting_calls.get(), calls, "An unready proxy must not send settings changes");
+        assert!(find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap().is_active());
+        assert!(find(&ui.settings_body, "setting:retry:general.autostart").is_some());
+        ui.refresh();
+        settle().await;
+        find(&ui.settings_body, "setting:retry:general.autostart").unwrap().downcast::<gtk::Button>().unwrap().emit_clicked();
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert!(!find(&ui.settings_body, "setting:general.autostart").unwrap().downcast::<adw::SwitchRow>().unwrap().is_active());
+        find(&ui.settings_body, "setting:search").unwrap().downcast::<gtk::SearchEntry>().unwrap().set_text("");
         let require_pin = find(&ui.settings_body, "setting:localsend.require_pin").unwrap();
         assert!(!require_pin.is_sensitive(), "A receiving PIN must be saved before it can be required");
         config["localsend"]["pin"] = json!("1234");

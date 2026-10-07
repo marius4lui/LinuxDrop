@@ -76,3 +76,23 @@ regression and app Clippy passed. History values through 10000 display correctly
 The native runner now isolates configuration/data/cache and excludes LinuxDrop
 activation from its private bus services; it cannot start the installed sharing
 daemon during owner-loss tests.
+
+2026-10-07 bounded two-agent follow-up: Astra/high agents independently owned
+GTK settings and GNOME Shell; parent reviewed their implementation and native
+renders. The Shell retains send/settings access during transfers, preserves
+same-request keyboard focus across unrelated updates, isolates replacement
+consent focus, treats external text literally, and aligns progress at the left
+edge. Its English 1440x900 and German 150% 800x600 native checks passed. See
+[Shell action acceptance](../acceptance/UI_SHELL_ACTIONS_2026-10-07.md).
+
+The broad unchecked accessibility, monitor and settings-inventory rows above
+are deliberately not treated as proved by these focused checks. This follow-up
+is not an assertion that all LinuxDrop implementation work is complete.
+
+The same follow-up adds persistent per-setting pending/error/retry feedback,
+preserves failed text/reset drafts, rejects obsolete save receipts and late
+snapshots, and serializes reset against field writes. The isolated native GTK
+scenario and app all-target Clippy passed; parent inspected the German 480x600
+failure/retry rendering. See
+[GTK settings acceptance](../acceptance/UI_GTK_SETTINGS_2026-10-07.md) for exact
+coverage and the bounded reset timeout during owner loss.
