@@ -3,6 +3,7 @@
 .linuxdrop-notch-header:hover { background-color: rgba(255,255,255,0.07); }
 .linuxdrop-notch-header:focus { border: 2px solid #8ab4f8; padding: 5px 12px; }
 .linuxdrop-notch-icon { color: #8ab4f8; icon-size: 16px; }
+.linuxdrop-notch-close { color: #b8bccb; icon-size: 12px; }
 .linuxdrop-notch-title { font-weight: 700; font-size: 0.82em; }
 .linuxdrop-notch-detail { color: #b8bccb; font-size: 0.75em; max-width: 130px; }
 .linuxdrop-notch-expanded { padding: 12px 14px 14px; spacing: 12px; }

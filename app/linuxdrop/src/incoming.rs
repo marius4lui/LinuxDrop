@@ -144,10 +144,16 @@ impl Ui {
         let list = gtk::Box::new(gtk::Orientation::Vertical, 6);
         for (index, file) in files.iter().enumerate() {
             let name = file["name"].as_str().unwrap_or_default();
-            let check = gtk::CheckButton::with_label(&format!(
-                "{name} · {}",
-                bytes(file["size"].as_u64().unwrap_or(0))
-            ));
+            let description = format!("{name} · {}", bytes(file["size"].as_u64().unwrap_or(0)));
+            let check = gtk::CheckButton::new();
+            let filename = label(&description, "");
+            filename.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            filename.set_lines(2);
+            filename.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            filename.set_hexpand(true);
+            check.set_child(Some(&filename));
+            check.set_tooltip_text(Some(&description));
+            check.update_property(&[gtk::accessible::Property::Label(&description)]);
             check.set_widget_name(&format!("incoming-file-{index}"));
             check.set_active(selected.borrow()[index]);
             let selected = selected.clone();
@@ -167,6 +173,7 @@ impl Ui {
             &gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .propagate_natural_height(true)
+                .min_content_height((files.len().min(2) as i32 * 44).max(44))
                 .max_content_height(240)
                 .child(&list)
                 .build(),
@@ -185,6 +192,9 @@ impl Ui {
         let choose = gtk::Button::from_icon_name("folder-open-symbolic");
         choose.set_valign(gtk::Align::Center);
         choose.set_tooltip_text(Some(&tr("Choose a receiving folder")));
+        choose.update_property(&[gtk::accessible::Property::Label(&tr(
+            "Choose a receiving folder",
+        ))]);
         destination.add_suffix(&choose);
         destination.set_activatable_widget(Some(&choose));
         let box_list = gtk::ListBox::new();
@@ -261,6 +271,84 @@ impl Ui {
                 ui.refresh();
             });
         });
+        dialog.present(Some(&self.window));
+        dialog
+    }
+
+    pub fn open_received_file(self: &Rc<Self>, path: &str, show_folder: bool) {
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+        let weak = Rc::downgrade(self);
+        let completed = move |result: Result<(), glib::Error>| {
+            if let Err(error) = result {
+                if !error.matches(gtk::DialogError::Dismissed)
+                    && !error.matches(gtk::DialogError::Cancelled)
+                {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.toast(&error.to_string());
+                    }
+                }
+            }
+        };
+        if show_folder {
+            launcher.open_containing_folder(Some(&self.window), gio::Cancellable::NONE, completed);
+        } else {
+            launcher.launch(Some(&self.window), gio::Cancellable::NONE, completed);
+        }
+    }
+
+    pub fn received_files(self: &Rc<Self>, paths: &[String]) -> adw::Dialog {
+        let dialog = adw::Dialog::builder()
+            .title(tr("Received files"))
+            .content_width(480)
+            .content_height((paths.len().min(6) as i32 * 56 + 72).clamp(184, 420))
+            .build();
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.set_valign(gtk::Align::Start);
+        list.add_css_class("boxed-list");
+        list.set_margin_top(18);
+        list.set_margin_bottom(18);
+        list.set_margin_start(18);
+        list.set_margin_end(18);
+        for (index, path) in paths.iter().enumerate() {
+            let file = gio::File::for_path(path);
+            let name = file
+                .basename()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let row = adw::ActionRow::builder().title(&name).build();
+            row.set_use_markup(false);
+            row.set_title_lines(2);
+            row.set_tooltip_text(Some(path));
+            let open = gtk::Button::from_icon_name("document-open-symbolic");
+            open.set_widget_name(&format!("received-file-{index}"));
+            open.set_valign(gtk::Align::Center);
+            open.set_tooltip_text(Some(&tr("Open file")));
+            open.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{}: {name}",
+                tr("Open file")
+            ))]);
+            let weak = Rc::downgrade(self);
+            let path = path.clone();
+            open.connect_clicked(move |_| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.open_received_file(&path, false);
+                }
+            });
+            row.add_suffix(&open);
+            row.set_activatable_widget(Some(&open));
+            list.append(&row);
+        }
+        toolbar.set_content(Some(
+            &gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .child(&list)
+                .build(),
+        ));
+        dialog.set_child(Some(&toolbar));
         dialog.present(Some(&self.window));
         dialog
     }

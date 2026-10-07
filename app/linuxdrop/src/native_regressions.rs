@@ -46,6 +46,8 @@ fn capture(ui: &Ui, name: &str) {
 #[test]
 #[ignore = "Needs isolated GTK display and session bus; run with dbus-run-session xvfb-run"]
 fn native_draft_focus_protocol_and_settings_regressions() {
+    // The test backend exposes accessible properties without a screen reader.
+    std::env::set_var("GTK_A11Y", "test");
     adw::init().unwrap();
     let provider = gtk::CssProvider::new();
     provider.load_from_string(include_str!("../resources/style.css"));
@@ -286,8 +288,28 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         capture(&ui, "send-wide-review.png");
         ui.window.set_default_size(480,600);
         ui.stack.set_visible_child_name("transfers");
-        let dialog = ui.accept_request(&json!({"id":"incoming-verification","peer_name":"Prüfgerät","protocol":"quickshare","direction":"incoming","state":"verification","verification_code":"1234","total_bytes":100,"receive_directory":"/tmp/Reviewed-Sender","selection_mode":"publish_selected","files":[{"name":"fixture.txt","size":75},{"name":"excluded.txt","size":25}]}));
+        let long_name = format!("{}.txt", "long-filename-without-spaces".repeat(8));
+        let dialog = ui.accept_request(&json!({"id":"incoming-verification","peer_name":"Prüfgerät","protocol":"quickshare","direction":"incoming","state":"verification","verification_code":"1234","total_bytes":100,"receive_directory":"/tmp/Reviewed-Sender","selection_mode":"publish_selected","files":[{"name":long_name,"size":75},{"name":"excluded.txt","size":25}]}));
         settle().await;
+        let long_file = find(&dialog, "incoming-file-0").unwrap();
+        assert!(long_file.measure(gtk::Orientation::Horizontal, -1).0 < 400,
+            "Unbroken filenames must wrap without forcing incoming review wider than a compact window");
+        let line_height = long_file.create_pango_layout(Some("A")).pixel_size().1;
+        assert!(long_file.measure(gtk::Orientation::Vertical, 300).1 <= line_height * 2 + 16,
+            "Long filenames must stay within two lines so other files remain reachable");
+        let full_name = format!("{long_name} · {}", bytes(75));
+        assert_eq!(long_file.tooltip_text().as_deref(), Some(full_name.as_str()));
+        let accessible_name = std::ffi::CString::new(full_name).unwrap();
+        // GTK's variadic accessibility assertion is not wrapped by gtk-rs.
+        // The LABEL property consumes one NUL-terminated string, kept alive here.
+        let mismatch: Option<glib::GString> = unsafe {
+            glib::translate::from_glib_full(gtk::ffi::gtk_test_accessible_check_property(
+                long_file.as_ptr().cast(),
+                gtk::ffi::GTK_ACCESSIBLE_PROPERTY_LABEL,
+                accessible_name.as_ptr(),
+            ))
+        };
+        assert!(mismatch.is_none(), "The accessible name must retain the complete filename: {mismatch:?}");
         find(&dialog,"incoming-file-1").unwrap().downcast::<gtk::CheckButton>().unwrap().set_active(false);
         glib::timeout_future(Duration::from_millis(400)).await;
         capture(&ui,"incoming-verification-review.png");
@@ -385,6 +407,37 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         ui.stop_link.emit_clicked();
         settle().await;
         assert!(!ui.download_link.is_visible());
+        snapshot.borrow_mut()["transfers"] = json!([{
+            "id":"received", "peer_name":"Pixel test fixture", "protocol":"localsend",
+            "direction":"incoming", "state":"completed", "total_bytes":0, "transferred_bytes":0,
+            "files":[{"name":"empty-valid.txt","size":0}], "saved_paths":[first]
+        }]);
+        snapshot.borrow_mut()["revision"] = json!(34);
+        ui.refresh();
+        settle().await;
+        let open = find(&ui.transfers, "transfer:received:OpenFiles").unwrap().downcast::<gtk::Button>().unwrap();
+        assert_eq!(open.label().as_deref(), Some(tr("Open file").as_str()));
+        assert!(find(&ui.transfers, "transfer:received:OpenFolder").is_some());
+        // File management remains usable even while the sharing service is offline.
+        // Do not launch a file manager or registered application in this isolated test.
+        snapshot.borrow_mut()["transfers"][0]["saved_paths"] = json!([first, second]);
+        snapshot.borrow_mut()["transfers"][0]["files"] = json!([
+            {"name":"empty-valid.txt","size":0}, {"name":"added-during-send.txt","size":13}
+        ]);
+        snapshot.borrow_mut()["revision"] = json!(35);
+        ui.refresh();
+        settle().await;
+        ui.service_error("test owner loss after completed receive");
+        let open = find(&ui.transfers, "transfer:received:OpenFiles").unwrap().downcast::<gtk::Button>().unwrap();
+        assert_eq!(open.label().as_deref(), Some(tr("Show received files").as_str()));
+        open.emit_clicked();
+        settle().await;
+        let received = ui.window.visible_dialog().expect("Multi-file completion opens the received file list");
+        assert!(find(&received, "received-file-0").unwrap().is_sensitive());
+        assert!(find(&received, "received-file-1").unwrap().is_sensitive());
+        glib::timeout_future(Duration::from_millis(400)).await;
+        capture(&ui, "completed-received-files.png");
+        received.force_close();
         ui.allow_close.set(true);
         ui.window.close();
     });

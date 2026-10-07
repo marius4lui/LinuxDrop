@@ -1570,17 +1570,42 @@ impl Ui {
                 );
             }
             if state == "completed" {
-                if let Some(path) = array(transfer, "saved_paths")
-                    .first()
-                    .and_then(Value::as_str)
-                {
-                    let file = gio::File::for_path(path);
-                    let open = gtk::Button::with_label(&tr("Open file"));
+                let paths: Vec<String> = array(transfer, "saved_paths")
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if let Some(path) = paths.first() {
+                    let folder = gtk::Button::from_icon_name("folder-open-symbolic");
+                    folder
+                        .set_widget_name(&format!("transfer:{}:OpenFolder", text(transfer, "id")));
+                    folder.set_tooltip_text(Some(&tr("Show the destination folder")));
+                    folder.update_property(&[gtk::accessible::Property::Label(&tr(
+                        "Show the destination folder",
+                    ))]);
+                    let weak = Rc::downgrade(self);
+                    let path = path.clone();
+                    folder.connect_clicked(move |_| {
+                        if let Some(ui) = weak.upgrade() {
+                            ui.open_received_file(&path, true);
+                        }
+                    });
+                    actions.append(&folder);
+                    let open = gtk::Button::with_label(&tr(if paths.len() == 1 {
+                        "Open file"
+                    } else {
+                        "Show received files"
+                    }));
+                    open.set_widget_name(&format!("transfer:{}:OpenFiles", text(transfer, "id")));
                     let weak = Rc::downgrade(self);
                     open.connect_clicked(move |_| {
                         if let Some(ui) = weak.upgrade() {
-                            let launcher = gtk::FileLauncher::new(Some(&file));
-                            launcher.launch(Some(&ui.window), gio::Cancellable::NONE, move |_| {});
+                            if paths.len() == 1 {
+                                ui.open_received_file(&paths[0], false);
+                            } else {
+                                ui.received_files(&paths);
+                            }
                         }
                     });
                     actions.append(&open);

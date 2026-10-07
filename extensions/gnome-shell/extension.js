@@ -95,6 +95,7 @@ export default class LinuxDropExtension extends Extension {
         row.add_child(this._title);
         this._detail = new St.Label({text: '', style_class: 'linuxdrop-notch-detail', y_align: Clutter.ActorAlign.CENTER}); row.add_child(this._detail);
         this._detail.clutter_text.ellipsize = Pango.EllipsizeMode.END;
+        row.add_child(new St.Icon({icon_name: 'window-close-symbolic', style_class: 'linuxdrop-notch-close', y_align: Clutter.ActorAlign.CENTER}));
         this._header.set_child(row); this._notch.add_child(this._header);
         this._scroll = new St.ScrollView({hscrollbar_policy: St.PolicyType.NEVER, vscrollbar_policy: St.PolicyType.AUTOMATIC, overlay_scrollbars: true});
         this._body = new St.BoxLayout({vertical: true, request_mode: Clutter.RequestMode.HEIGHT_FOR_WIDTH, style_class: 'linuxdrop-notch-expanded', visible: false});
@@ -197,7 +198,7 @@ export default class LinuxDropExtension extends Extension {
         if (active.length) this._panelIcon.add_style_class_name('linuxdrop-panel-active');
         else this._panelIcon.remove_style_class_name('linuxdrop-panel-active');
         this._title.text = current ? `${['incoming', 'receive'].includes(current.direction) ? '↓' : '↑'} ${current.peer_name}` : 'LinuxDrop';
-        this._detail.text = current ? (TERMINAL.has(current.state) ? t(current.state) : current.state === 'transferring' && current.total_bytes > 0 ? `${Math.floor(100 * current.transferred_bytes / current.total_bytes)}%` : t(current.state === 'verification' ? 'Compare code' : current.state === 'waiting' && ['incoming', 'receive'].includes(current.direction) ? 'Request' : 'Waiting')) : nearby((snapshot.peers ?? []).length);
+        this._detail.text = current ? (TERMINAL.has(current.state) ? t(current.state) : current.state === 'transferring' && current.total_bytes > 0 ? `${Math.floor(100 * current.transferred_bytes / current.total_bytes)}%` : t(current.state === 'verification' ? 'Compare code' : current.state === 'pin_required' ? 'Enter PIN' : current.state === 'waiting' && ['incoming', 'receive'].includes(current.direction) ? 'Request' : 'Waiting')) : nearby((snapshot.peers ?? []).length);
         const visible = snapshot.settings?.visibility?.mode === 'everyone';
         this._indicator.toggle.checked = visible;
         this._indicator.toggle.reactive = this._serviceState === 'ready' && !this._actionPending;
@@ -238,6 +239,7 @@ export default class LinuxDropExtension extends Extension {
         }
         this._bodySignature = signature;
         const focus = global.stage.get_key_focus();
+        const navigationFocus = focus && this._body.contains(focus) ? focus.accessible_name : null;
         if (focus && this._body.contains(focus)) this._header.grab_key_focus();
         this._body.destroy_all_children(); this._progress = null;
         if (this._actionError) this._body.add_child(textLabel(this._actionError, 'linuxdrop-notch-error'));
@@ -257,12 +259,16 @@ export default class LinuxDropExtension extends Extension {
                 this._selectedTransfer = active[next].id;
                 this._render();
             };
-            this._iconButton(chooser, 'Previous', 'go-previous-symbolic', () => select(-1));
+            const previous = this._iconButton(chooser, 'Previous transfer', 'go-previous-symbolic', () => select(-1));
             const count = textLabel(index < 0 ? t('Active transfers') : `${index + 1} / ${active.length}`);
             count.y_align = Clutter.ActorAlign.CENTER;
             chooser.add_child(count);
-            this._iconButton(chooser, 'Next', 'go-next-symbolic', () => select(1));
+            const next = this._iconButton(chooser, 'Next transfer', 'go-next-symbolic', () => select(1));
             this._body.add_child(chooser);
+            // Keep repeated keyboard navigation on the same arrow. Consent and
+            // cancellation actions still fall back to the header on state changes.
+            if (navigationFocus === previous.accessible_name) previous.grab_key_focus();
+            else if (navigationFocus === next.accessible_name) next.grab_key_focus();
         }
         if (current) {
             this._body.add_child(textLabel(current.peer_name, 'linuxdrop-notch-heading', true));
@@ -337,6 +343,7 @@ export default class LinuxDropExtension extends Extension {
         const button = new St.Button({can_focus: true, accessible_name: t(label), style_class: 'linuxdrop-notch-action linuxdrop-notch-navigation'});
         button.set_child(new St.Icon({icon_name: icon, style_class: 'linuxdrop-notch-icon'}));
         button.connect('clicked', callback); box.add_child(button);
+        return button;
     }
 
     _setExpanded(expanded) {

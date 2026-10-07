@@ -53,3 +53,8 @@ or separately bound protocol listeners.
 Astra UX/UI pass, failed-consent retry preservation, PIN dependency/search focus,
 and a real isolated GNOME 46 bubble smoke at normal and German 150% text. Broad
 unchecked rows remain open where their full acceptance scope exceeds those checks.
+
+2026-10-07 focused polish: completed multi-file receive navigation, compact
+filename review, launcher feedback and Shell keyboard transfer selection are
+implemented and covered by native tests. See the acceptance record for exact
+scope; broader accessibility and mixed-DPI acceptance remain open.

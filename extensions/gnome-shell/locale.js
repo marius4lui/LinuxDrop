@@ -4,6 +4,7 @@ const de = {
     'LinuxDrop stopped before this transfer finished.': 'LinuxDrop wurde beendet, bevor diese Übertragung abgeschlossen war.',
     'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.': 'Der Netzwerk-Helfer ist nicht erreichbar. Der Freigabedienst wurde gestoppt; der Adapter wird möglicherweise noch freigegeben. Verbinde ihn erneut und starte die Freigabedienste in den Einstellungen neu.',
     'Previous': 'Zurück', 'Next': 'Weiter', 'Active transfers': 'Aktive Übertragungen',
+    'Previous transfer': 'Vorherige Übertragung', 'Next transfer': 'Nächste Übertragung',
     'completed': 'Abgeschlossen', 'failed': 'Fehlgeschlagen', 'cancelled': 'Abgebrochen', 'rejected': 'Abgelehnt',
     'Open folder': 'Ordner öffnen', 'Done': 'Fertig', 'Review files': 'Dateien prüfen', 'Enter PIN': 'PIN eingeben',
     'Open bubble on': 'Bubble öffnen auf', 'Primary monitor': 'Hauptbildschirm', 'Pointer monitor': 'Bildschirm des Mauszeigers', 'Fixed monitor': 'Festgelegter Bildschirm',

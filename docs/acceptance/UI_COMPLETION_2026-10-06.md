@@ -168,3 +168,25 @@ The isolated GNOME 46 smoke passed with German/150% text, including replacement
 of Cancel with Details/Done after helper failure and the translated explanation.
 This is runtime behavior acceptance, not a new rendered image or physical-radio
 claim. The live demo remains unchanged.
+
+## 2026-10-07: focused native and Shell usability polish
+
+Two additional Astra/high agents worked on separate surfaces. GTK completed
+receives now expose every saved file, retain a direct Open action for one file,
+and provide destination-folder access. File-launch failures surface as feedback;
+user dismissal does not raise an error. File access remains usable while the
+sharing service is disconnected. Incoming filenames preserve their full
+accessible text while fitting a compact review dialog.
+
+The Shell's Previous/Next transfer controls keep keyboard focus when the body
+is rebuilt. Consent and cancellation state changes retain the safer header
+focus fallback. The header has a visible close affordance and accurately labels
+the PIN-required state. The bubble still opens only after its panel action.
+
+Validation: isolated German GTK regression at 480x600, scoped GTK and Quick Share
+Clippy, and isolated GNOME 46 smoke in English and German with 150% text passed.
+Rendered evidence is in `ui/completion/completed-received-files.png`,
+`ui/completion/incoming-long-name.png`, and `ui/completion/shell-polish-de150.png`.
+External application/file-manager launch, actual screen-reader traversal and
+physical mixed-DPI acceptance are not inferred from these checks. The live demo
+and installed packages were not changed.

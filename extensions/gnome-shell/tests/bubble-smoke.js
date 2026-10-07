@@ -24,7 +24,7 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                 const button = find(this._body, name);
                 check(button.width <= this._body.width, `${name} must fit the body`);
             }
-            check(find(this._body, 'Previous') && find(this._body, 'Next'), 'Transfer chooser must expose named controls');
+            check(find(this._body, 'Previous transfer') && find(this._body, 'Next transfer'), 'Transfer chooser must expose specific named controls');
             const capture = GLib.getenv('LINUXDROP_SMOKE_CAPTURE');
             if (capture) {
                 const output = Gio.File.new_for_path(capture).replace(null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
@@ -32,7 +32,11 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                 finally { output.close(null); }
                 console.log(`LINUXDROP_SMOKE_CAPTURED: ${capture}`);
             }
-            this._selectedTransfer = 'other-transfer'; this._render();
+            let next = find(this._body, 'Next transfer'); next.grab_key_focus(); next.emit('clicked', 1);
+            check(this._selectedTransfer === 'other-transfer' && global.stage.get_key_focus() === find(this._body, 'Next transfer'), 'Next must preserve keyboard focus on the rebuilt chooser');
+            const previous = find(this._body, 'Previous transfer'); previous.grab_key_focus(); previous.emit('clicked', 1);
+            check(this._selectedTransfer === 'verification' && global.stage.get_key_focus() === find(this._body, 'Previous transfer'), 'Previous must preserve keyboard focus on the rebuilt chooser');
+            next = find(this._body, 'Next transfer'); next.grab_key_focus(); next.emit('clicked', 1);
             later(() => {
                 const cancel = find(this._body, 'Cancel'); cancel.grab_key_focus();
                 const fill = this._progress;
@@ -48,6 +52,8 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     check(find(this._body, 'Details').reactive, 'Details must remain available while pending');
                     check(global.stage.get_key_focus() === this._header, 'Status rebuild must retain focus inside the bubble');
                     this._actionPending = false;
+                    current.state = 'pin_required'; this._render();
+                    check(this._detail.text === t('Enter PIN') && find(this._body, 'Enter PIN'), 'PIN state must explain the next action in the header and body');
                     current.state = 'failed';
                     current.error = 'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.';
                     this._render();

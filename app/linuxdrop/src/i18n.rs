@@ -250,6 +250,8 @@ pub fn tr(message: &str) -> String {
         "Cancel" => "Abbrechen",
         "Close" => "Schließen",
         "Open file" => "Datei öffnen",
+        "Received files" => "Empfangene Dateien",
+        "Show received files" => "Empfangene Dateien anzeigen",
         "Then choose a nearby device" => "Danach ein Gerät in der Nähe auswählen",
         "Your files are ready. Choose who to share with." => "Deine Dateien sind bereit. Wähle den Empfänger aus.",
         "Choose device" => "Gerät auswählen",
