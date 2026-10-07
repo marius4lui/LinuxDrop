@@ -15,7 +15,7 @@ async fn listener_updates_preserve_sessions_and_advertise_only_bound_addresses()
         .borrow()
         .interfaces
         .iter()
-        .find(|entry| entry.address.is_loopback())
+        .find(|entry| entry.address.is_ipv4() && entry.address.is_loopback())
         .unwrap()
         .clone();
     let added = linuxdrop_network::InterfaceAddress {
@@ -106,6 +106,15 @@ async fn running_engine_follows_real_address_and_link_changes() {
     ip(&["link", "add", "ld-test0", "type", "dummy"]);
     ip(&["addr", "add", "198.18.0.1/24", "dev", "ld-test0"]);
     ip(&["link", "set", "ld-test0", "up"]);
+    ip(&[
+        "-6",
+        "addr",
+        "add",
+        "fd42:1234::1/64",
+        "dev",
+        "ld-test0",
+        "nodad",
+    ]);
     lan_policy::set(TransferPolicy {
         allowed_interfaces: vec!["ld-test0".into()],
         ..Default::default()
@@ -130,6 +139,38 @@ async fn running_engine_follows_real_address_and_link_changes() {
             .await
             .is_ok()
     );
+    let ipv6: SocketAddr = format!("[fd42:1234::1]:{port}").parse().unwrap();
+    assert!(lan_policy::connect(ipv6).await.is_ok());
+    let offer = lan_policy::upgrade_offer(&[ipv6]).unwrap();
+    let candidates = lan_policy::upgrade_candidates(&offer).unwrap();
+    assert!(lan_policy::connect_candidates(&candidates).await.is_ok());
+    let mdns = rqs_lib::hdl::MDnsServer::build_service_on(
+        *b"TEST",
+        port,
+        rqs_lib::DeviceType::Laptop,
+        &updates.borrow().interfaces,
+    )
+    .unwrap();
+    assert!(mdns.get_addresses().contains(&ipv6.ip()));
+    // Remove IPv4 entirely: the running engine must keep its IPv6 LAN ready.
+    ip(&["addr", "del", "198.18.0.1/24", "dev", "ld-test0"]);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            updates.changed().await.unwrap();
+            if !updates
+                .borrow_and_update()
+                .interfaces
+                .iter()
+                .any(|local| !local.loopback && local.address.is_ipv4())
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(updates.borrow().available());
+    assert!(lan_policy::connect(ipv6).await.is_ok());
     ip(&["addr", "add", "198.18.1.1/24", "dev", "ld-test0"]);
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {

@@ -172,7 +172,7 @@ pub struct InboundRequest<S = TcpStream> {
     bwu_retry_at: Option<tokio::time::Instant>,
     /// The sender's advertised LAN address (from its ConnectionRequest's
     /// medium_metadata); decides the bandwidth-upgrade path.
-    remote_ip: Option<[u8; 4]>,
+    remote_ip: Option<std::net::IpAddr>,
     /// Host our own hotspot for the next upgrade attempt (no shared LAN with
     /// the sender, or the LAN offer already failed once).
     bwu_try_hotspot: bool,
@@ -331,27 +331,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
 
     /// Offer a Wi-Fi-LAN bandwidth upgrade: send an encrypted UPGRADE_PATH_AVAILABLE
     /// over the current (BLE) channel advertising our TCP ip:port.
-    async fn send_upgrade_path_available(&mut self, port: u16) -> Result<(), anyhow::Error> {
+    async fn send_upgrade_path_available(
+        &mut self,
+        addresses: &[std::net::SocketAddr],
+    ) -> Result<(), anyhow::Error> {
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
-            EventType, UpgradePathInfo,
-            upgrade_path_info::{Medium, WifiLanSocket},
+            EventType, UpgradePathInfo, upgrade_path_info::Medium,
         };
-
-        let ip = crate::utils::local_ipv4()
-            .ok_or_else(|| anyhow!("no local IPv4 address for bandwidth upgrade"))?;
+        let socket = crate::lan_policy::upgrade_offer(addresses)?;
         info!(
-            "BWU: offering WIFI_LAN upgrade at {}.{}.{}.{}:{port}",
-            ip[0], ip[1], ip[2], ip[3]
+            "BWU: offering WIFI_LAN upgrade on {} bound addresses",
+            socket.address_candidates.len()
         );
 
         let frame = Self::bwu_frame(
             EventType::UpgradePathAvailable,
             Some(UpgradePathInfo {
                 medium: Some(Medium::WifiLan.into()),
-                wifi_lan_socket: Some(WifiLanSocket {
-                    ip_address: Some(ip.to_vec()),
-                    wifi_port: Some(port as i32),
-                }),
+                wifi_lan_socket: Some(socket),
                 supports_client_introduction_ack: Some(true),
                 ..Default::default()
             }),
@@ -615,7 +612,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             .medium_metadata
             .as_ref()
             .and_then(|m| m.ip_address.as_ref())
-            .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok());
+            .and_then(|b| crate::lan_policy::decode_ip(b).ok());
 
         let endpoint_info = connection_request
             .endpoint_info
@@ -2078,8 +2075,16 @@ impl InboundRequest<crate::hdl::MigratableStream> {
         // for the retry, so a wrong guess costs one round, never the transfer.
         if self.bwu_attempts == 0 {
             self.bwu_try_hotspot = match self.remote_ip {
-                Some(ip) => !crate::utils::same_subnet(ip),
-                None => crate::utils::local_ipv4().is_none(),
+                Some(ip) => crate::lan_policy::interfaces(false).map_or(true, |interfaces| {
+                    !interfaces.iter().any(|local| {
+                        crate::lan_policy::upgrade_address(local.address) && local.contains(ip)
+                    })
+                }),
+                None => crate::lan_policy::interfaces(false).map_or(true, |interfaces| {
+                    !interfaces
+                        .iter()
+                        .any(|local| crate::lan_policy::upgrade_address(local.address))
+                }),
             };
         }
         if self.bwu_try_hotspot {
@@ -2096,13 +2101,19 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             return self.do_bwu_hotspot().await;
         }
 
-        let local = crate::utils::local_ipv4()
-            .ok_or_else(|| anyhow!("No enabled LAN interface for bandwidth upgrade"))?;
-        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::from(local), 0)).await?;
-        let port = listener.local_addr()?.port();
-
-        // Offer WIFI_LAN over the encrypted BLE channel.
-        self.send_upgrade_path_available(port).await?;
+        let interfaces = crate::lan_policy::interfaces(false)?
+            .into_iter()
+            .filter(|local| crate::lan_policy::upgrade_address(local.address))
+            .collect();
+        let listener = crate::lan_policy::LanListeners::new_on(0, interfaces).await?;
+        let addresses: Vec<_> = listener
+            .subscribe()
+            .borrow()
+            .interfaces
+            .iter()
+            .map(|local| std::net::SocketAddr::new(local.address, listener.port()))
+            .collect();
+        self.send_upgrade_path_available(&addresses).await?;
 
         // Wait for the phone to connect over TCP -- while KEEPING the BLE
         // channel read: a phone whose Wi-Fi is still down reports

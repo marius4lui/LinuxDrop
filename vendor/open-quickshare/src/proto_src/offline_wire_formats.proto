@@ -239,6 +239,12 @@ message PayloadTransferFrame {
   optional ControlMessage control_message = 4;
 }
 
+// Network tuple, with an IPv4 (4 bytes) or IPv6 (16 bytes) network-order address.
+message ServiceAddress {
+  optional bytes ip_address = 1;
+  optional int32 port = 2;
+}
+
 message BandwidthUpgradeNegotiationFrame {
   enum EventType {
     UNKNOWN_EVENT_TYPE = 0;
@@ -285,6 +291,9 @@ message BandwidthUpgradeNegotiationFrame {
     message WifiLanSocket {
       optional bytes ip_address = 1;
       optional int32 wifi_port = 2;
+      // Ordered IPv6 then IPv4 candidates replace the legacy fields.
+      // Link-local addresses are forbidden for WIFI_LAN.
+      repeated ServiceAddress address_candidates = 3;
     }
 
     // Accompanies Medium.BLUETOOTH.

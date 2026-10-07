@@ -27,7 +27,7 @@ Quick Share:
 - LinuxDrop sends opened source descriptors into the outbound engine; logical names remain stable and path replacement cannot change which inode is read. Legacy upstream path inputs remain separate.
 - Independent tracked LAN sessions, shutdown cancellation, inbound terminal failure events and discovery connect timeout.
 - TCP/mDNS task health events, Bluetooth degradation diagnostics, initial mDNS registration and daemon shutdown on drop. Rust formatting is normalized for the repository's formatter gate.
-- IPv4 LAN listeners, source sockets, discovery probes and upgrades follow LinuxDrop's interface allowlist. mDNS uses explicit bound addresses instead of the library's unrestricted auto-address population. Listener reconciliation publishes one snapshot for advertisement, discovery and readiness; existing sessions survive unrelated address changes. Discovery probes are bounded, cancellable and discarded when superseded.
+- IPv4/IPv6 LAN listeners, source sockets, discovery probes and upgrades follow LinuxDrop's interface allowlist. mDNS uses explicit bound addresses instead of the library's unrestricted auto-address population. Listener reconciliation publishes one snapshot for advertisement, discovery and readiness; existing sessions survive unrelated address changes. Discovery probes are bounded, cancellable and discarded when superseded.
 - Shared signed-integer P-256 coordinate decoder restores leading zeroes for SEC1 and rejects negative/oversized coordinates, wrong key types and invalid points; both handshake directions use it.
 - File payloads consume the daemon-provided shared bandwidth budget in both directions; matching cancellation remains responsive during a budget wait. The outbound BLE connector uses the explicitly selected controller too.
 
@@ -126,3 +126,11 @@ by the server after the original BLE bridge ends. Shutdown closes task admission
 before waiting, and each server permits at most 32 tasks. GATT packet queues are
 bounded to 128 writes of at most 512 bytes; reassembly is capped at 1 MiB and
 foreign service payloads are not forwarded to the Quick Share parser.
+
+
+IPv6 LAN support includes scoped link-local discovery endpoints, dual-family
+bound listeners and source-bound connections. The Google wire schema's
+ServiceAddress and WIFI_LAN address_candidates fields are now implemented for
+both upgrade offers and received candidates; legacy fields remain compatible.
+Only actually bound non-link-local LAN addresses are offered for upgrades.
+Direct/hotspot IPv6 credentials and full P2P negotiation are still distinct work.

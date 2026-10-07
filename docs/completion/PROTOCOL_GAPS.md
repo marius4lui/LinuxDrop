@@ -27,7 +27,8 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Missing BlueZ preserves LAN functionality; task failures and cancellation produce terminal states; mdns lifecycle cleanup.
 - [x] Stable configurable IPv4 LAN listener port and interface-filtered advertisement/discovery/listening; exact local-address binds and source-bound outgoing connections.
 - [x] Live IPv4 LAN address/interface changes reconcile listeners, mDNS records, discovery probes and readiness without requiring a manual backend restart.
-- [ ] IPv6 LAN and negotiated IPv6 address candidates; prolonged mDNS reconfiguration/resource-bound acceptance.
+- [x] IPv6 LAN listeners, scoped discovery endpoints and WIFI_LAN address-candidate offers/selection, including IPv6-only readiness and exact interface binding.
+- [ ] IPv6 credentials/candidates for direct/hotspot networks; prolonged mDNS reconfiguration/resource-bound acceptance.
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
 - [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
@@ -407,3 +408,31 @@ ownership tests cover migrated-session lifetime and cancellation of stalled work
 Workspace all-target Clippy passed. Real Bluetooth transport/Wi-Fi migration and
 controller loss recovery across all roles remain separate acceptance/implementation
 items; these tests do not mark those broader rows complete.
+
+
+## IPv6 LAN and WIFI_LAN candidate negotiation, 2026-10-07
+
+Quick Share listens and advertises on enabled bound IPv4 and IPv6 addresses.
+Discovery probes both families; link-local records receive an explicit enabled
+interface scope, retained through the endpoint and send API. Unscoped link-local
+connections and scopes outside the allowlist are rejected, and local addresses
+are not rediscovered as peers. Readiness no longer treats IPv6-only LAN as missing.
+
+WIFI_LAN upgrade offers are built from the listeners actually opened for the
+transfer. The wire schema now includes ServiceAddress and the ordered
+address_candidates field: IPv6 precedes IPv4, legacy fields match the final
+candidate, and a received candidate list supersedes those legacy fields. Invalid
+lengths, ports, mapped addresses, loopback, multicast and link-local upgrade
+addresses are rejected. Connection attempts remain ordered and bounded. This
+implements the LAN portion of the
+[Google wire schema](https://github.com/google/nearby/blob/main/connections/implementation/proto/offline_wire_formats.proto);
+Wi-Fi Direct ip_v6_address and hotspot candidates remain separate active work.
+
+Checks passed: 11 Quick Share tests, including real UKEY2/consent/exact-byte
+transfer over IPv4 and IPv6, candidate rules and scoped discovery; the existing
+private network-namespace engine lifecycle test now removes all non-loopback
+IPv4 addresses and proves IPv6 readiness, connection, advertised address and
+candidate connection before link-down/recovery. The address-policy/socket test
+also passed as unprivileged Ubuntu. Workspace all-target Clippy passed. No
+physical Android or over-the-air multicast acceptance is inferred, and installed
+packages/live demo remain unchanged.

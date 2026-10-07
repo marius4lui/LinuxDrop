@@ -201,7 +201,9 @@ impl MDnsServer {
         let properties = [("n", endpoint_info)];
         let addresses = interfaces
             .iter()
-            .filter(|interface| interface.address.is_ipv4() && !interface.loopback)
+            .filter(|interface| {
+                !interface.loopback && crate::lan_policy::valid_unicast(interface.address)
+            })
             .map(|interface| interface.address.to_string())
             .collect::<Vec<_>>()
             .join(",");

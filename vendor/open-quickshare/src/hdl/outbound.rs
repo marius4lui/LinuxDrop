@@ -378,13 +378,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
             Some("plain") => None,
             Some("norole") => Some(location_nearby_connections::MediumMetadata {
                 supports_5_ghz: Some(true),
-                ip_address: crate::utils::local_ipv4().map(|ip| ip.to_vec()),
+                ip_address: crate::utils::local_lan_ip().map(crate::lan_policy::address_bytes),
                 ap_frequency: Some(-1),
                 ..Default::default()
             }),
             _ => Some(location_nearby_connections::MediumMetadata {
                 supports_5_ghz: Some(true),
-                ip_address: crate::utils::local_ipv4().map(|ip| ip.to_vec()),
+                ip_address: crate::utils::local_lan_ip().map(crate::lan_policy::address_bytes),
                 ap_frequency: Some(-1),
                 medium_role: Some(location_nearby_connections::MediumRole {
                     support_wifi_direct_group_owner: Some(true),
@@ -1119,7 +1119,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         // LAN, we connect to it) or an UPGRADE_PATH_REQUEST (no shared LAN —
         // the phone asks US to host; the Quick Share for Windows path).
         let mut deadline = tokio::time::Instant::now() + BWU_OFFER_TIMEOUT;
-        let (ip, port) = loop {
+        let candidates = loop {
             let offline = if let Some(stashed) = self.pending_bwu.take() {
                 stashed
             } else {
@@ -1157,11 +1157,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                     match medium {
                         Some(UpMedium::WifiLan) => {
                             if let Some(w) = upi.and_then(|u| u.wifi_lan_socket.as_ref()) {
-                                let ipb = w.ip_address();
-                                if ipb.len() == 4 {
-                                    let ip =
-                                        std::net::Ipv4Addr::new(ipb[0], ipb[1], ipb[2], ipb[3]);
-                                    break (ip, w.wifi_port() as u16);
+                                if let Ok(candidates) = crate::lan_policy::upgrade_candidates(w) {
+                                    break candidates;
                                 }
                             }
                             info!("BWU(send): WIFI_LAN offer had no usable socket; staying on BLE");
@@ -1180,7 +1177,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                             // shared network → Direct again, taken as-is.
                             // `PACKET_BWU_LAN_PREF=off` disables the dance.
                             if !self.bwu_declined_direct
-                                && crate::utils::local_ipv4().is_some()
+                                && crate::utils::local_lan_ip().is_some()
                                 && !std::env::var("PACKET_BWU_LAN_PREF")
                                     .map(|v| v.eq_ignore_ascii_case("off"))
                                     .unwrap_or(false)
@@ -1305,16 +1302,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
             }
         };
 
-        info!("BWU(send): phone offered WIFI_LAN at {ip}:{port}; connecting");
-        let tcp = match tokio::time::timeout(
-            Duration::from_secs(8),
-            crate::lan_policy::connect(std::net::SocketAddr::new(ip.into(), port)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => {
-                warn!("BWU(send): couldn't reach the phone's Wi-Fi socket; staying on BLE");
+        info!(
+            "BWU(send): phone offered {} WIFI_LAN candidates",
+            candidates.len()
+        );
+        let tcp = match crate::lan_policy::connect_candidates(&candidates).await {
+            Ok(socket) => socket,
+            Err(_) => {
+                warn!("BWU(send): couldn't reach the phone's Wi-Fi candidates; staying on BLE");
                 return Ok(false);
             }
         };

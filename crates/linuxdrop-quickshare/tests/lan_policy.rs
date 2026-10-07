@@ -27,6 +27,15 @@ async fn lan_binds_only_enabled_addresses_and_rejects_routes_outside_them() {
         .map(|listener| listener.local_addr().unwrap())
         .find(|address| address.ip().is_loopback())
         .unwrap();
+    let ipv6 = listeners
+        .iter()
+        .map(|listener| listener.local_addr().unwrap())
+        .find(|address| address.ip() == "::1".parse::<IpAddr>().unwrap())
+        .expect("IPv6 loopback listener");
+    let ipv6_client = lan_policy::connect(ipv6).await.unwrap();
+    let (ipv6_server, _) = lan_policy::accept(&listeners).await.unwrap();
+    assert!(ipv6_client.local_addr().unwrap().is_ipv6());
+    assert!(ipv6_server.local_addr().unwrap().is_ipv6());
     let client = lan_policy::connect(address).await.unwrap();
     let (server, peer) =
         tokio::time::timeout(Duration::from_secs(1), lan_policy::accept(&listeners))
@@ -102,9 +111,95 @@ async fn lan_binds_only_enabled_addresses_and_rejects_routes_outside_them() {
     let allowed: std::collections::HashSet<_> = lan_policy::interfaces(false)
         .unwrap()
         .into_iter()
-        .filter(|interface| interface.address.is_ipv4())
         .map(|interface| interface.address)
         .collect();
     assert_eq!(service.get_addresses(), &allowed);
     assert!(!service.is_addr_auto());
+}
+
+#[test]
+fn discovery_scopes_link_local_peers_to_enabled_adapters() {
+    use linuxdrop_network::InterfaceAddress;
+    let first = InterfaceAddress {
+        name: "wlan0".into(),
+        address: "fe80::1".parse().unwrap(),
+        netmask: "ffff:ffff:ffff:ffff::".parse().unwrap(),
+        index: 7,
+        loopback: false,
+    };
+    let second = InterfaceAddress {
+        name: "wlan1".into(),
+        index: 8,
+        ..first.clone()
+    };
+    let candidates = lan_policy::discovery_candidates(
+        "fe80::abcd".parse().unwrap(),
+        53318,
+        &[first.clone(), second.clone()],
+    );
+    assert_eq!(
+        candidates,
+        vec![
+            "[fe80::abcd%7]:53318".parse().unwrap(),
+            "[fe80::abcd%8]:53318".parse().unwrap()
+        ]
+    );
+    assert_eq!(
+        lan_policy::source_for_on(candidates[1], &[first.clone(), second.clone()]).unwrap(),
+        second
+    );
+    assert!(
+        lan_policy::source_for_on(
+            "[fe80::abcd]:53318".parse().unwrap(),
+            std::slice::from_ref(&first)
+        )
+        .is_err()
+    );
+    assert!(lan_policy::source_for_on(candidates[1], &[first]).is_err());
+    for address in candidates {
+        let std::net::SocketAddr::V6(v6) = address else {
+            unreachable!()
+        };
+        let endpoint = rqs_lib::EndpointInfo {
+            ip: Some(format!("{}%{}", v6.ip(), v6.scope_id())),
+            port: Some(v6.port().to_string()),
+            ..Default::default()
+        };
+        assert_eq!(endpoint.socket_address().unwrap(), address);
+    }
+}
+
+#[test]
+fn wifi_lan_wire_candidates_replace_legacy_and_preserve_ip_family_order() {
+    let candidates = vec![
+        "192.168.4.2:5000".parse().unwrap(),
+        "[fd42::2]:5000".parse().unwrap(),
+    ];
+    let mut offer = lan_policy::upgrade_offer(&candidates).unwrap();
+    assert_eq!(offer.ip_address(), &[192, 168, 4, 2]);
+    assert_eq!(
+        lan_policy::upgrade_candidates(&offer).unwrap(),
+        vec![candidates[1], candidates[0]]
+    );
+    offer.ip_address = Some(vec![1]); // ignored when the new list is present
+    assert!(lan_policy::upgrade_candidates(&offer).is_ok());
+    offer.address_candidates[0].port = Some(65536);
+    assert!(lan_policy::upgrade_candidates(&offer).is_err());
+    offer.address_candidates.clear();
+    offer.ip_address = Some(lan_policy::address_bytes("fd42::2".parse().unwrap()));
+    assert_eq!(
+        lan_policy::upgrade_candidates(&offer).unwrap(),
+        vec![candidates[1]]
+    );
+    for invalid in [
+        "fe80::2",
+        "::",
+        "ff02::1",
+        "::ffff:192.168.4.2",
+        "127.0.0.1",
+        "169.254.1.2",
+    ] {
+        offer.ip_address = Some(lan_policy::address_bytes(invalid.parse().unwrap()));
+        assert!(lan_policy::upgrade_candidates(&offer).is_err(), "{invalid}");
+    }
 }

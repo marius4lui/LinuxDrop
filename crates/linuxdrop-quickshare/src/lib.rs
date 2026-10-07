@@ -274,8 +274,7 @@ fn network_status(
     let mut detail = if lan_ready {
         "Quick Share LAN active".to_string()
     } else {
-        "Quick Share has no enabled IPv4 LAN interface; waiting for a network connection"
-            .to_string()
+        "Quick Share has no enabled LAN interface; waiting for a network connection".to_string()
     };
     if !lan.errors.is_empty() {
         detail.push_str(&format!("; LAN listener errors: {}", lan.errors.join("; ")));
@@ -366,11 +365,11 @@ fn prepare_send(
         SendInfo {
             id: id.into(),
             name: transfer.peer_name.clone(),
-            addr: format!(
-                "{}:{}",
-                peer.ip.as_deref().unwrap_or("0.0.0.0"),
-                peer.port.as_deref().unwrap_or("0")
-            ),
+            addr: if peer.ble_addr.is_some() {
+                "0.0.0.0:0".into()
+            } else {
+                peer.socket_address()?.to_string()
+            },
             ob: OutboundPayload::OpenedFiles(files.to_vec()),
             ble: peer.ble_addr.is_some(),
         },
@@ -503,6 +502,11 @@ mod tests {
     use rqs_lib::utils::RemoteDeviceInfo;
     #[tokio::test]
     async fn ukey2_loopback_requires_both_consents_and_transfers_exact_bytes() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            transfer_over(address).await;
+        }
+    }
+    async fn transfer_over(bind: &str) {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         let receive = dir.path().join("received");
@@ -520,7 +524,7 @@ mod tests {
             Some(receive.clone()),
             Some("LinuxDrop protocol test".into()),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (messages, mut events) = broadcast::channel(1024);
         let rx_messages = messages.clone();
@@ -538,7 +542,7 @@ mod tests {
         });
         // Fragment the first length prefix while unrelated UI events arrive.
         // Cancellation of a read_exact future used to lose prefix bytes.
-        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind(bind).await.unwrap();
         let proxy_address = proxy.local_addr().unwrap();
         let chatter = messages.clone();
         tokio::spawn(async move {

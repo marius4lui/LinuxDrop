@@ -58,7 +58,7 @@ async fn lan_starts_without_bluetooth_and_port_conflicts_fail() {
         panic!("Expected startup status");
     };
     assert_eq!(state.state, "unavailable");
-    assert!(state.detail.contains("no enabled IPv4 LAN interface"));
+    assert!(state.detail.contains("no enabled LAN interface"));
     commands.shutdown().await.unwrap();
     tokio::time::timeout(Duration::from_secs(12), async {
         while receiver.recv().await.is_some() {}

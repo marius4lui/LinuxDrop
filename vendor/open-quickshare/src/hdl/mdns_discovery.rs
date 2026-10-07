@@ -5,7 +5,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::DeviceType;
-use crate::utils::{is_not_self_ip, parse_mdns_endpoint_info};
+use crate::utils::parse_mdns_endpoint_info;
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct EndpointInfo {
@@ -22,6 +22,27 @@ pub struct EndpointInfo {
     /// a hint and the marker that this endpoint is reachable over BLE.
     pub ble_addr: Option<String>,
     pub ble_psm: Option<u16>,
+}
+
+impl EndpointInfo {
+    pub fn socket_address(&self) -> Result<std::net::SocketAddr, anyhow::Error> {
+        use anyhow::Context;
+        let ip = self.ip.as_deref().context("Missing endpoint address")?;
+        let port: u16 = self
+            .port
+            .as_deref()
+            .context("Missing endpoint port")?
+            .parse()?;
+        if port == 0 {
+            anyhow::bail!("Invalid endpoint port");
+        }
+        Ok(if ip.contains(':') {
+            format!("[{ip}]:{port}")
+        } else {
+            format!("{ip}:{port}")
+        }
+        .parse()?)
+    }
 }
 
 pub struct MDnsDiscovery {
@@ -69,8 +90,9 @@ impl MDnsDiscovery {
                     probes.abort_all();
                     pending.clear();
                     cache.retain(|_, endpoint| {
-                        let valid = endpoint.ip.as_ref().and_then(|ip| ip.parse().ok())
-                            .is_some_and(|ip| snapshot.interfaces.iter().any(|interface| !interface.loopback && interface.contains(ip)));
+                        let valid = endpoint.socket_address().ok().is_some_and(|address| {
+                            crate::lan_policy::source_for_on(address, &snapshot.interfaces).is_ok()
+                        });
                         if !valid { let _ = self.sender.send(EndpointInfo { id: endpoint.id.clone(), ..Default::default() }); }
                         valid
                     });
@@ -129,42 +151,32 @@ async fn probe(
         return None;
     }
     let (rtype, name) = parse_mdns_endpoint_info(info.get_property("n")?.val_str()).ok()?;
-    let addresses = info.get_addresses_v4();
-    let mut addresses: Vec<_> = addresses.into_iter().copied().collect();
-    addresses.sort();
-    // A peer may advertise multiple LANs. Try each usable candidate, with a
-    // single bounded deadline, instead of choosing a random HashSet entry.
+    let mut addresses: Vec<_> = info
+        .get_addresses()
+        .iter()
+        .filter(|ip| crate::utils::is_not_self_ip(ip))
+        .flat_map(|ip| crate::lan_policy::discovery_candidates(*ip, port, &interfaces))
+        .collect();
+    addresses.sort_by_key(|address| (address.is_ipv4(), *address));
+    addresses.dedup();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         use futures::StreamExt;
         let mut connections = futures::stream::FuturesUnordered::new();
-        for ip in addresses
-            .into_iter()
-            .filter(|ip| {
-                is_not_self_ip(ip)
-                    && interfaces.iter().any(|interface| {
-                        !interface.loopback && interface.contains(std::net::IpAddr::V4(*ip))
-                    })
-            })
-            .take(16)
-        {
-            connections.push(async move {
-                (
-                    ip,
-                    crate::lan_policy::connect(std::net::SocketAddr::new(
-                        std::net::IpAddr::V4(ip),
-                        port,
-                    ))
-                    .await,
-                )
-            });
+        for address in addresses.into_iter().take(16) {
+            connections.push(async move { (address, crate::lan_policy::connect(address).await) });
         }
-        while let Some((ip, result)) = connections.next().await {
+        while let Some((address, result)) = connections.next().await {
             if result.is_ok() {
                 return Some(EndpointInfo {
                     fullname: info.get_fullname().to_owned(),
-                    id: format!("{ip}:{port}"),
+                    id: address.to_string(),
                     name: Some(name),
-                    ip: Some(ip.to_string()),
+                    ip: Some(match address {
+                        std::net::SocketAddr::V6(v6) if v6.scope_id() != 0 => {
+                            format!("{}%{}", v6.ip(), v6.scope_id())
+                        }
+                        _ => address.ip().to_string(),
+                    }),
                     port: Some(port.to_string()),
                     rtype: Some(rtype),
                     present: Some(true),

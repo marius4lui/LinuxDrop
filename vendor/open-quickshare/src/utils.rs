@@ -249,6 +249,20 @@ pub fn local_ipv4() -> Option<[u8; 4]> {
     fallback
 }
 
+/// A usable metadata address, preferring IPv4 for older peers and retaining
+/// IPv6-only LAN support. Actual upgrades advertise all bound candidates.
+pub fn local_lan_ip() -> Option<std::net::IpAddr> {
+    local_ipv4()
+        .map(|ip| std::net::Ipv4Addr::from(ip).into())
+        .or_else(|| {
+            crate::lan_policy::interfaces(false)
+                .ok()?
+                .into_iter()
+                .map(|local| local.address)
+                .find(|ip| crate::lan_policy::upgrade_address(*ip))
+        })
+}
+
 /// Whether `remote` falls inside the subnet of any of our non-loopback IPv4
 /// interfaces — i.e. whether a peer at that address is reachable over the
 /// local network (used to pick the bandwidth-upgrade path).
@@ -261,7 +275,7 @@ pub fn same_subnet(remote: [u8; 4]) -> bool {
     })
 }
 
-pub fn is_not_self_ip(ip_address: &Ipv4Addr) -> bool {
+pub fn is_not_self_ip(ip_address: &std::net::IpAddr) -> bool {
     if let Ok(if_addrs) = get_if_addrs() {
         for if_addr in if_addrs {
             if if_addr.ip() == *ip_address {
