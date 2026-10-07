@@ -6,6 +6,8 @@ use std::sync::{
 
 #[path = "../../linuxdrop-network/tests/support/bluez.rs"]
 mod bluez;
+#[path = "../../linuxdrop-quickshare/tests/support/gatt.rs"]
+mod gatt;
 
 async fn wait_for(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(12), async {
@@ -61,7 +63,7 @@ async fn wake_recovers_without_restarting_awdl_and_drains_shutdown() {
         "Explicit selection must not fall back to another controller"
     );
     power.store(true, Ordering::SeqCst);
-    wait_for(|| updates.borrow().contains("wake is active")).await;
+    wait_for(|| updates.borrow().contains("shared discovery windows")).await;
     assert_eq!(state.active.lock().unwrap().len(), 1);
 
     power.store(false, Ordering::SeqCst);
@@ -87,6 +89,7 @@ async fn wake_recovers_without_restarting_awdl_and_drains_shutdown() {
     // for the old generation stays on its old unique bus owner.
     bus.release_name("org.bluez").await.unwrap();
     let replacement = Arc::new(bluez::State::default());
+    let gatt = Arc::new(gatt::State::default());
     let _new_bus = zbus::connection::Builder::session()
         .unwrap()
         .name("org.bluez")
@@ -96,6 +99,8 @@ async fn wake_recovers_without_restarting_awdl_and_drains_shutdown() {
         .serve_at("/org/bluez/hci1", bluez::Adapter(power))
         .unwrap()
         .serve_at("/org/bluez/hci1", bluez::Advertising(replacement.clone()))
+        .unwrap()
+        .serve_at("/org/bluez/hci1", gatt::Gatt(gatt.clone()))
         .unwrap()
         .build()
         .await
@@ -116,4 +121,78 @@ async fn wake_recovers_without_restarting_awdl_and_drains_shutdown() {
         .unwrap();
     assert!(replacement.active.lock().unwrap().is_empty());
     assert_eq!(foreign.registrations.load(Ordering::SeqCst), 0);
+
+    // Exercise both real protocol advertising workers on the same single-slot
+    // controller. An in-progress connection protects the receiver's turn.
+    rqs_lib::set_bluetooth_adapter(Some("hci1".into()));
+    let (visible, visibility) = watch::channel(rqs_lib::Visibility::Visible);
+    let (messages, mut receiver_events) = tokio::sync::broadcast::channel(128);
+    let receiver_stop = CancellationToken::new();
+    let receiver = tokio::spawn(rqs_lib::hdl::supervise_receiver(
+        *b"TEST",
+        1,
+        "Receiver".into(),
+        12345,
+        visibility,
+        messages,
+        receiver_stop.clone(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let rqs_lib::channel::Message::BluetoothServiceReady { component } =
+                receiver_events.recv().await.unwrap().msg
+                && component == "bluetooth-receiver"
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let connection = rqs_lib::hdl::BleScanSuppressor::new();
+    let before = replacement.registrations.load(Ordering::SeqCst);
+    let (status, _updates) = watch::channel(String::new());
+    let apple_stop = CancellationToken::new();
+    let apple = tokio::spawn(super::supervise(
+        Some("hci1".into()),
+        status,
+        apple_stop.clone(),
+    ));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        replacement.registrations.load(Ordering::SeqCst),
+        before,
+        "AirDrop must wait for the active Quick Share connection"
+    );
+    drop(connection);
+    wait_for(|| replacement.registrations.load(Ordering::SeqCst) >= before + 4).await;
+    let types = replacement
+        .properties
+        .lock()
+        .unwrap()
+        .iter()
+        .skip(before)
+        .map(|properties| String::try_from(properties["Type"].try_clone().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        &types[..4],
+        &["broadcast", "peripheral", "broadcast", "peripheral"],
+        "Both protocols must receive repeated turns"
+    );
+    assert_eq!(
+        gatt.registrations.load(Ordering::SeqCst),
+        1,
+        "Advertising turns must preserve the GATT server"
+    );
+    assert_eq!(replacement.active.lock().unwrap().len(), 1);
+    apple_stop.cancel();
+    receiver_stop.cancel();
+    drop(visible);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        apple.await.unwrap().unwrap();
+        receiver.await.unwrap().unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(replacement.active.lock().unwrap().is_empty());
 }

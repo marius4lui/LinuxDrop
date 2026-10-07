@@ -69,6 +69,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 static ADVERTISEMENT_REGISTRATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub mod bluetooth_airtime;
 pub mod bluetooth_lifetime;
 
 /// Resolve one powered controller once, then pass its name to every operation.
@@ -110,7 +111,7 @@ pub async fn advertise(
     let supported = adapter.supported_advertising_instances().await?;
     let active = adapter.active_advertising_instances().await?;
     if supported == 0 || active >= supported {
-        bail!("Bluetooth controller {} has no free advertisement slots ({active}/{supported}). Select another controller or disable the other protocol's Bluetooth advertisements.",adapter.name());
+        bail!("Bluetooth controller {} has no free advertisement slots ({active}/{supported}). Select another controller or close other Bluetooth sharing applications.",adapter.name());
     }
     // Give each registration its own bus owner. If a RegisterAdvertisement
     // reply times out after BlueZ started processing it, ending this dedicated

@@ -29,6 +29,7 @@ bluer = { version = "0.17", features = ["bluetoothd"] }
 
 [dev-dependencies]
 zbus.workspace = true
+rqs_lib = { path = "../../vendor/open-quickshare" }
 
 [features]
 fuzzing = []

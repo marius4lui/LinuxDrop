@@ -31,7 +31,7 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] IPv6 credentials/candidates for direct/hotspot networks; owned-interface binding and IPv6-only group readiness.
 - [x] Pin supplicant operations and journaled P2P cleanup to the original unique D-Bus owner/bus; abort owner changes and distinguish revoked leases from healthy reservations.
 - [ ] Prolonged mDNS reconfiguration/resource-bound acceptance.
-- [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
+- [x] Explicit Bluetooth controller across scanner/advertiser/GATT/L2CAP paths; shared advertising turns cooperate with AirDrop. Selected-controller paths are source-audited and the real protocol workers alternate on a private single-slot BlueZ fixture; physical radio acceptance remains below.
 - Scanner owner replacement now has [private-bus regression evidence](../acceptance/BLUETOOTH_SCANNER_OWNER_2026-10-07.md): old cleanup cannot reach a new daemon, stale starts are rejected, and explicit reconstruction works. Automatic recovery now also covers the listener, receiver, sender and recipient scanner; prolonged resource bounds and cross-protocol airtime remain open.
 - The FastInit announcement scanner now has [automatic recovery](../acceptance/BLUETOOTH_SCANNER_RECOVERY_2026-10-07.md) for power, controller and daemon loss, including initial unavailability and deliberate airtime pauses. Receiver and sender supervisors have their own lifecycle fixtures; recipient discovery and pre-connect scans now have [owned cleanup and recovery](../acceptance/BLUETOOTH_RECIPIENT_SCANS_2026-10-07.md).
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
@@ -50,7 +50,7 @@ Google's wire schema distinguishes password-based joining from device-name disco
 - [x] Streaming dvzip/CPIO, bounded decompression, exact advertised entries, traversal/symlink/device rejection, empty/multiple files, no-replace publication.
 - [x] BLE wake, graceful degradation without Bluetooth, cancellation including disconnect during consent.
 - [x] Automatically restore BLE wake after initial controller unavailability, power loss or bluetoothd replacement, without restarting the AWDL backend. Selected-controller recovery and acknowledged shutdown pass on the private BlueZ bus (2026-10-07).
-- [ ] Explicit Bluetooth controller and shared advertisement resource coordination.
+- [x] Explicit Bluetooth controller and shared advertisement resource coordination. AirDrop wake yields its slot after three seconds, protects Quick Share connections and participates in the common scan pause. See [shared Bluetooth acceptance](../acceptance/BLUETOOTH_SHARED_AIRTIME_2026-10-07.md).
 - [x] ReceiveOptions destination/selection/collision policy.
 - [x] Incoming/outgoing archive bandwidth uses the daemon's shared payload budget; outgoing sockets remain bound to the leased AWDL interface.
 - [ ] Reconnect/channel/hardware-loss integration exercised with helper simulations; no false ready state after lease failure.

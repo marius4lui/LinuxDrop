@@ -19,6 +19,7 @@ Quick Share:
 - NetworkManager upgrades now use lease-scoped volatile D-Bus profiles bound to the creating client, plus an exclusive transfer semaphore and ownership-checked asynchronous cleanup. The old fixed profile names and `nmcli` password arguments are removed.
 - Added Google wire fields `ip_v6_address=6`, `pin=8`, `device_name=9`; device-name offers route through LinuxDrop's leased supplicant P2P connector. IPv6 credential routing now uses the leased interface; complete role negotiation and IPv6-only supplicant group activation remain explicit completion work.
 - Per-session random inbound IDs (LAN, GATT, L2CAP); daemon transfer ID retained on outbound failures.
+- Advertising turns and scan suppression use linuxdrop-network's shared scheduler so AirDrop wake windows cooperate with Quick Share without cycling GATT or preempting protected connections.
 - Explicit SAS consent in both directions; hidden-mode offers are rejected by the adapter.
 - Private per-session staging, exclusive file creation, name/count/size checks, exact end-of-file checks, receive publication through LinuxDrop ReceiveStore.
 - Constant-time HMAC verification, bounded metadata buffers, invalid curve-point rejection and AES frame dimension checks.

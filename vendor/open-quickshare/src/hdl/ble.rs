@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, anyhow};
@@ -42,37 +41,8 @@ const DBUS_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// often than that.
 const ALERT_RATE_LIMIT: Duration = Duration::from_secs(10);
 
-/// Number of things currently asking us to stay off the air (an in-progress
-/// GATT session, an outgoing-share advertisement, ...).
-static SCAN_SUPPRESSORS: AtomicUsize = AtomicUsize::new(0);
-
-/// Suppresses BLE scanning for as long as it is held, so that the advertising
-/// and connection work the radio is busy with gets the whole antenna.
-#[derive(Debug)]
-pub struct BleScanSuppressor(());
-
-impl BleScanSuppressor {
-    pub fn new() -> Self {
-        SCAN_SUPPRESSORS.fetch_add(1, Ordering::SeqCst);
-        Self(())
-    }
-}
-
-impl Default for BleScanSuppressor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Drop for BleScanSuppressor {
-    fn drop(&mut self) {
-        SCAN_SUPPRESSORS.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-pub(crate) fn scanning_suppressed() -> bool {
-    SCAN_SUPPRESSORS.load(Ordering::SeqCst) > 0
-}
+pub use linuxdrop_network::bluetooth_airtime::BleScanSuppressor;
+pub(crate) use linuxdrop_network::bluetooth_airtime::scanning_suppressed;
 
 pub struct BleListener {
     adapter: Adapter,

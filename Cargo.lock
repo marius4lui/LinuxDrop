@@ -2010,6 +2010,7 @@ dependencies = [
  "luftlift-rs",
  "mdns-sd 0.11.5",
  "plist",
+ "rqs_lib",
  "rustls",
  "sha2",
  "tempfile",
