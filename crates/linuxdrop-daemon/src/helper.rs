@@ -279,6 +279,7 @@ pub(crate) mod tests {
             connection_uuid: None,
             p2p_group: None,
             p2p_pending: false,
+            p2p_recovery: None,
             direct_capabilities: Default::default(),
         }
     }

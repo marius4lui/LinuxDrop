@@ -12,8 +12,16 @@ use zbus::{
 
 #[path = "p2p_owner.rs"]
 mod owner;
+#[path = "p2p_recovery.rs"]
+mod recovery;
+pub use recovery::{prepare_formation, recover_formation, FormationIdentity};
 
 pub type FormationError = anyhow::Error;
+
+struct FormationChecks {
+    verify: fn(&GroupIdentity) -> Result<()>,
+    prepared: Option<FormationIdentity>,
+}
 
 const SERVICE: &str = "fi.w1.wpa_supplicant1";
 const DEVICE: &str = "fi.w1.wpa_supplicant1.Interface.P2PDevice";
@@ -182,6 +190,17 @@ pub async fn connect_wps(
     frequency: u32,
     cancel: CancellationToken,
 ) -> Result<Group> {
+    connect_wps_prepared(interface, peer_name, pin, frequency, cancel, None).await
+}
+
+pub async fn connect_wps_prepared(
+    interface: &str,
+    peer_name: &str,
+    pin: &str,
+    frequency: u32,
+    cancel: CancellationToken,
+    prepared: Option<FormationIdentity>,
+) -> Result<Group> {
     validate(interface, peer_name, pin, frequency)?;
     let interface = interface.to_owned();
     let peer_name = peer_name.to_owned();
@@ -190,7 +209,7 @@ pub async fn connect_wps(
     // The worker keeps cleanup alive even if its caller drops the future.
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let result = connect_inner(interface, peer_name, pin, frequency, cancel).await;
+        let result = connect_inner(interface, peer_name, pin, frequency, cancel, prepared).await;
         let _ = sender.send(result); // An abandoned result drops the group guard.
     });
     let result = receiver
@@ -206,6 +225,7 @@ async fn connect_inner(
     pin: String,
     frequency: u32,
     cancel: CancellationToken,
+    prepared: Option<FormationIdentity>,
 ) -> Result<Group> {
     connect_on(
         Connection::system().await?,
@@ -214,7 +234,10 @@ async fn connect_inner(
         pin,
         frequency,
         cancel,
-        verify_phy,
+        FormationChecks {
+            verify: verify_phy,
+            prepared,
+        },
     )
     .await
 }
@@ -226,8 +249,9 @@ async fn connect_on(
     pin: String,
     frequency: u32,
     cancel: CancellationToken,
-    verify: fn(&GroupIdentity) -> Result<()>,
+    checks: FormationChecks,
 ) -> Result<Group> {
+    let FormationChecks { verify, prepared } = checks;
     let mut owner = owner::Watch::bind(&connection).await?;
     let destination = owner.name.clone();
     let bus_guid = connection.server_guid().to_string();
@@ -254,6 +278,9 @@ async fn connect_on(
     })
     .await
     .context("Supplicant setup timed out")??;
+    if let Some(prepared) = prepared {
+        prepared.verify_setup(&device, &existing, &interface)?;
+    }
     let mut find = HashMap::new();
     find.insert("Timeout", Value::from(20i32));
     find.insert("DiscoveryType", Value::from("start_with_full"));
@@ -416,6 +443,16 @@ pub async fn create_group_with_auth(
     auth: crate::P2pHostAuth,
     cancel: CancellationToken,
 ) -> Result<HostedGroup> {
+    create_group_prepared(interface, frequency, auth, cancel, None).await
+}
+
+pub async fn create_group_prepared(
+    interface: &str,
+    frequency: u32,
+    auth: crate::P2pHostAuth,
+    cancel: CancellationToken,
+    prepared: Option<FormationIdentity>,
+) -> Result<HostedGroup> {
     validate(interface, "LinuxDrop", "", frequency)?;
     anyhow::ensure!(
         frequency != 0,
@@ -427,8 +464,10 @@ pub async fn create_group_with_auth(
     tokio::spawn(async move {
         let result = async {
             let connection = Connection::system().await?;
-            create_group_authenticated(connection, &interface, frequency, auth, cancel, verify_phy)
-                .await
+            create_group_authenticated(
+                connection, &interface, frequency, auth, cancel, verify_phy, prepared,
+            )
+            .await
         }
         .await;
         let _ = sender.send(result);
@@ -455,6 +494,7 @@ async fn create_group_inner(
         crate::P2pHostAuth::Password,
         cancel,
         verify,
+        None,
     )
     .await
 }
@@ -466,6 +506,7 @@ async fn create_group_authenticated(
     auth: crate::P2pHostAuth,
     cancel: CancellationToken,
     verify: fn(&GroupIdentity) -> Result<()>,
+    prepared: Option<FormationIdentity>,
 ) -> Result<HostedGroup> {
     let mut owner = owner::Watch::bind(&connection).await?;
     let destination = owner.name.clone();
@@ -493,6 +534,9 @@ async fn create_group_authenticated(
     })
     .await
     .context("Supplicant setup timed out")??;
+    if let Some(prepared) = prepared {
+        prepared.verify_setup(&device, &existing, interface)?;
+    }
     let mut settlement = None;
     let mut submitted = false;
     let operation = async {

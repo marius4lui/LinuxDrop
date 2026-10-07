@@ -68,7 +68,14 @@ pub struct Lease {
     #[serde(default)]
     pub p2p_pending: bool,
     #[serde(default)]
+    pub p2p_recovery: Option<P2pRecovery>,
+    #[serde(default)]
     pub direct_capabilities: linuxdrop_network::DirectWifiCapabilities,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct P2pRecovery {
+    pub formation: linuxdrop_network::p2p::FormationIdentity,
+    pub kernel_interfaces: std::collections::BTreeMap<String, u32>,
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

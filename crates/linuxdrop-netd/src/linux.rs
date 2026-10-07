@@ -28,6 +28,8 @@ const HELPER_DIRECTORY: &str = match option_env!("LINUXDROP_LIBEXECDIR") {
 mod acquire;
 #[path = "channel.rs"]
 mod channel;
+#[path = "p2p_recovery.rs"]
+mod p2p_recovery;
 
 const JOURNAL: &str = "/var/lib/linuxdrop-netd/leases.json";
 const MAX_REQUEST: u64 = 4096;
@@ -439,8 +441,20 @@ pub async fn run() -> io::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     let monitor = state.clone();
     tasks.spawn(async move {
+        let mut next_recovery = tokio::time::Instant::now();
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            if tokio::time::Instant::now() >= next_recovery {
+                next_recovery = tokio::time::Instant::now() + Duration::from_secs(30);
+                let pending: Vec<_> = {
+                    let state = monitor.lock().await;
+                    state.leases.values().filter(|lease| lease.p2p_pending && lease.p2p_recovery.is_some()
+                        && !state.attached.contains(&lease.id) && !state.producers.contains_key(&lease.id)
+                        && !state.cleanups.contains_key(&lease.id) && !state.group_cleanups.contains_key(&lease.id))
+                        .map(|lease| lease.id.clone()).collect()
+                };
+                for id in pending { let _ = begin_cleanup(&monitor, &id).await; }
+            }
             let revision = {
                 let state = monitor.lock().await;
                 if state.leases.is_empty() { continue; }
@@ -780,6 +794,7 @@ async fn join_p2p(
     }
     // Survive a helper crash even before supplicant returns a group identity.
     lease.p2p_pending = true;
+    lease.p2p_recovery = None;
     state.leases.insert(lease_id.clone(), lease.clone());
     if let Err(error) = persist(&state) {
         lease.p2p_pending = false;
@@ -825,6 +840,10 @@ struct P2pSetup {
     host_auth: Option<linuxdrop_network::P2pHostAuth>,
 }
 
+fn formation_error(message: String) -> linuxdrop_network::p2p::FormationError {
+    io::Error::other(message).into()
+}
+
 async fn perform_p2p(
     shared: &Shared,
     mut lease: Lease,
@@ -840,12 +859,25 @@ async fn perform_p2p(
     let host = host_auth.is_some();
     let lease_id = lease.id.clone();
     let formed = async {
+        let provenance = p2p_recovery::prepare(&lease)
+            .await
+            .map_err(formation_error)?;
+        {
+            let mut state = shared.lock().await;
+            if cancel.is_cancelled() || !state.attached.contains(&lease_id) {
+                return Err(formation_error("P2P lease ended during preparation".into()));
+            }
+            lease.p2p_recovery = Some(provenance.clone());
+            state.leases.insert(lease_id.clone(), lease.clone());
+            persist(&state).map_err(|error| formation_error(error.to_string()))?;
+        }
         if let Some(auth) = host_auth {
-            let hosted = linuxdrop_network::p2p::create_group_with_auth(
+            let hosted = linuxdrop_network::p2p::create_group_prepared(
                 &lease.interface,
                 frequency,
                 auth,
                 cancel.clone(),
+                Some(provenance.formation),
             )
             .await?;
             Ok((
@@ -858,12 +890,13 @@ async fn perform_p2p(
                 )),
             ))
         } else {
-            let group = linuxdrop_network::p2p::connect_wps(
+            let group = linuxdrop_network::p2p::connect_wps_prepared(
                 &lease.interface,
                 &peer_name,
                 &pin,
                 frequency,
                 cancel.clone(),
+                Some(provenance.formation),
             )
             .await?;
             Ok((group, None))
@@ -877,6 +910,9 @@ async fn perform_p2p(
             lease.p2p_pending = error
                 .downcast_ref::<linuxdrop_network::p2p::FormationUncertain>()
                 .is_some();
+            if !lease.p2p_pending {
+                lease.p2p_recovery = None;
+            }
             if let Some(failed) =
                 error.downcast_ref::<linuxdrop_network::p2p::GroupCleanupFailure>()
             {
@@ -922,6 +958,7 @@ async fn perform_p2p(
         }
         lease.p2p_pending = false;
         lease.p2p_group = Some(group.identity.clone());
+        lease.p2p_recovery = None;
         state.leases.insert(lease_id.clone(), lease.clone());
         persist(&state).map_err(|e| e.to_string())?;
         group.into_journaled();
@@ -936,6 +973,7 @@ async fn perform_p2p(
         state.attached.remove(&lease_id);
         lease.p2p_pending = false;
         lease.p2p_group = settled.is_err().then_some(formed_identity);
+        lease.p2p_recovery = None;
         state.leases.insert(lease_id.clone(), lease.clone());
         persist(&state).map_err(|error| error.to_string())?;
     }
@@ -1253,7 +1291,7 @@ async fn restore_p2p(lease: &Lease) -> Result<(), String> {
     let boot =
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(|e| e.to_string())?;
     if lease.p2p_pending && boot.trim() == lease.boot_id {
-        return Err(P2P_UNCERTAIN.into());
+        p2p_recovery::recover(lease).await?;
     }
     let Some(group) = &lease.p2p_group else {
         return Ok(());
@@ -2176,6 +2214,7 @@ mod tests {
             connection_uuid: Some("owned-uuid".into()),
             p2p_group: None,
             p2p_pending: false,
+            p2p_recovery: None,
             direct_capabilities: Default::default(),
         }
     }

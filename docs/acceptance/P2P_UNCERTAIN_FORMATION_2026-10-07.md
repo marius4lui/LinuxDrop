@@ -40,7 +40,12 @@ Focused validation:
   synthetic old-boot journal clears successfully; this is not a physical reboot
   test. Existing malformed journal and ownership-marker recovery probes pass.
 
-Remaining limitation: an unidentified formation retained after a helper crash
+Follow-up: [durable formation provenance and current-boot recovery](P2P_FORMATION_RECOVERY_2026-10-07.md)
+now allow the original supplicant instance to acknowledge cancellation after a
+helper restart. The following limitation still applies to records without that
+provenance and to unidentified already formed groups or changed service owners.
+
+Earlier limitation: an unidentified formation retained after a helper crash
 cannot yet be automatically reconciled during the same system boot. A system
 reboot establishes that the old kernel operation is gone. Implementing safe
 same-boot reconciliation needs more durable provenance; this change deliberately

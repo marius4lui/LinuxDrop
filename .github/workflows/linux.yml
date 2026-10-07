@@ -15,7 +15,7 @@ jobs:
       - name: Native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi python3-pexpect busybox gjs
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi python3-dbus python3-pexpect busybox gjs
       - name: Rust tools
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
@@ -50,7 +50,9 @@ jobs:
       - name: Build installable package
         run: sh packaging/build-deb.sh
       - name: Isolated helper startup and journal recovery
-        run: sudo sh crates/linuxdrop-netd/tests/run-startup-recovery.sh "$PWD/target/release/linuxdrop-netd"
+        run: |
+          sudo sh crates/linuxdrop-netd/tests/run-startup-recovery.sh "$PWD/target/release/linuxdrop-netd"
+          sudo sh crates/linuxdrop-netd/tests/run-formation-recovery.sh "$PWD/target/release/linuxdrop-netd"
       - name: Daemon session and HTTPS integration
         run: |
           LINUXDROP_TEST_GJS_STATUS=1 LINUXDROP_TEST_CONTRACT=1 LINUXDROP_CONTRACT_PROBE="$PWD/target/debug/examples/check_contract" dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd

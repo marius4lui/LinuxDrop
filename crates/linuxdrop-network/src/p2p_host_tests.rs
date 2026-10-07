@@ -26,6 +26,7 @@ struct State {
     malformed_started: bool,
     cancel_reject: bool,
     cancel_silent: bool,
+    parent_group: bool,
 }
 type Shared = Arc<Mutex<State>>;
 fn path(value: &str) -> OwnedObjectPath {
@@ -144,7 +145,11 @@ impl Device {
     }
     #[zbus(property)]
     fn group(&self) -> OwnedObjectPath {
-        path(if self.parent { "/" } else { GROUP })
+        path(if self.parent && !self.state.lock().unwrap().parent_group {
+            "/"
+        } else {
+            GROUP
+        })
     }
     #[zbus(property)]
     fn peers(&self) -> Vec<OwnedObjectPath> {
@@ -435,7 +440,10 @@ async fn autonomous_group_credentials_cleanup_and_cancellation_race() {
             String::new(),
             2437,
             CancellationToken::new(),
-            verify,
+            FormationChecks {
+                verify,
+                prepared: None,
+            },
         )
         .await
     });
@@ -521,6 +529,7 @@ async fn device_name_host_uses_owned_go_and_cleans_up_failed_wps() {
             crate::P2pHostAuth::DeviceName,
             CancellationToken::new(),
             verify,
+            None,
         )
         .await;
         if case == "ok" {
@@ -745,4 +754,93 @@ async fn unknown_formation_is_never_a_successful_cleanup_receipt() {
             "never guess a group to delete"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "private supplicant bus"]
+async fn durable_formation_recovery_is_pinned_and_never_disconnects_unknown_groups() {
+    assert_eq!(
+        std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+        Ok("1")
+    );
+    let state = Shared::default();
+    let service = serve(state.clone(), Arc::new(tokio::sync::Notify::new())).await;
+    let saved = prepare_formation("testwifi0").await.unwrap();
+    let saved: FormationIdentity =
+        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    recover_formation(&saved).await.unwrap();
+    assert_eq!(state.lock().unwrap().cancelled, 1);
+    state.lock().unwrap().cancel_reject = true;
+    assert!(recover_formation(&saved).await.is_err());
+    state.lock().unwrap().cancel_reject = false;
+    // An existing or late unidentified group is retained, never disconnected.
+    for parent in [false, true] {
+        state.lock().unwrap().group_present = !parent;
+        state.lock().unwrap().parent_group = parent;
+        let before = state.lock().unwrap().cancelled;
+        assert!(recover_formation(&saved).await.is_err());
+        assert_eq!(state.lock().unwrap().cancelled, before);
+    }
+    state.lock().unwrap().parent_group = false;
+    state.lock().unwrap().delay = true;
+    assert!(recover_formation(&saved).await.is_err());
+    assert!(state.lock().unwrap().group_present);
+    assert_eq!(state.lock().unwrap().disconnected, 0);
+    state.lock().unwrap().group_present = false;
+    state.lock().unwrap().delay = false;
+    let mut foreign_bus = saved.clone();
+    foreign_bus.bus_guid = "another-bus".into();
+    assert!(recover_formation(&foreign_bus).await.is_err());
+    service.release_name(SERVICE).await.unwrap();
+    let replacement_state = Shared::default();
+    let _replacement = serve(
+        replacement_state.clone(),
+        Arc::new(tokio::sync::Notify::new()),
+    )
+    .await;
+    assert!(recover_formation(&saved).await.is_err());
+    assert_eq!(replacement_state.lock().unwrap().cancelled, 0);
+    assert_eq!(replacement_state.lock().unwrap().disconnected, 0);
+}
+
+#[tokio::test]
+#[ignore = "private supplicant bus"]
+async fn prepared_formation_refuses_changed_inventory_before_any_submission() {
+    assert_eq!(
+        std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+        Ok("1")
+    );
+    let state = Shared::default();
+    let _service = serve(state.clone(), Arc::new(tokio::sync::Notify::new())).await;
+    let prepared = prepare_formation("testwifi0").await.unwrap();
+    state.lock().unwrap().existing = true;
+    assert!(create_group_authenticated(
+        Connection::session().await.unwrap(),
+        "testwifi0",
+        5180,
+        crate::P2pHostAuth::Password,
+        CancellationToken::new(),
+        verify,
+        Some(prepared.clone())
+    )
+    .await
+    .is_err());
+    assert!(connect_on(
+        Connection::session().await.unwrap(),
+        "testwifi0".into(),
+        "Peer".into(),
+        String::new(),
+        2437,
+        CancellationToken::new(),
+        FormationChecks {
+            verify,
+            prepared: Some(prepared)
+        }
+    )
+    .await
+    .is_err());
+    let state = state.lock().unwrap();
+    assert!(!state.group_present);
+    assert_eq!(state.found, 0);
+    assert_eq!(state.cancelled, 0);
 }

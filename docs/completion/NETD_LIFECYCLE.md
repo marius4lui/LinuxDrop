@@ -17,8 +17,11 @@ Remaining code/evidence requirements:
   See [producer retirement evidence](../acceptance/NETD_PRODUCER_SETTLEMENT_2026-10-07.md).
   Unidentified late GroupStarted events and ambiguous Cancel results now retain
   a durable formation intent and radio reservation, including across helper
-  restart. Automatic same-boot reconciliation remains open; see
-  [uncertain formation evidence](../acceptance/P2P_UNCERTAIN_FORMATION_2026-10-07.md).
+  restart. [Current-boot reconciliation](../acceptance/P2P_FORMATION_RECOVERY_2026-10-07.md)
+  now records service/kernel provenance before submission and retries cancellation
+  against the original instance, with actual process-restart evidence. Old records,
+  replacement owners and unidentified formed groups remain reserved; see the
+  limits in that report and the earlier [uncertain formation evidence](../acceptance/P2P_UNCERTAIN_FORMATION_2026-10-07.md).
   Known unmarked groups retain strict ownership checks during recovery.
   Known-group cleanup now waits for live supplicant
   inventory removal and, in netd, kernel interface disappearance; see
