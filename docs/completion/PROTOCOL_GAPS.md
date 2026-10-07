@@ -49,6 +49,7 @@ Google's wire schema distinguishes password-based joining from device-name disco
 - [x] Discover/Ask/Upload in both directions, explicit consent, source-bound single-use offers, self-signed TLS with per-transfer certificate pinning.
 - [x] Streaming dvzip/CPIO, bounded decompression, exact advertised entries, traversal/symlink/device rejection, empty/multiple files, no-replace publication.
 - [x] BLE wake, graceful degradation without Bluetooth, cancellation including disconnect during consent.
+- [x] Automatically restore BLE wake after initial controller unavailability, power loss or bluetoothd replacement, without restarting the AWDL backend. Selected-controller recovery and acknowledged shutdown pass on the private BlueZ bus (2026-10-07).
 - [ ] Explicit Bluetooth controller and shared advertisement resource coordination.
 - [x] ReceiveOptions destination/selection/collision policy.
 - [x] Incoming/outgoing archive bandwidth uses the daemon's shared payload budget; outgoing sockets remain bound to the leased AWDL interface.

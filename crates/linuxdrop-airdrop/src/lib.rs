@@ -2,6 +2,7 @@
 //! Everyone mode is unauthenticated; consent is mandatory and contacts are not
 //! represented as verified. The AWDL interface must be leased by linuxdrop-netd.
 mod archive;
+mod bluetooth;
 mod transport;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {
@@ -202,21 +203,20 @@ pub async fn start_with_budget(
         events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:"Experimental AirDrop on leased AWDL hardware. Everyone mode; Apple device verification pending.".into()})).await.ok();
         let mut peers = HashMap::<String, (SocketAddr, Instant)>::new();
         let mut tick = tokio::time::interval(Duration::from_secs(15));
-        let mut advertisement = None;
-        if config.ble_wake {
-            match transport::ble_wake(config.policy.bluetooth_adapter.as_deref()).await {
-                Ok(handle) => advertisement = Some(handle),
-                Err(error) => {
-                    events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:format!("AirDrop AWDL receive is ready. Bluetooth wake unavailable: {error}. Enable a BlueZ controller or open the Apple device's AirDrop panel manually.")})).await.ok();
-                }
-            }
-        }
+        let (bluetooth_status, mut bluetooth_updates) = tokio::sync::watch::channel(String::new());
+        let bluetooth_task = config.ble_wake.then(|| {
+            tokio::spawn(bluetooth::supervise(
+                config.policy.bluetooth_adapter.clone(),
+                bluetooth_status,
+                stop.child_token(),
+            ))
+        });
         loop {
             tokio::select! {
                 _=stop.cancelled()=>break,
-                _=async { if let Some(handle)=advertisement.as_ref() { handle.released().await; } else { std::future::pending::<()>().await; } }=>{
-                    if let Some(mut handle)=advertisement.take() { let _=handle.unregister().await; }
-                    events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:"AirDrop AWDL receive is ready. Bluetooth wake is unavailable after a controller or Bluetooth service change. Restart sharing services to enable it again.".into()})).await.ok();
+                Ok(())=bluetooth_updates.changed(), if config.ble_wake=>{
+                    let detail=bluetooth_updates.borrow_and_update().clone();
+                    events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail})).await.ok();
                 },
                 event=mdns_health.recv_async()=>match event {
                     Ok(mdns_sd::DaemonEvent::Error(error))=>{events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"error".into(),detail:format!("AirDrop discovery error: {error}")})).await.ok();break;},
@@ -276,11 +276,11 @@ pub async fn start_with_budget(
                 .await
                 .ok();
         }
-        let bluetooth_cleanup = if let Some(mut advertisement) = advertisement {
-            advertisement
-                .unregister()
-                .await
-                .map_err(|error| error.to_string())
+        let bluetooth_cleanup = if let Some(task) = bluetooth_task {
+            match task.await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            }
         } else {
             Ok(())
         };

@@ -27,5 +27,8 @@ sha2 = "0.10"
 mdns-sd = "0.11"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 
+[dev-dependencies]
+zbus.workspace = true
+
 [features]
 fuzzing = []
