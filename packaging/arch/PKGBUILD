@@ -6,8 +6,11 @@ pkgdesc='Nearby file sharing for Linux'
 arch=('x86_64' 'aarch64')
 url='https://github.com/marius4lui/LinuxDrop'
 license=('GPL-3.0-only')
-depends=('gtk4' 'libadwaita' 'openssl' 'systemd' 'dbus' 'polkit' 'iw' 'iproute2' 'ethtool' 'python' 'busybox')
-makedepends=('rust' 'pkgconf' 'protobuf' 'libnl' 'libpcap' 'libev')
+# GCC LTO objects from ring cannot be linked by Rust's lld. Cargo keeps its
+# own thin LTO; only makepkg's C/C++ LTO injection is disabled.
+options=('!lto')
+depends=('gtk4>=4.12' 'libadwaita>=1.5' 'openssl' 'systemd' 'dbus' 'polkit' 'iw' 'iproute2' 'ethtool' 'python' 'busybox')
+makedepends=('cmake' 'rust' 'pkgconf' 'protobuf' 'libnl' 'libpcap' 'libev')
 optdepends=('networkmanager: network state and Wi-Fi Direct' 'bluez: Bluetooth discovery' 'python-nautilus: Nautilus file action')
 source=("linuxdrop_${pkgver}_source.tar.gz")
 sha256sums=('SKIP')
@@ -17,15 +20,20 @@ build() {
         # Explicit packaging-only verification; ordinary builds compile source.
         return
     fi
+    export LINUXDROP_LIBEXECDIR=/usr/lib/linuxdrop
+    # Preserve makepkg hardening while letting upstream enforce jitterentropy -O0.
+    export AWS_LC_SYS_CMAKE_BUILDER=1
     cargo build --release --locked --workspace
     cargo build --release --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs
 }
 package() {
     cd "$srcdir"
+    export LINUXDROP_LIBEXECDIR=/usr/lib/linuxdrop
     if [[ -n "${LINUXDROP_PREBUILT_DIR:-}" ]]; then
         LINUXDROP_TARGET_DIR="$LINUXDROP_PREBUILT_DIR" LINUXDROP_FILIN="$LINUXDROP_PREBUILT_DIR/filin" DESTDIR="$pkgdir" sh packaging/install.sh
     else
         DESTDIR="$pkgdir" sh packaging/install.sh
     fi
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
     install -Dm644 packaging/linuxdrop.sysusers "$pkgdir/usr/lib/sysusers.d/linuxdrop.conf"
 }

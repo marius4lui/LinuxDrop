@@ -1,6 +1,6 @@
 Name:           linuxdrop
 Version:        0.1.0
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Nearby file sharing for Linux
 License:        GPL-3.0-only
 URL:            https://github.com/marius4lui/LinuxDrop
@@ -10,10 +10,13 @@ Source0:        linuxdrop_%{version}_source.tar.gz
 Source1:        linuxdrop-binaries.tar.gz
 BuildRequires:  glib2 systemd-rpm-macros
 %else
-BuildRequires:  cargo rust gcc pkgconfig(gtk4) pkgconfig(libadwaita-1) pkgconfig(openssl) pkgconfig(dbus-1) pkgconfig(libudev) pkgconfig(libnl-3.0) pkgconfig(libnl-genl-3.0) libpcap-devel libev-devel protobuf-compiler glib2-devel
+BuildRequires:  cargo rust gcc gcc-c++ cmake pkgconfig(gtk4) pkgconfig(libadwaita-1) pkgconfig(openssl) pkgconfig(dbus-1) pkgconfig(libudev) pkgconfig(libnl-3.0) pkgconfig(libnl-genl-3.0) libpcap-devel libev-devel protobuf-compiler glib2-devel
 BuildRequires:  systemd-rpm-macros
 %endif
-Requires:       gtk4 libadwaita openssl-libs systemd dbus polkit iw iproute ethtool python3 busybox
+Requires:       gtk4 >= 4.12
+Requires:       libadwaita >= 1.5
+Requires:       openssl-libs systemd dbus polkit iw iproute ethtool python3 busybox
+Recommends:     NetworkManager bluez nautilus-python
 %{?systemd_requires}
 
 %description
@@ -28,6 +31,9 @@ tar -xf %{SOURCE1} -C target/release
 
 %build
 %if !%{with prebuilt}
+# cc-rs caches distro CFLAGS before the jitterentropy -O0 guard in aws-lc-sys
+# 0.45.0. The upstream CMake builder applies its per-source flags last.
+export AWS_LC_SYS_CMAKE_BUILDER=1
 cargo build --release --locked --workspace
 cargo build --release --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs
 %endif

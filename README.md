@@ -42,7 +42,7 @@ dbus-run-session -- python3 tests/integration/daemon_session.py target/debug/lin
 sh packaging/build-deb.sh
 ```
 
-The DEB includes the app, user daemon, restricted radio helper, AWDL helper and desktop integrations. A matching source archive is generated beside it. RPM/Arch recipes are provided; their native installation has not been validated.
+The DEB includes the app, user daemon, restricted radio helper, AWDL helper and desktop integrations. A matching source archive is generated beside it. Fedora 44 and Arch x86_64 source builds, isolated installation/removal and installed GTK/daemon checks have also passed; see [native package acceptance](docs/acceptance/PACKAGES_NATIVE_2026-10-07.md) for the remaining booted-desktop and Shell-version boundaries.
 
 ## Design and evidence
 

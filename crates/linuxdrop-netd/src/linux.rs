@@ -18,6 +18,12 @@ use tokio::{
     time::{timeout, Duration},
 };
 
+// Compile-time packaging choice; a privileged helper never accepts its program
+// directory from the runtime environment or an IPC request.
+const HELPER_DIRECTORY: &str = match option_env!("LINUXDROP_LIBEXECDIR") {
+    Some(directory) => directory,
+    None => "/usr/libexec/linuxdrop",
+};
 const JOURNAL: &str = "/var/lib/linuxdrop-netd/leases.json";
 const MAX_REQUEST: u64 = 4096;
 #[derive(Default)]
@@ -1010,7 +1016,7 @@ async fn apply(
                     .map(|c| c.frequency_mhz.to_string())
                     .collect::<Vec<_>>()
                     .join(",");
-                let child = Command::new("/usr/libexec/linuxdrop/filin")
+                let child = Command::new(format!("{HELPER_DIRECTORY}/filin"))
                     .args([
                         "-i",
                         &lease.interface,
@@ -1312,7 +1318,7 @@ async fn start_p2p_network(
             "-i",
             &group.interface,
             "-s",
-            "/usr/libexec/linuxdrop/p2p-dhcp",
+            &format!("{HELPER_DIRECTORY}/p2p-dhcp"),
         ])
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin")

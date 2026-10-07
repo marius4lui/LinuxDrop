@@ -12,7 +12,7 @@ Updated 2026-10-06. Branch: `feature/linuxdrop-implementation`. **Full implement
 - AirDrop TLS discovery/ask/upload, send/receive, strict bounded archives, optional BLE wake and AWDL through a separately authorized Filin helper.
 - Passive udev/sysfs/nl80211/NetworkManager/BlueZ inventory, active-connection protection, regulatory channel selection, leases and recovery ownership.
 - Private no-replace file publication, bounded persistent transfer history, visibility expiry/lock behavior, native notifications and opt-in auto-open/autostart.
-- Ubuntu DEB, matching source archive, native services and file-manager actions. RPM/Arch source recipes are present.
+- Ubuntu DEB, matching source archive, native services and file-manager actions. Fedora 44/Arch x86_64 native source builds and isolated installed-package checks now pass; see the native package acceptance record.
 - Dedicated Ubuntu environment and a working live Windows/WSLg demo, with an explicit loopback-only HTTPS demo receiver. No fabricated devices are injected into the product.
 
 ## Verified evidence
@@ -38,7 +38,7 @@ Details: [native UI](acceptance/UI_NATIVE_2026-10-06.md), [packaging](acceptance
 
 No physical Android, iPhone, macOS, Bluetooth or Wi-Fi adapter was available in this guest. Actual AWDL injection/channel behavior, USB unplug/recovery and Quick Share direct-Wi-Fi/BLE combinations need a suitable device matrix. Upstream compatibility claims are not LinuxDrop test results. AirDrop remains experimental and initially disabled.
 
-Also not yet validated: GNOME versions other than 46, fractional scaling and monitor hotplug, sandbox file-portal drops, a complete screen-reader traversal, native RPM/Arch installation, exhaustive fuzzing and an independent security audit. The verified Wayland drop source was native Nautilus. These limits do not prevent the tested Ubuntu package or live local demo from running.
+Also not yet validated: GNOME versions other than 46, fractional scaling and monitor hotplug, sandbox file-portal drops, a complete screen-reader traversal, booted RPM/Arch service lifecycles and Arch cross-version upgrades, exhaustive fuzzing and an independent security audit. The verified Wayland drop source was native Nautilus. These limits do not prevent the tested Ubuntu package or live local demo from running.
 
 ## Completion scope
 

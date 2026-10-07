@@ -68,7 +68,61 @@ sh packaging/build-deb.sh
 
 Outputs are `dist/linuxdrop_0.1.0_amd64.deb` and `dist/linuxdrop_0.1.0_source.tar.gz`. The source archive contains the actual source, vendor patches and lockfiles used for the local build. License texts and source provenance are also installed under `/usr/share/doc/linuxdrop/`. A local development build can include uncommitted source; do not confuse the recorded base Git revision with the accompanying complete source archive.
 
-For a fresh environment, build the workspace and vendored filin helper before packaging. `CARGO_TARGET_DIR` is honored. A review package can use existing debug binaries with `LINUXDROP_SKIP_BUILD=1`, `LINUXDROP_TARGET_DIR=/path/to/target/debug` and `LINUXDROP_FILIN=/path/to/target/debug/filin`; release packages should use the default release build. RPM and Arch source recipes are available under `packaging/`, with native distro install validation still separate from the tested Ubuntu DEB path.
+For a fresh environment, build the workspace and vendored filin helper before packaging. `CARGO_TARGET_DIR` is honored. A review package can use existing debug binaries with `LINUXDROP_SKIP_BUILD=1`, `LINUXDROP_TARGET_DIR=/path/to/target/debug` and `LINUXDROP_FILIN=/path/to/target/debug/filin`; release packages should use the default release build. RPM and Arch source recipes are available under `packaging/`. Their distro-specific build instructions and acceptance boundaries follow below.
+
+## Fedora and Arch source packages
+
+Build each package on its target distribution. The scripts perform release builds
+of both the workspace and the AWDL helper and keep a matching source archive.
+Do not copy Ubuntu executables into a distribution package for release.
+
+On Fedora, install build requirements and run the RPM builder as your normal
+build user:
+
+```sh
+sudo dnf install rpm-build systemd-rpm-macros cargo rust gcc gcc-c++ cmake \
+  gtk4-devel libadwaita-devel openssl-devel dbus-devel systemd-devel \
+  libnl3-devel libpcap-devel libev-devel protobuf-compiler glib2-devel
+sh packaging/build-rpm.sh
+sudo dnf install ./dist/linuxdrop-0.1.0-2.fc44.x86_64.rpm
+```
+
+The filename above is the Fedora 44 x86_64 build. Use the actual distribution and
+architecture filename produced in `dist/`. The RPM recommends NetworkManager, BlueZ and `nautilus-python` for wireless,
+Bluetooth and Nautilus integration. If installing without weak dependencies,
+add the corresponding packages when enabling these features.
+
+On Arch, install the declared build/runtime dependencies, then run `makepkg`
+through the wrapper as a normal user (it intentionally refuses root):
+
+```sh
+sudo pacman -S --needed base-devel rust cmake pkgconf protobuf libnl libpcap \
+  libev gtk4 libadwaita openssl systemd dbus polkit iw iproute2 ethtool python busybox
+sh packaging/build-arch.sh
+sudo pacman -U ./dist/linuxdrop-0.1.0-1-x86_64.pkg.tar.zst
+```
+
+Arch's optional runtime integrations are `networkmanager`, `bluez` and
+`python-nautilus`. Its radio helper and child programs live in
+`/usr/lib/linuxdrop`; the build embeds this directory and the package's systemd
+unit uses the same path. Fedora and Debian use `/usr/libexec/linuxdrop`.
+`LINUXDROP_LIBEXECDIR` is a build-time choice, never a runtime way to replace a
+privileged child program. Prebuilt packaging checks must use binaries compiled
+for the matching path; ordinary source builds configure it automatically.
+
+Arch disables makepkg's C/C++ LTO flag for mixed crates such as `ring`; Cargo's
+Rust thin LTO remains enabled, following the
+[Arch Rust packaging guidance](https://wiki.archlinux.org/title/Rust_package_guidelines).
+
+The RPM and Arch builds use AWS-LC's CMake builder to preserve distribution
+hardening flags while applying the jitter entropy source's required per-file
+optimization settings. They do not disable that entropy source. See the
+[upstream build configuration](https://aws.github.io/aws-lc-rs/resources.html).
+
+The GTK app requires GTK >= 4.12 and libadwaita >= 1.5. The bundled Shell extension
+currently declares GNOME 46 only. Packaging the app for another distribution does
+not establish compatibility with that distribution's newer GNOME Shell; the app
+can run independently while that Shell-version acceptance remains open.
 
 ## Troubleshooting
 

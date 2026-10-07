@@ -4,17 +4,20 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 dest=${DESTDIR:-}
 prefix=${PREFIX:-/usr}
+libexec=${LINUXDROP_LIBEXECDIR:-/usr/libexec/linuxdrop}
+case "$libexec" in /usr/libexec/linuxdrop|/usr/lib/linuxdrop) ;; *) printf '%s\n' 'Unsupported helper directory' >&2; exit 2;; esac
 target=${LINUXDROP_TARGET_DIR:-"${CARGO_TARGET_DIR:-$root/target}/release"}
 if [ "$prefix" != /usr ]; then printf '%s\n' 'Native packaging requires PREFIX=/usr' >&2; exit 1; fi
 install -Dm755 "$target/linuxdrop" "$dest$prefix/bin/linuxdrop"
 install -Dm755 "$target/linuxdropd" "$dest$prefix/bin/linuxdropd"
-install -Dm755 "$target/linuxdrop-netd" "$dest$prefix/libexec/linuxdrop/linuxdrop-netd"
+install -Dm755 "$target/linuxdrop-netd" "$dest$libexec/linuxdrop-netd"
 filin=${LINUXDROP_FILIN:-"${CARGO_TARGET_DIR:-$root/vendor/opendrop-rs/target}/release/filin"}
-install -Dm755 "$filin" "$dest$prefix/libexec/linuxdrop/filin"
-install -Dm755 "$root/packaging/helpers/p2p-dhcp.py" "$dest$prefix/libexec/linuxdrop/p2p-dhcp"
+install -Dm755 "$filin" "$dest$libexec/filin"
+install -Dm755 "$root/packaging/helpers/p2p-dhcp.py" "$dest$libexec/p2p-dhcp"
 install -Dm644 "$root/packaging/dbus/io.github.marius4lui.LinuxDrop.Netd.conf" "$dest$prefix/share/dbus-1/system.d/io.github.marius4lui.LinuxDrop.Netd.conf"
 install -Dm644 "$root/packaging/systemd/linuxdropd.service" "$dest$prefix/lib/systemd/user/linuxdropd.service"
 install -Dm644 "$root/packaging/systemd/linuxdrop-netd.service" "$dest$prefix/lib/systemd/system/linuxdrop-netd.service"
+sed "s|/usr/libexec/linuxdrop/|$libexec/|g" "$root/packaging/systemd/linuxdrop-netd.service" > "$dest$prefix/lib/systemd/system/linuxdrop-netd.service"
 install -Dm644 "$root/packaging/dbus/io.github.marius4lui.LinuxDrop.service" "$dest$prefix/share/dbus-1/services/io.github.marius4lui.LinuxDrop.service"
 install -Dm644 "$root/packaging/polkit/io.github.marius4lui.LinuxDrop.policy" "$dest$prefix/share/polkit-1/actions/io.github.marius4lui.LinuxDrop.policy"
 install -Dm644 "$root/packaging/polkit/50-linuxdrop-netd.rules" "$dest$prefix/share/polkit-1/rules.d/50-linuxdrop-netd.rules"
