@@ -1429,6 +1429,12 @@ impl Ui {
                 .iter()
                 .filter_map(|v| v.as_str().map(|s| protocol_name(s).to_owned()))
                 .collect();
+            // A custom Box child does not give GtkToggleButton an accessible
+            // name. Expose the device independently of its decorative children.
+            button.update_property(&[
+                gtk::accessible::Property::Label(display_name),
+                gtk::accessible::Property::Description(&protocols.join(" · ")),
+            ]);
             details.append(&label(&protocols.join(" · "), "protocol-badge"));
             row.append(&details);
             row.append(&gtk::Image::from_icon_name(

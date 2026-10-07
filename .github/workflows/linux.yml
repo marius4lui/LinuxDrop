@@ -81,6 +81,37 @@ jobs:
             dist/*_source.tar.gz
             dist/SHA256SUMS
           if-no-files-found: error
+  accessibility:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Download this run's package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name linuxdrop-ubuntu-24.04 --dir dist
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Install native screen-reader runtime
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends orca python3-pyatspi python3-gi openbox xvfb xauth xdotool dbus-x11 locales ./dist/linuxdrop_*.deb
+          sudo localedef -i de_DE -f UTF-8 de_DE.UTF-8
+      - name: Traverse the installed application with Orca
+        run: sh app/linuxdrop/tests/run-orca-smoke.sh /usr/bin/linuxdrop "$PWD/dist/orca-acceptance"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linuxdrop-orca-acceptance
+          path: |
+            dist/orca-acceptance/RESULT.json
+            dist/orca-acceptance/speech-evidence.txt
+          if-no-files-found: error
   desktop-authorization:
     needs: build
     runs-on: ubuntu-24.04
