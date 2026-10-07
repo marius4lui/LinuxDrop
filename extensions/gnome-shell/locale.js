@@ -5,6 +5,12 @@ const deErrors = {
     'Network helper is unavailable. The sharing service stopped; radio cleanup may still be running. Reconnect the adapter and restart sharing services.': 'Der Netzwerk-Helfer ist nicht erreichbar. Der Freigabedienst wurde gestoppt; der Adapter wird möglicherweise noch freigegeben. Verbinde ihn erneut und starte die Freigabedienste in den Einstellungen neu.',
 };
 const de = {
+    'Keyboard shortcut': 'Tastenkürzel', 'Set shortcut': 'Tastenkürzel festlegen', 'Apply': 'Übernehmen',
+    'Opens or closes the bubble': 'Öffnet oder schließt die Bubble',
+    'Shortcut is unavailable or already in use; choose another': 'Tastenkürzel nicht verfügbar oder bereits belegt; wähle ein anderes',
+    'Enable the extension to use this shortcut': 'Aktiviere die Erweiterung, um das Tastenkürzel zu verwenden',
+    'No shortcut assigned': 'Kein Tastenkürzel zugewiesen',
+    'Press a key combination. Escape cancels; Backspace removes the shortcut.': 'Drücke eine Tastenkombination. Escape bricht ab; die Rücktaste entfernt das Kürzel.',
     'Sharing service contract mismatch': 'App und Freigabedienst sind nicht kompatibel. Aktualisiere beide.',
     'Previous': 'Zurück', 'Next': 'Weiter', 'Active transfers': 'Aktive Übertragungen',
     'Previous transfer': 'Vorherige Übertragung', 'Next transfer': 'Nächste Übertragung',

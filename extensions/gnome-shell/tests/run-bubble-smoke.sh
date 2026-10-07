@@ -50,7 +50,7 @@ dbus-run-session -- bash -c '
     gsettings set org.gnome.desktop.session idle-delay 0
     gnome-shell --headless --wayland --no-x11 --wayland-display=linuxdrop-bubble-smoke --virtual-monitor="${LINUXDROP_SMOKE_MONITOR:-1440x900}" > "$LINUXDROP_SMOKE_ROOT/shell.log" 2>&1 &
     shell_pid=$!
-    for attempt in {1..15}; do
+    for attempt in {1..30}; do
         sleep 1
         if grep -q LINUXDROP_SMOKE_FAILED "$LINUXDROP_SMOKE_ROOT/shell.log"; then cat "$LINUXDROP_SMOKE_ROOT/shell.log"; exit 1; fi
         if grep -q LINUXDROP_SMOKE_PASSED "$LINUXDROP_SMOKE_ROOT/shell.log"; then

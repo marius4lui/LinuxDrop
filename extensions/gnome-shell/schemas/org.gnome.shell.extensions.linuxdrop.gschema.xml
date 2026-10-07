@@ -5,6 +5,8 @@
     <key name="hide-fullscreen" type="b"><default>true</default><summary>Hide in full screen</summary></key>
     <key name="monitor" type="i"><default>-1</default><range min="-1" max="32"/><summary>Monitor index; -1 uses the primary monitor</summary></key>
     <key name="monitor-mode" type="s"><default>'primary'</default><choices><choice value="primary"/><choice value="pointer"/><choice value="fixed"/></choices><summary>Monitor selection when the bubble opens</summary></key>
+    <key name="toggle-shortcut" type="s"><default>''</default><summary>Optional accelerator to open or close the bubble</summary></key>
+    <key name="shortcut-status" type="s"><default>'inactive'</default><choices><choice value="inactive"/><choice value="disabled"/><choice value="active"/><choice value="unavailable"/></choices><summary>Current extension shortcut registration status</summary></key>
     <key name="drag-hover-delay" type="i"><default>350</default><range min="100" max="2000"/><summary>Milliseconds over the open bubble before the native drop surface appears</summary></key>
     <key name="top-offset" type="i"><default>8</default><range min="0" max="200"/><summary>Distance below the top panel</summary></key>
     <key name="compact-width" type="i"><default>240</default><range min="160" max="360"/><summary>Legacy compact width, retained for settings migration</summary></key>

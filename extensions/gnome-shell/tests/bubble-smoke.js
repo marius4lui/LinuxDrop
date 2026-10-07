@@ -254,6 +254,32 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     for (let tick = 0; tick < 12 && this._expanded; tick++) await settle();
                     check(!this._expanded && !this._notch.visible, 'Unfocused bubble must close after the configured inactivity interval');
                     this._settings.set_int('auto-collapse', collapseSeconds);
+                    this._setExpanded(true);
+                    Main.layoutManager.emit('monitors-changed');
+                    check(!this._expanded && this._interactionMonitor === null, 'Display layout changes must retire the pinned monitor interaction');
+                    this._setExpanded(true);
+                    check(this._notch.visible && this._monitor(), 'Panel interaction must recover on the available monitor');
+                    this._setExpanded(false);
+                    const shortcut = '<Control><Alt><Super>F12';
+                    const occupied = global.display.grab_accelerator(shortcut, Meta.KeyBindingFlags.NONE);
+                    check(occupied, 'Fixture shortcut must initially be free');
+                    try {
+                        this._settings.set_string('toggle-shortcut', shortcut);
+                        check(!this._shortcutAction && this._settings.get_string('shortcut-status') === 'unavailable', 'An occupied shortcut must not replace another action');
+                    } finally { global.display.ungrab_accelerator(occupied); }
+                    this._bindShortcut();
+                    check(this._shortcutAction && this._settings.get_string('shortcut-status') === 'active', 'An available shortcut must register after conflict removal');
+                    const toggleAction = this._shortcutAction;
+                    global.display.emit('accelerator-activated', toggleAction, null, global.get_current_time());
+                    check(this._expanded && this._notch.visible, 'Registered shortcut must open the bubble');
+                    global.display.emit('accelerator-activated', toggleAction, null, global.get_current_time());
+                    check(!this._expanded, 'Registered shortcut must close the bubble');
+                    this._settings.set_string('toggle-shortcut', 'd');
+                    check(!this._shortcutAction, 'Unmodified typing keys must never be grabbed');
+                    this._settings.set_string('toggle-shortcut', '');
+                    const released = global.display.grab_accelerator(shortcut, Meta.KeyBindingFlags.NONE);
+                    check(released, 'Removing the preference must release the shortcut');
+                    global.display.ungrab_accelerator(released);
                     if (GLib.getenv('LINUXDROP_SMOKE_REAL_DROP') === '1') {
                         for (let attempt = 0; attempt < 2; attempt++) {
                             this._setExpanded(true);

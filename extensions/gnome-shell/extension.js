@@ -6,6 +6,7 @@ import GObject from 'gi://GObject';
 import Pango from 'gi://Pango';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
+import Meta from 'gi://Meta';
 import {parseSnapshot} from './snapshot.js';
 import {t, nearby, filesStatus, transferError} from './locale.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -127,7 +128,12 @@ export default class LinuxDropExtension extends Extension {
             this._scheduleCollapse();
         });
         this._body.connect('notify::allocation', () => this._ensureFocusVisible());
-        this._connect(Main.layoutManager, 'monitors-changed', () => this._position());
+        this._connect(Main.layoutManager, 'monitors-changed', () => {
+            // Monitor indices are reassigned after hotplug. Never move an open
+            // consent/drop interaction onto a different physical display.
+            this._setExpanded(false);
+            this._position();
+        });
         this._connect(St.ThemeContext.get_for_stage(global.stage), 'notify::scale-factor', () => this._position());
         this._connect(Main.sessionMode, 'updated', () => this._visibility());
         this._connect(Main.overview, 'showing', () => this._visibility());
@@ -148,6 +154,13 @@ export default class LinuxDropExtension extends Extension {
         this._connect(dnd, 'dnd-leave', () => this._cancelDragHover());
         this._connect(this._settings, 'changed', () => { this._position(); this._visibility(); });
         this._connect(this._settings, 'changed::auto-collapse', () => this._scheduleCollapse());
+        this._connect(this._settings, 'changed::toggle-shortcut', () => this._bindShortcut());
+        this._connect(global.display, 'accelerator-activated', (_, action) => {
+            if (action === this._shortcutAction && this._settings.get_boolean('show-notch') &&
+                !Main.sessionMode.isLocked && !Main.sessionMode.isGreeter)
+                this._setExpanded(!this._expanded);
+        });
+        this._bindShortcut();
         this._position(); this._render(); this._visibility();
         const session = this._cancellable;
         Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, INTERFACE_INFO, BUS, PATH, IFACE, session, (source, result) => {
@@ -163,6 +176,32 @@ export default class LinuxDropExtension extends Extension {
     }
 
     _connect(object, signal, callback) { const id=object.connect(signal, callback); this._signals.push([object,id]); return id; }
+
+    _releaseShortcut() {
+        if (!this._shortcutAction) return;
+        Main.wm.allowKeybinding(Meta.external_binding_name_for_action(this._shortcutAction), Shell.ActionMode.NONE);
+        global.display.ungrab_accelerator(this._shortcutAction);
+        this._shortcutAction = 0;
+    }
+
+    _bindShortcut() {
+        this._releaseShortcut();
+        const accelerator = this._settings.get_string('toggle-shortcut');
+        let status = 'disabled';
+        if (accelerator) {
+            // Grab refuses an occupied combination rather than overwriting
+            // another desktop action. The preferences capture validates syntax.
+            try {
+                this._shortcutAction = accelerator.length <= 128 && /<(Control|Ctrl|Primary|Alt|Super|Meta|Hyper)>/i.test(accelerator)
+                    ? global.display.grab_accelerator(accelerator, Meta.KeyBindingFlags.NONE) : 0;
+            }
+            catch (_) { this._shortcutAction = 0; }
+            status = this._shortcutAction ? 'active' : 'unavailable';
+            if (this._shortcutAction)
+                Main.wm.allowKeybinding(Meta.external_binding_name_for_action(this._shortcutAction), Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW);
+        }
+        this._settings.set_string('shortcut-status', status);
+    }
 
     _disconnectObject(object) {
         const remaining=[];
@@ -682,6 +721,8 @@ export default class LinuxDropExtension extends Extension {
 
     disable() {
         this._alive = false;
+        this._releaseShortcut();
+        this._settings?.set_string('shortcut-status', 'inactive');
         this._openAfterOverview = false;
         if (this._overviewOpenIdle) { GLib.source_remove(this._overviewOpenIdle); this._overviewOpenIdle = 0; }
         this._cancellable?.cancel();

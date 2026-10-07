@@ -1,5 +1,6 @@
 import Adw from 'gi://Adw';
 import Gtk from 'gi://Gtk';
+import Gdk from 'gi://Gdk';
 import Gio from 'gi://Gio';
 import {t} from './locale.js';
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
@@ -47,7 +48,53 @@ export default class LinuxDropPreferences extends ExtensionPreferences {
         };
         syncMonitorMode();
         const monitorChanged = settings.connect('changed::monitor-mode', syncMonitorMode);
-        window.connect('close-request', () => { settings.disconnect(monitorChanged); return false; });
+        const shortcut = new Adw.ActionRow({title: t('Keyboard shortcut')});
+        const shortcutLabel = new Gtk.ShortcutLabel({valign: Gtk.Align.CENTER});
+        shortcut.add_suffix(shortcutLabel);
+        const choose = new Gtk.Button({label: t('Set shortcut'), valign: Gtk.Align.CENTER});
+        shortcut.add_suffix(choose);
+        shortcut.activatable_widget = choose;
+        position.add(shortcut);
+        const syncShortcut = () => {
+            shortcutLabel.accelerator = settings.get_string('toggle-shortcut');
+            const status = settings.get_string('shortcut-status');
+            shortcut.subtitle = t(status === 'active' ? 'Opens or closes the bubble' : status === 'unavailable' ? 'Shortcut is unavailable or already in use; choose another' : status === 'inactive' ? 'Enable the extension to use this shortcut' : 'No shortcut assigned');
+        };
+        const shortcutChanged = settings.connect('changed::toggle-shortcut', syncShortcut);
+        const shortcutStatus = settings.connect('changed::shortcut-status', syncShortcut);
+        syncShortcut();
+        choose.connect('clicked', () => {
+            let selected = settings.get_string('toggle-shortcut');
+            const preview = new Gtk.ShortcutLabel({accelerator: selected, halign: Gtk.Align.CENTER});
+            const dialog = new Adw.AlertDialog({heading: t('Set shortcut'), body: t('Press a key combination. Escape cancels; Backspace removes the shortcut.'), extra_child: preview});
+            dialog.add_response('cancel', t('Cancel'));
+            dialog.add_response('apply', t('Apply'));
+            dialog.set_close_response('cancel');
+            const keys = new Gtk.EventControllerKey();
+            keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE);
+            keys.connect('key-pressed', (_, key, _code, state) => {
+                if (key === Gdk.KEY_Escape) { dialog.close(); return true; }
+                if (key === Gdk.KEY_BackSpace) selected = '';
+                else {
+                    const modifiers = state & Gtk.accelerator_get_default_mod_mask();
+                    const commandModifiers = modifiers & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK | Gdk.ModifierType.SUPER_MASK);
+                    if (!commandModifiers && [Gdk.KEY_Tab, Gdk.KEY_ISO_Left_Tab, Gdk.KEY_Return, Gdk.KEY_space].includes(key)) return false;
+                    if (!Gtk.accelerator_valid(key, modifiers) || !commandModifiers) return true;
+                    selected = Gtk.accelerator_name(key, modifiers);
+                }
+                preview.accelerator = selected;
+                return true;
+            });
+            dialog.add_controller(keys);
+            dialog.connect('response', (_, response) => {
+                if (response === 'apply') settings.set_string('toggle-shortcut', selected);
+            });
+            dialog.present(window);
+        });
+        window.connect('close-request', () => {
+            for (const id of [monitorChanged, shortcutChanged, shortcutStatus]) settings.disconnect(id);
+            return false;
+        });
         const info = new Adw.PreferencesGroup({title: t('Files and privacy'), description: t('Click the LinuxDrop icon in the top panel first. Then choose Drop files or drag files over the open bubble. Click outside or press Escape to close. Requests and progress never open it automatically.')});
         page.add(info);
         window.add(page);

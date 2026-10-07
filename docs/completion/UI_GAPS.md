@@ -30,7 +30,7 @@ items retain their remaining acceptance scope even where code now exists.
 - [x] Desired/effective settings differences and backend apply errors visible: persistent applying/error/offline status in Settings, per-service details and recovery; native German 480x600 acceptance.
 - [ ] Icon-only actions have translated accessible names; selected states/progress exposed; keyboard navigation/actions documented.
 - [ ] Notch multiple-transfer selection remains stable; completion/error/open-folder actions; summary does not randomly change peer.
-- [ ] Pointer-monitor option, position pinned during interaction, monitor removal recovery; configurable drag dwell and keyboard shortcut without conflict.
+- [x] Primary/pointer/fixed monitor policy, pinned interaction, layout-change dismissal and fallback; configurable drag dwell and optional shortcut with actual conflict refusal. Native settings and controlled-layout evidence: [Notch shortcut acceptance](../acceptance/NOTCH_SHORTCUT_2026-10-07.md). Physical monitor hotplug remains below.
 - [x] Adaptive wide-window navigation and targeted 480x600 and wide rendering.
 - [ ] Fractional rendering acceptance.
 - [x] Portal-origin file acceptance validated with a real document-portal export and descriptor handoff; revocation/closed-client lifetime and daemon access tested. Installed Flatpak chooser, descriptor transfer, registered MIME opening and folder-reveal portal actions now pass; default/per-request folder persistence and actual HTTPS receive now pass across portal/daemon restart. The sandbox Notch preferences action now routes through the host; its acceptance scope is recorded separately below.
