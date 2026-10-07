@@ -130,6 +130,7 @@ Shell-version matrix are not asserted by these tests.
 
 2026-10-07 native file-manager follow-up: Nautilus/Thunar/Dolphin actual menu
 handoffs preserve a three-file selection with special characters. Installed
-Fedora revision 3 GTK captures expose horizontal clipping at the default window
-width; rebuild the current app there and diagnose any remaining 4.22/1.9 layout
-incompatibility. See [file-manager acceptance](../acceptance/FILEMANAGERS_2026-10-07.md).
+Fedora revision 3 GTK captures exposed horizontal clipping at the default window
+width. This was a cross-page minimum-width bug from unbroken transfer filenames,
+now fixed and verified in installed Fedora revision 4 across all three file
+managers. See [width acceptance](../acceptance/GTK_TRANSFER_WIDTH_2026-10-07.md).

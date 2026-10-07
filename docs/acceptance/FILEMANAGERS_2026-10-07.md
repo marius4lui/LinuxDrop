@@ -70,3 +70,9 @@ daemon private-network D-Bus/HTTPS scenario pass. No live installation changed.
 Fedora/Arch artifacts still require their next native rebuild to include the new
 integration and recent GTK scaling changes; the file-manager test staged only
 the integration resources into the isolated installed Fedora revision 3 root.
+
+The next [transfer-width pass](GTK_TRANSFER_WIDTH_2026-10-07.md) resolved the
+observed clipping and delivered native Fedora revision 4 / Arch revision 3.
+All three Fedora menu journeys now also assert that primary action buttons are
+inside the actual window. The earlier captures above intentionally preserve the
+pre-fix evidence; the linked report contains the corrected installed rendering.
