@@ -1242,6 +1242,14 @@ async fn boot_backends(shared: &Arc<Shared>, output: mpsc::Sender<(u64, BackendE
     shared.changed().await;
 }
 async fn install_backend(shared: &Arc<Shared>, id: &str, result: Result<CommandSender>) {
+    // Startup can acquire a radio before sockets/discovery are ready. Release
+    // that ownership before publishing failure or allowing the next backend
+    // to select hardware. Never await helper I/O while holding Data.
+    let result = match id {
+        "quickshare" => helper::release_after_failure(&shared.quickshare_helper, result).await,
+        "airdrop" => helper::release_after_failure(&shared.helper, result).await,
+        _ => result,
+    };
     let mut data = shared.data.lock().await;
     match result {
         Ok(tx) => {
@@ -1327,12 +1335,11 @@ async fn start_airdrop(
         linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
         _ => anyhow::bail!("Unexpected helper response"),
     };
-    let interface = lease
-        .awdl_interface
-        .clone()
-        .context("Helper did not return an AWDL interface")?;
+    let interface = lease.awdl_interface.clone();
+    *shared.helper.lock().await = Some(helper::HelperLease::new(client, lease, shared));
+    let interface = interface.context("Helper did not return an AWDL interface")?;
     let bandwidth = shared.bandwidth.lock().await.clone();
-    let tx = linuxdrop_airdrop::start_with_budget(
+    linuxdrop_airdrop::start_with_budget(
         linuxdrop_airdrop::Config {
             name,
             download_dir: directory,
@@ -1346,9 +1353,7 @@ async fn start_airdrop(
         events,
         bandwidth,
     )
-    .await?;
-    *shared.helper.lock().await = Some(helper::HelperLease::new(client, lease, shared));
-    Ok(tx)
+    .await
 }
 
 async fn reserve_direct_wifi(
@@ -1366,16 +1371,17 @@ async fn reserve_direct_wifi(
         linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
         _ => anyhow::bail!("Unexpected direct Wi-Fi helper response"),
     };
-    let result = linuxdrop_quickshare::DirectWifiLease {
-        interface: lease.interface.clone(),
-        lease_id: lease.id.clone(),
-        connection_uuid: lease
-            .connection_uuid
-            .clone()
-            .context("Direct Wi-Fi lease missing its connection ownership marker")?,
-    };
+    let result = lease
+        .connection_uuid
+        .clone()
+        .context("Direct Wi-Fi lease missing its connection ownership marker")
+        .map(|connection_uuid| linuxdrop_quickshare::DirectWifiLease {
+            interface: lease.interface.clone(),
+            lease_id: lease.id.clone(),
+            connection_uuid,
+        });
     *shared.quickshare_helper.lock().await = Some(helper::HelperLease::new(client, *lease, shared));
-    Ok(result)
+    helper::release_after_failure(&shared.quickshare_helper, result).await
 }
 
 fn transfer_policy(settings: &Value) -> TransferPolicy {

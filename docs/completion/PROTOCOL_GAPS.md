@@ -480,3 +480,35 @@ creates a marked group-like interface, proves immediate IPv6-only readiness with
 a DHCP server, and rejects changed ownership. Workspace all-target Clippy passed.
 The test does not emulate radio negotiation: complete P2P group-owner roles and
 physical device interoperability still require their separate work/acceptance.
+
+
+## Failed and cancelled startup ownership, 2026-10-07
+
+The daemon now publishes radio ownership before fallible AirDrop setup and awaits
+an explicit helper Release reply when either radio-backed backend fails to start.
+Quick Share reservation validation also releases an invalid acquired lease before
+falling back to LAN. Startup errors retain any restoration failure, and helper I/O
+never holds the snapshot/data mutex. Generation-based quarantine remains intact.
+
+Quick Share owns its engine and staging together from the first asynchronous
+startup step. Aborting startup drains workers before deleting staging, including
+when a full event queue prevents the initial ready event from being delivered.
+Session cancellation belongs to the engine generation rather than whichever global
+session token was most recently installed. mDNS advertiser/discovery objects own
+their daemon before configuration can fail and await normal shutdown acknowledgement.
+
+AirDrop owns mDNS from creation; setup failure and cancellation request shutdown,
+with queue-full retry and a retained cleanup receipt. The listener is transferred
+to the owning actor without an intervening await. Actor exit cancels connections;
+listener, transfer, discovery and Bluetooth cleanup all run even if one fails.
+
+Passed: 13 daemon tests (including delayed successful/failed helper release),
+6 AirDrop tests (real discovery lifetime and consent/TLS/archive checks), all
+12 default Quick Share tests, and workspace all-target Clippy. The targeted
+Quick Share startup regression observes a real opened TCP port, aborts the caller,
+and waits for the port and temporary staging directory to be released. The private
+kernel LAN lifecycle test verifies discovery/listener recovery and normal stop.
+These checks do not prove prolonged mDNS resource bounds or physical radio recovery.
+Quick Share's outer RQS stop API still needs propagation of discovery cleanup
+errors currently returned only by its tracked workers. Installed packages and the
+live demo remain unchanged.

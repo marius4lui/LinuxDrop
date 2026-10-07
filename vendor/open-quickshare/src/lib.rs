@@ -102,6 +102,7 @@ pub struct RQS {
     pub ble_enabled: bool,
     tracker: Option<TaskTracker>,
     ctoken: Option<CancellationToken>,
+    session_ctoken: Option<CancellationToken>,
     // Discovery token is different than ctoken because he is on his own
     // - can be cancelled while the ctoken is still active
     discovery_ctk: Option<CancellationToken>,
@@ -154,6 +155,7 @@ impl RQS {
             ble_enabled: true,
             tracker: None,
             ctoken: None,
+            session_ctoken: None,
             discovery_ctk: None,
             lan_state: None,
             visibility_sender: Arc::new(Mutex::new(visibility_sender)),
@@ -167,7 +169,12 @@ impl RQS {
     pub async fn run(
         &mut self,
     ) -> Result<(mpsc::Sender<SendInfo>, broadcast::Receiver<()>), anyhow::Error> {
-        *SESSION_SHUTDOWN.write().unwrap() = CancellationToken::new();
+        if self.ctoken.is_some() {
+            return Err(anyhow!("Quick Share engine is already started"));
+        }
+        let sessions = CancellationToken::new();
+        self.session_ctoken = Some(sessions.clone());
+        *SESSION_SHUTDOWN.write().unwrap() = sessions;
         let tracker = TaskTracker::new();
         let ctoken = CancellationToken::new();
         self.tracker = Some(tracker.clone());
@@ -484,7 +491,10 @@ impl RQS {
     }
 
     pub async fn stop(&mut self) {
-        session_shutdown().cancel();
+        // An old/cancelled startup must never cancel a newer engine generation.
+        if let Some(sessions) = &self.session_ctoken {
+            sessions.cancel();
+        }
         let _ = self.message_sender.send(channel::ChannelMessage {
             id: "*".into(),
             msg: channel::Message::Lib {
@@ -507,6 +517,7 @@ impl RQS {
         }
 
         self.ctoken = None;
+        self.session_ctoken = None;
         self.tracker = None;
         self.lan_state = None;
     }

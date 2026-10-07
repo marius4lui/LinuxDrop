@@ -80,4 +80,55 @@ async fn lan_starts_without_bluetooth_and_port_conflicts_fail() {
         receiver.recv().await.is_none(),
         "A failed bind must not claim readiness"
     );
+
+    // Cancel startup after the real listener is bound but before the initial
+    // status can enter a full event queue. Workers and staging must be owned
+    // through cleanup even though no CommandSender was returned to the caller.
+    let reservation = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let mut config = configuration(Some(port));
+    config.ble = false;
+    let (events, mut receiver) = mpsc::channel(1);
+    events
+        .send(BackendEvent::StateChanged(linuxdrop_core::BackendState {
+            id: "test".into(),
+            state: "queued".into(),
+            detail: String::new(),
+        }))
+        .await
+        .unwrap();
+    let starting = tokio::spawn(async move { start(config, events).await });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if std::net::TcpListener::bind(("0.0.0.0", port)).is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!starting.is_finished());
+    starting.abort();
+    assert!(starting.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let staging_remains = std::fs::read_dir(directory.path()).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".linuxdrop-quickshare-")
+            });
+            if !staging_remains && std::net::TcpListener::bind(("0.0.0.0", port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    receiver.recv().await.unwrap();
+    assert!(receiver.recv().await.is_none());
 }

@@ -71,6 +71,23 @@ pub(super) async fn release(socket: &Mutex<Option<HelperLease>>) -> Result<()> {
     }
 }
 
+/// A failed startup must not retain a lease until a later manual restart.
+/// Preserve both the startup error and an unconfirmed restoration in the UI.
+pub(super) async fn release_after_failure<T>(
+    socket: &Mutex<Option<HelperLease>>,
+    result: Result<T>,
+) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => match release(socket).await {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(anyhow::anyhow!(
+                "{error}; radio restoration was not confirmed: {cleanup}"
+            )),
+        },
+    }
+}
+
 pub(super) async fn failed(shared: &Arc<Shared>, backend: &str, generation: u64) {
     let mut data = shared.data.lock().await;
     if generation != shared.backend_generation.load(Ordering::Acquire)
@@ -295,6 +312,81 @@ pub(crate) mod tests {
             error: None,
             verification_code: None,
             saved_paths: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_backend_start_waits_for_radio_release_and_reports_cleanup_failure() {
+        for (backend, cleanup_failure) in [("quickshare", false), ("airdrop", true)] {
+            let fixture = Fixture::new();
+            let shared = &fixture.0;
+            let (client, server) = tokio::net::UnixStream::pair().unwrap();
+            let (entered, entering) = oneshot::channel();
+            let (finish, finished) = oneshot::channel();
+            let server_task = tokio::spawn(async move {
+                let (read, mut write) = server.into_split();
+                let mut read = BufReader::new(read);
+                let mut line = String::new();
+                read.read_line(&mut line).await.unwrap();
+                assert!(
+                    matches!(serde_json::from_str::<Request>(&line).unwrap(), Request::Release { lease_id } if lease_id == "our-lease")
+                );
+                entered.send(()).unwrap();
+                finished.await.unwrap();
+                let response = if cleanup_failure {
+                    Response::Error {
+                        message: "restoration test failure".into(),
+                    }
+                } else {
+                    Response::Ok
+                };
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                write.write_all(&bytes).await.unwrap();
+            });
+            let socket = if backend == "quickshare" {
+                &shared.quickshare_helper
+            } else {
+                &shared.helper
+            };
+            *socket.lock().await = Some(HelperLease::new(
+                Client::from_stream(client),
+                lease(),
+                shared,
+            ));
+            let task = {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    install_backend(
+                        &shared,
+                        backend,
+                        Err(anyhow::anyhow!("listener startup failed")),
+                    )
+                    .await;
+                })
+            };
+            entering.await.unwrap();
+            assert!(
+                !task.is_finished(),
+                "Startup completion must wait for restoration acknowledgement"
+            );
+            assert!(
+                shared.data.try_lock().is_ok(),
+                "Radio cleanup must not block snapshot access"
+            );
+            finish.send(()).unwrap();
+            task.await.unwrap();
+            server_task.await.unwrap();
+            assert!(socket.lock().await.is_none());
+            let data = shared.data.lock().await;
+            assert!(!data.commands.contains_key(backend));
+            let state = &data.backends[backend];
+            assert_eq!(state.state, "error");
+            assert!(state.detail.contains("listener startup failed"));
+            assert_eq!(
+                state.detail.contains("restoration test failure"),
+                cleanup_failure
+            );
         }
     }
 

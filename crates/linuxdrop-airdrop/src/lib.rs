@@ -26,6 +26,7 @@ pub mod fuzzing {
         Ok(())
     }
 }
+mod mdns_lifetime;
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -141,22 +142,36 @@ pub async fn start_with_budget(
         offers: Mutex::new(HashMap::new()),
         jobs: Mutex::new(HashMap::new()),
     });
-    let mdns = mdns_sd::ServiceDaemon::new()?;
-    mdns.disable_interface(mdns_sd::IfKind::All)?;
-    mdns.enable_interface(mdns_sd::IfKind::Name(config.interface.clone()))?;
-    let service = luftlift_rs::mdns::build_airdrop_service_info(
-        &luftlift_rs::mdns::MdnsConfig {
-            computer_name: format!("linuxdrop-{}", uuid::Uuid::new_v4().simple()),
-            port: 8771,
-            flags: 0x88,
-        },
-        IpAddr::V6(address),
-    )?;
-    if config.visible {
-        mdns.register(service.clone())?;
-    }
-    let discovery = mdns.browse("_airdrop._tcp.local.")?;
-    let mdns_health = mdns.monitor()?;
+    let mut mdns = mdns_lifetime::OwnedMdns::new()?;
+    let setup = (|| -> Result<_> {
+        mdns.disable_interface(mdns_sd::IfKind::All)?;
+        mdns.enable_interface(mdns_sd::IfKind::Name(config.interface.clone()))?;
+        let service = luftlift_rs::mdns::build_airdrop_service_info(
+            &luftlift_rs::mdns::MdnsConfig {
+                computer_name: format!("linuxdrop-{}", uuid::Uuid::new_v4().simple()),
+                port: 8771,
+                flags: 0x88,
+            },
+            IpAddr::V6(address),
+        )?;
+        if config.visible {
+            mdns.register(service.clone())?;
+        }
+        let discovery = mdns.browse("_airdrop._tcp.local.")?;
+        let mdns_health = mdns.monitor()?;
+        Ok((service, discovery, mdns_health))
+    })();
+    let (service, discovery, mdns_health) = match setup {
+        Ok(ready) => ready,
+        Err(error) => {
+            return match mdns.stop().await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(anyhow::anyhow!(
+                    "{error}; discovery cleanup failed: {cleanup}"
+                )),
+            };
+        }
+    };
     let (tx, mut commands) = mpsc::channel(32);
     let stop = CancellationToken::new();
     let server_stop = stop.clone();
@@ -181,8 +196,10 @@ pub async fn start_with_budget(
             }
         }
     });
-    events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:"Experimental AirDrop on leased AWDL hardware. Everyone mode; Apple device verification pending.".into()})).await.ok();
+    let cancel_on_exit = stop.clone().drop_guard();
     let task = tokio::spawn(async move {
+        let _cancel_on_exit = cancel_on_exit;
+        events.send(BackendEvent::StateChanged(BackendState{id:"airdrop".into(),state:"ready".into(),detail:"Experimental AirDrop on leased AWDL hardware. Everyone mode; Apple device verification pending.".into()})).await.ok();
         let mut peers = HashMap::<String, (SocketAddr, Instant)>::new();
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         let mut advertisement = None;
@@ -267,14 +284,13 @@ pub async fn start_with_budget(
         } else {
             Ok(())
         };
-        server.await.map_err(|error| error.to_string())?;
+        let server_cleanup = server.await.map_err(|error| error.to_string());
         workers.close();
         workers.wait().await;
-        let stopped = mdns.shutdown().map_err(|error| error.to_string())?;
-        stopped
-            .recv_async()
-            .await
-            .map_err(|error| error.to_string())?;
+        let discovery_cleanup = mdns.stop().await;
+        // Complete every cleanup path even if a listener or BlueZ task failed.
+        server_cleanup?;
+        discovery_cleanup?;
         bluetooth_cleanup?;
         Ok(())
     });

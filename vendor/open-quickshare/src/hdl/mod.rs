@@ -43,6 +43,7 @@ pub use hotspot::*;
 mod inbound;
 pub use inbound::*;
 pub mod info;
+mod mdns_cleanup;
 mod mdns_discovery;
 pub use mdns_discovery::*;
 mod mdns;

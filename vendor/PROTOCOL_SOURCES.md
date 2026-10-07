@@ -141,4 +141,12 @@ hotspot ServiceAddress candidates. Host listeners and all client attempts bind t
 leased interface, with local scope IDs for link-local addresses. Temporary NM
 profiles permit IPv6-only joins and select link-local mode when the offered
 addresses need no RA; normal routes/DNS remain isolated. Complete supplicant
-P2P role negotiation and its IPv4-required DHCP completion are still open.
+P2P role negotiation remains open. Netd now accepts an owned group with usable
+IPv6 link-local addressing independently of DHCP; see the protocol completion log.
+
+
+Startup lifetime fixes retain the Quick Share engine and staging until workers
+finish, including caller cancellation. Engine session cancellation is scoped to
+its own generation. mDNS advertiser/discovery objects acquire cleanup ownership
+before configuration, retry a full shutdown queue, and await normal daemon exit.
+The outer RQS stop API still needs explicit worker cleanup-error propagation.

@@ -34,6 +34,7 @@ impl Visibility {
 
 pub struct MDnsServer {
     daemon: ServiceDaemon,
+    closed: bool,
     service_info: ServiceInfo,
     ble_receiver: Receiver<()>,
     visibility_sender: Arc<Mutex<watch::Sender<Visibility>>>,
@@ -46,7 +47,9 @@ pub struct MDnsServer {
 
 impl Drop for MDnsServer {
     fn drop(&mut self) {
-        let _ = self.daemon.shutdown();
+        if !self.closed {
+            super::mdns_cleanup::abandoned(&self.daemon);
+        }
     }
 }
 
@@ -68,9 +71,9 @@ impl MDnsServer {
         )?;
 
         let daemon = ServiceDaemon::new()?;
-        crate::lan_policy::configure_mdns_on(&daemon, &snapshot.interfaces)?;
-        Ok(Self {
+        let this = Self {
             daemon,
+            closed: false,
             service_info,
             ble_receiver,
             visibility_sender,
@@ -79,10 +82,19 @@ impl MDnsServer {
             endpoint_id,
             service_port,
             registered: false,
-        })
+        };
+        crate::lan_policy::configure_mdns_on(&this.daemon, &snapshot.interfaces)?;
+        Ok(this)
     }
 
     pub async fn run(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+        let result = self.run_inner(ctk).await;
+        let cleanup = super::mdns_cleanup::shutdown(&self.daemon).await;
+        self.closed = cleanup.is_ok();
+        result.and(cleanup)
+    }
+
+    async fn run_inner(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         info!("{INNER_NAME}: service starting");
         let monitor = self.daemon.monitor()?;
         let mut visibility = *self.visibility_receiver.borrow();

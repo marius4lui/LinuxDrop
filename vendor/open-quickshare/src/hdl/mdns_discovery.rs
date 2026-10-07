@@ -47,13 +47,16 @@ impl EndpointInfo {
 
 pub struct MDnsDiscovery {
     daemon: ServiceDaemon,
+    closed: bool,
     sender: broadcast::Sender<EndpointInfo>,
     lan_state: tokio::sync::watch::Receiver<crate::lan_policy::LanSnapshot>,
 }
 
 impl Drop for MDnsDiscovery {
     fn drop(&mut self) {
-        let _ = self.daemon.shutdown();
+        if !self.closed {
+            super::mdns_cleanup::abandoned(&self.daemon);
+        }
     }
 }
 
@@ -63,16 +66,24 @@ impl MDnsDiscovery {
         lan_state: tokio::sync::watch::Receiver<crate::lan_policy::LanSnapshot>,
     ) -> Result<Self, anyhow::Error> {
         let daemon = ServiceDaemon::new()?;
-        crate::lan_policy::configure_mdns_on(&daemon, &lan_state.borrow().interfaces)?;
-
-        Ok(Self {
+        let this = Self {
             daemon,
+            closed: false,
             sender,
             lan_state,
-        })
+        };
+        crate::lan_policy::configure_mdns_on(&this.daemon, &this.lan_state.borrow().interfaces)?;
+        Ok(this)
     }
 
     pub async fn run(mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
+        let result = self.run_inner(ctk).await;
+        let cleanup = super::mdns_cleanup::shutdown(&self.daemon).await;
+        self.closed = cleanup.is_ok();
+        result.and(cleanup)
+    }
+
+    async fn run_inner(&mut self, ctk: CancellationToken) -> Result<(), anyhow::Error> {
         let service_type = "_FC9F5ED42C8A._tcp.local.";
         let mut receiver = self.daemon.browse(service_type)?;
         let mut cache: HashMap<String, EndpointInfo> = HashMap::new();

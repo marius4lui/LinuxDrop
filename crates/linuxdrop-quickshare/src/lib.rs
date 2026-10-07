@@ -1,4 +1,5 @@
 //! Quick Share (formerly Nearby Share) adapter. Protocol types never cross IPC.
+mod engine_lifetime;
 use anyhow::{Context, Result, bail};
 use linuxdrop_core::{BackendCommand, BackendEvent, BackendState, Peer, Transfer, TransferFile};
 use rqs_lib::channel::{ChannelMessage, Message, TransferAction, TransferKind};
@@ -49,7 +50,7 @@ pub async fn start_with_budget(
     let staging = tempfile::Builder::new()
         .prefix(".linuxdrop-quickshare-")
         .tempdir_in(&config.download_dir)?;
-    let mut engine = RQS::new(
+    let engine = RQS::new(
         if config.visible {
             Visibility::Visible
         } else {
@@ -59,6 +60,7 @@ pub async fn start_with_budget(
         Some(staging.path().to_owned()),
         Some(config.name),
     );
+    let mut engine = engine_lifetime::OwnedEngine::new(engine, staging);
     let bluetooth = if config.ble {
         match tokio::time::timeout(
             Duration::from_secs(5),
@@ -99,7 +101,13 @@ pub async fn start_with_budget(
             return Err(error);
         }
     };
-    let mut lan_state = engine.lan_state()?;
+    let mut lan_state = match engine.lan_state() {
+        Ok(state) => state,
+        Err(error) => {
+            engine.stop().await;
+            return Err(error);
+        }
+    };
     let (discovery, mut peers_rx) = broadcast::channel::<EndpointInfo>(128);
     if let Err(error) = engine.discovery(discovery) {
         engine.stop().await;
@@ -224,7 +232,7 @@ pub async fn start_with_budget(
                                 TransferState::Cancelled => transfer.state = "cancelled".into(),
                                 TransferState::Disconnected => {transfer.state = "failed".into(); transfer.error = Some("The Quick Share connection ended before completion.".into());},
                                 TransferState::Finished => {
-                                    let result = if incoming { match destinations.get(&id) {Some(dir)=>publish_received(dir, staging.path(), &config.download_dir,&transfer.files,&receive_options.remove(&id).unwrap_or_default()).await,None=>Err(anyhow::anyhow!("Missing receive staging directory"))} } else {Ok(Vec::new())};
+                                    let result = if incoming { match destinations.get(&id) {Some(dir)=>publish_received(dir, engine.staging_path(), &config.download_dir,&transfer.files,&receive_options.remove(&id).unwrap_or_default()).await,None=>Err(anyhow::anyhow!("Missing receive staging directory"))} } else {Ok(Vec::new())};
                                     match result {Ok(paths) => {transfer.saved_paths=paths; transfer.state="completed".into(); transfer.transferred_bytes=transfer.total_bytes;}, Err(error) => {transfer.state="failed".into(); transfer.error=Some(error.to_string());}}
                                 }
                                 _ => {},
@@ -233,7 +241,7 @@ pub async fn start_with_budget(
                         if matches!(transfer.state.as_str(), "completed"|"failed"|"rejected"|"cancelled") {
                             pending.remove(&id);
                             receive_options.remove(&id);
-                            if let Some(dir)=destinations.remove(&id) && dir.starts_with(staging.path()) && dir != staging.path() {let _=std::fs::remove_dir_all(dir);}
+                            if let Some(dir)=destinations.remove(&id) && dir.starts_with(engine.staging_path()) && dir != engine.staging_path() {let _=std::fs::remove_dir_all(dir);}
                         }
                         events.send(if is_request {BackendEvent::Incoming(transfer.clone())} else {BackendEvent::TransferUpdated(transfer.clone())}).await.ok();
                     }
@@ -257,7 +265,6 @@ pub async fn start_with_budget(
                     .ok();
             }
         }
-        drop(staging);
         Ok(())
     });
     Ok(linuxdrop_core::CommandSender::track(commands, task))
