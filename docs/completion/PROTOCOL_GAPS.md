@@ -32,6 +32,7 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Pin supplicant operations and journaled P2P cleanup to the original unique D-Bus owner/bus; abort owner changes and distinguish revoked leases from healthy reservations.
 - [ ] Prolonged mDNS reconfiguration/resource-bound acceptance.
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
+- Scanner owner replacement now has [private-bus regression evidence](../acceptance/BLUETOOTH_SCANNER_OWNER_2026-10-07.md): old cleanup cannot reach a new daemon, stale starts are rejected, and explicit reconstruction works. Automatic recovery across all roles remains open.
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
 - [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
 - [x] Receiver-initiated dynamic role switching with advertised local identity, reserved-radio joining, consent, cancellation and encrypted channel continuity.

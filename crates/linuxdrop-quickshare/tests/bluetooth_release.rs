@@ -415,4 +415,107 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         .call::<_, _, ()>("StopDiscovery", &())
         .await
         .unwrap();
+    let (alerts, _) = tokio::sync::broadcast::channel(4);
+    let powered = rqs_lib::hdl::BleListener::new(alerts).await.unwrap();
+    let starts = selected_scan.starts.load(Ordering::SeqCst);
+    selected_scan.powered.store(false, Ordering::SeqCst);
+    let error = powered.run(CancellationToken::new()).await.unwrap_err();
+    assert!(format!("{error:#}").contains("switched off"), "{error:#}");
+    assert_eq!(selected_scan.starts.load(Ordering::SeqCst), starts);
+    selected_scan.powered.store(true, Ordering::SeqCst);
+
+    // A stale scanner must clean its original daemon, never its replacement.
+    let (alerts, _) = tokio::sync::broadcast::channel(4);
+    let parked = rqs_lib::hdl::BleListener::new(alerts.clone())
+        .await
+        .unwrap();
+    let old = rqs_lib::hdl::BleListener::new(alerts.clone())
+        .await
+        .unwrap();
+    let cancel_old = CancellationToken::new();
+    let run_cancel = cancel_old.clone();
+    let starts = selected_scan.starts.load(Ordering::SeqCst);
+    let old_task = tokio::spawn(async move { old.run(run_cancel).await });
+    wait_for(|| selected_scan.starts.load(Ordering::SeqCst) > starts).await;
+    bus.release_name("org.bluez").await.unwrap();
+    let replacement_state = Arc::new(scanner::State::default());
+    replacement_state.powered.store(true, Ordering::SeqCst);
+    let replacement = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.bluez")
+        .unwrap()
+        .serve_at("/", zbus::fdo::ObjectManager)
+        .unwrap()
+        .serve_at(
+            "/org/bluez/hci1",
+            scanner::Scanner(replacement_state.clone()),
+        )
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let fresh = rqs_lib::hdl::BleListener::new(alerts).await.unwrap();
+    let cancel_fresh = CancellationToken::new();
+    let run_cancel = cancel_fresh.clone();
+    let fresh_task = tokio::spawn(async move { fresh.run(run_cancel).await });
+    wait_for(|| replacement_state.starts.load(Ordering::SeqCst) == 1).await;
+    cancel_old.cancel();
+    tokio::time::timeout(Duration::from_secs(2), old_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        replacement_state.stops.load(Ordering::SeqCst),
+        0,
+        "Old scanner cleanup reached the replacement BlueZ daemon"
+    );
+    assert!(replacement_state.active.load(Ordering::SeqCst));
+    assert!(!selected_scan.active.load(Ordering::SeqCst));
+    let error = tokio::time::timeout(Duration::from_secs(2), parked.run(CancellationToken::new()))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("owner changed"), "{error:#}");
+    assert_eq!(replacement_state.starts.load(Ordering::SeqCst), 1);
+    assert_eq!(replacement_state.stops.load(Ordering::SeqCst), 0);
+    cancel_fresh.cancel();
+    tokio::time::timeout(Duration::from_secs(2), fresh_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(replacement_state.stops.load(Ordering::SeqCst), 1);
+    // A dead unique owner has released its per-client scan implicitly.
+    let (alerts, _) = tokio::sync::broadcast::channel(4);
+    let dying = rqs_lib::hdl::BleListener::new(alerts).await.unwrap();
+    let cancel_dying = CancellationToken::new();
+    let run_cancel = cancel_dying.clone();
+    let dying_task = tokio::spawn(async move { dying.run(run_cancel).await });
+    wait_for(|| replacement_state.starts.load(Ordering::SeqCst) == 2).await;
+    replacement.close().await.unwrap();
+    let third_state = Arc::new(scanner::State::default());
+    third_state.powered.store(true, Ordering::SeqCst);
+    let _third = zbus::connection::Builder::session()
+        .unwrap()
+        .name("org.bluez")
+        .unwrap()
+        .serve_at("/", zbus::fdo::ObjectManager)
+        .unwrap()
+        .serve_at("/org/bluez/hci1", scanner::Scanner(third_state.clone()))
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    cancel_dying.cancel();
+    tokio::time::timeout(Duration::from_secs(2), dying_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        third_state.stops.load(Ordering::SeqCst),
+        0,
+        "Cleanup after daemon disconnection must not mutate a replacement"
+    );
 }

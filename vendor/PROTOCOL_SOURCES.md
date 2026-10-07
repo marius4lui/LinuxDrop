@@ -194,3 +194,10 @@ validation and strict prior-channel completion; shared bounded host introduction
 checks against retained BLE/mDNS/ConnectionRequest endpoint identity. Encrypted
 TCP/duplex and private-kernel regressions cover malformed introductions, ACKs,
 cancellation and incomplete drains. No additional upstream code was copied.
+
+2026-10-07 bluez-async generation safety: sessions pin method/signal traffic to
+the captured unique BlueZ owner. Discovery refuses changed owners and switched-off
+controllers; cleanup cannot target a replacement. NameHasOwner confirms release
+when the original daemon has disconnected. Owner lookup precedes persistent IO
+worker spawn. Private-bus regressions cover reachable and disconnected old daemons.
+See docs/acceptance/BLUETOOTH_SCANNER_OWNER_2026-10-07.md. No upstream code copied.

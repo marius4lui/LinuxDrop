@@ -66,6 +66,10 @@ pub enum BluetoothError {
     /// No Bluetooth adapters were found on the system.
     #[error("No Bluetooth adapters found.")]
     NoBluetoothAdapters,
+    #[error("Bluetooth daemon owner changed; reconnect the scanner")]
+    OwnerChanged,
+    #[error("Bluetooth controller is switched off")]
+    PoweredOff,
     /// There was an error talking to the BlueZ daemon over D-Bus.
     #[error(transparent)]
     DbusError(#[from] dbus::Error),
@@ -266,6 +270,8 @@ impl From<WriteOptions> for PropMap {
 #[derive(Clone)]
 pub struct BluetoothSession {
     connection: Arc<SyncConnection>,
+    // LinuxDrop: object paths belong to one bluetoothd generation.
+    owner: String,
 }
 
 impl Debug for BluetoothSession {
@@ -287,13 +293,27 @@ impl BluetoothSession {
         // Configure the connection to send signal messages to all matching `MsgMatch`es, as we may
         // have streams with overlapping match rules.
         connection.set_signal_match_mode(true);
-        // The resource is a task that should be spawned onto a tokio compatible
-        // reactor ASAP. If the resource ever finishes, you lost connection to D-Bus.
-        let dbus_handle = tokio::spawn(async {
-            let err = dbus_resource.await;
+        // Resolve the generation before spawning the persistent IO worker.
+        // Cancellation or a missing owner must not leave a detached connection.
+        let bus = Proxy::new(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            DBUS_METHOD_CALL_TIMEOUT,
+            connection.clone(),
+        );
+        let mut resource = Box::pin(dbus_resource);
+        let (owner,): (String,) = tokio::select! {
+            error = &mut resource => return Err(dbus::Error::new_failed(&error.to_string()).into()),
+            result = bus.method_call("org.freedesktop.DBus", "GetNameOwner", ("org.bluez",)) => result?,
+        };
+        let dbus_handle = tokio::spawn(async move {
+            let err = resource.await;
             Err(SpawnError::DbusConnectionLost(err))
         });
-        Ok((dbus_handle.map(|res| res?), BluetoothSession { connection }))
+        Ok((
+            dbus_handle.map(|res| res?),
+            BluetoothSession { connection, owner },
+        ))
     }
 
     /// Powers the given adapter on or off.
@@ -367,7 +387,23 @@ impl BluetoothSession {
         adapter_id: &AdapterId,
         discovery_filter: &DiscoveryFilter,
     ) -> Result<(), BluetoothError> {
+        let bus = Proxy::new(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            DBUS_METHOD_CALL_TIMEOUT,
+            self.connection.clone(),
+        );
+        let (owner,): (String,) = bus
+            .method_call("org.freedesktop.DBus", "GetNameOwner", ("org.bluez",))
+            .await?;
+        if owner != self.owner {
+            return Err(BluetoothError::OwnerChanged);
+        }
         let adapter = self.adapter(adapter_id);
+        // Recheck immediately before discovery; construction may predate power loss.
+        if !adapter.powered().await? {
+            return Err(BluetoothError::PoweredOff);
+        }
         // LinuxDrop: scanning must respect the user's controller power state.
         adapter
             .set_discovery_filter(discovery_filter.into())
@@ -396,14 +432,29 @@ impl BluetoothSession {
         adapter_id: &AdapterId,
     ) -> Result<(), BluetoothError> {
         let adapter = self.adapter(adapter_id);
-        adapter.stop_discovery().await?;
+        if let Err(error) = adapter.stop_discovery().await {
+            // A disconnected original daemon cannot retain this client's scan.
+            // Check its unique name; never redirect cleanup to the new owner.
+            let bus = Proxy::new(
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                DBUS_METHOD_CALL_TIMEOUT,
+                self.connection.clone(),
+            );
+            let (alive,): (bool,) = bus
+                .method_call("org.freedesktop.DBus", "NameHasOwner", (&self.owner,))
+                .await?;
+            if alive {
+                return Err(error.into());
+            }
+        }
         Ok(())
     }
 
     /// Get a list of all Bluetooth adapters on the system.
     pub async fn get_adapters(&self) -> Result<Vec<AdapterInfo>, BluetoothError> {
         let bluez_root = Proxy::new(
-            "org.bluez",
+            self.owner.clone(),
             "/",
             DBUS_METHOD_CALL_TIMEOUT,
             self.connection.clone(),
@@ -423,7 +474,7 @@ impl BluetoothSession {
     /// Get a list of all Bluetooth devices which have been discovered so far.
     pub async fn get_devices(&self) -> Result<Vec<DeviceInfo>, BluetoothError> {
         let bluez_root = Proxy::new(
-            "org.bluez",
+            self.owner.clone(),
             "/",
             DBUS_METHOD_CALL_TIMEOUT,
             self.connection.clone(),
@@ -636,7 +687,7 @@ impl BluetoothSession {
         id: &AdapterId,
     ) -> impl OrgBluezAdapter1 + Introspectable + Properties + use<> {
         Proxy::new(
-            "org.bluez",
+            self.owner.clone(),
             id.object_path.to_owned(),
             DBUS_METHOD_CALL_TIMEOUT,
             self.connection.clone(),
@@ -650,7 +701,7 @@ impl BluetoothSession {
     ) -> impl OrgBluezDevice1 + Introspectable + Properties + use<> {
         let timeout = timeout.min(DBUS_METHOD_CALL_MAX_TIMEOUT);
         Proxy::new(
-            "org.bluez",
+            self.owner.clone(),
             id.object_path.to_owned(),
             timeout,
             self.connection.clone(),
@@ -662,7 +713,7 @@ impl BluetoothSession {
         id: &ServiceId,
     ) -> impl OrgBluezGattService1 + Introspectable + Properties + use<> {
         Proxy::new(
-            "org.bluez",
+            self.owner.clone(),
             id.object_path.to_owned(),
             DBUS_METHOD_CALL_TIMEOUT,
             self.connection.clone(),
@@ -674,7 +725,7 @@ impl BluetoothSession {
         id: &CharacteristicId,
     ) -> impl OrgBluezGattCharacteristic1 + Introspectable + Properties + use<> {
         Proxy::new(
-            "org.bluez",
+            self.owner.clone(),
             id.object_path.to_owned(),
             DBUS_METHOD_CALL_TIMEOUT,
             self.connection.clone(),
@@ -686,7 +737,7 @@ impl BluetoothSession {
         id: &DescriptorId,
     ) -> impl OrgBluezGattDescriptor1 + Introspectable + Properties + use<> {
         Proxy::new(
-            "org.bluez",
+            self.owner.clone(),
             id.object_path.to_owned(),
             DBUS_METHOD_CALL_TIMEOUT,
             self.connection.clone(),
@@ -911,7 +962,8 @@ impl BluetoothSession {
         device_discovery: bool,
     ) -> Result<impl Stream<Item = BluetoothEvent> + use<P>, BluetoothError> {
         let mut message_streams = vec![];
-        for match_rule in BluetoothEvent::match_rules(object.cloned(), device_discovery) {
+        for mut match_rule in BluetoothEvent::match_rules(object.cloned(), device_discovery) {
+            match_rule.sender = Some(self.owner.clone().into());
             let msg_match = self.connection.add_match(match_rule).await?;
             message_streams.push(MessageStream::new(msg_match, self.connection.clone()));
         }
