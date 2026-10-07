@@ -35,4 +35,4 @@ from PID 1's namespace before creating or deleting any interface. It uses a Unix
 socket pair for helper responses and disables BLE. It does not start the AWDL
 radio engine, acquire a real helper lease, exercise regulatory/channel changes,
 or prove Apple-device interoperability. Actual helper channel/hardware-loss
-integration and physical radio acceptance remain separately open.
+integration is now covered separately by [the combined watchdog fixture](AWDL_WATCHDOG_2026-10-07.md); physical radio acceptance remains open.

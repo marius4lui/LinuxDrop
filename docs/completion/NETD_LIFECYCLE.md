@@ -58,6 +58,10 @@ Remaining code/evidence requirements:
   runtime/config values inherited by its PAM session. The manager environment is
   restored afterwards. This changes only the disposable test setup; the remote
   full CI result remains to be confirmed.
+- The actual release helper now passes nine AWDL watchdog/retirement scenarios,
+  with real child/TAP lifetime and simulated radio metadata. The actual user
+  daemon also retires and restarts its AirDrop listener across channel and helper
+  loss: [combined acceptance](../acceptance/AWDL_WATCHDOG_2026-10-07.md).
 - Re-run relevant isolated kernel network and installed-package lifecycle checks
   after the completed helper change. Unit fixtures are not physical radio or
   installed daemon acceptance.

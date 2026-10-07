@@ -53,8 +53,8 @@ sh crates/linuxdrop-netd/tests/run-awdl-link.sh /path/netd-test-binary /path/fil
 ```
 
 The existing real AirDrop listener/discovery actor reconnect check remains in
-[helper lifetime acceptance](AIRDROP_HELPER_LIFETIME_2026-10-07.md). The complete
-helper/watchdog/channel-loss chain still requires the broader integration
-acceptance in the ledger; this scoped case does not replace it. Successful
+[helper lifetime acceptance](AIRDROP_HELPER_LIFETIME_2026-10-07.md). The broader
+helper/watchdog/channel-loss chain is now exercised by the separate
+[combined integration fixture](AWDL_WATCHDOG_2026-10-07.md). Successful
 radio injection, channel hopping with Apple peers and physical unplug remain
 hardware acceptance. The live demo session was not modified.

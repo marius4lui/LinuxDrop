@@ -54,15 +54,18 @@ Google's wire schema distinguishes password-based joining from device-name disco
 - [x] Explicit Bluetooth controller and shared advertisement resource coordination. AirDrop wake yields its slot after three seconds, protects Quick Share connections and participates in the common scan pause. See [shared Bluetooth acceptance](../acceptance/BLUETOOTH_SHARED_AIRTIME_2026-10-07.md).
 - [x] ReceiveOptions destination/selection/collision policy.
 - [x] Incoming/outgoing archive bandwidth uses the daemon's shared payload budget; outgoing sockets remain bound to the leased AWDL interface.
-- [ ] Reconnect/channel/hardware-loss integration exercised with helper simulations; no false ready state after lease failure.
+- [x] Reconnect/channel/hardware-loss integration exercised with helper simulations; no false ready state after lease failure.
   The real AirDrop listener/discovery worker now has [lease-revocation, socket-loss
   and interface-reconnect evidence](../acceptance/AIRDROP_HELPER_LIFETIME_2026-10-07.md).
   AirDrop health checks also run independently of pending Wi-Fi Direct operations.
-  The combined row remains open for actual helper/channel integration.
+  [Actual helper/daemon integration](../acceptance/AWDL_WATCHDOG_2026-10-07.md)
+  now exercises nine watchdog/retirement cases and two complete daemon/IPv6
+  listener generations, including restricted channels, rfkill and helper stop.
   [Managed AWDL link acceptance](../acceptance/AWDL_MANAGED_LINK_2026-10-07.md)
   additionally fixes premature readiness and silent channel failures, and runs
-  the real Filin process through a kernel-rejected channel startup. Complete
-  watchdog/channel-loss integration remains separate from that scoped check.
+  the real Filin process through a kernel-rejected channel startup. The combined
+  software evidence uses simulated radio capabilities; physical acceptance
+  remains below.
 
 ## Physical acceptance (software work continues independently)
 

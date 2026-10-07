@@ -494,7 +494,7 @@ pub async fn run() -> io::Result<()> {
                     let owner_lost = lease.p2p_group.as_ref().is_some_and(|group| {
                         supplicant.as_ref().is_none_or(|(owner, bus)| group.service_owner != *owner || group.bus_guid != *bus)
                     });
-                    let radio_gone = !inventory.radios.iter().any(|r| r.phy == lease.phy);
+                    let radio_gone = !inventory.radios.iter().any(|r| r.phy == lease.phy && !r.rfkill);
                     let regulatory_change = inventory.radios.iter().find(|r| r.phy == lease.phy).is_some_and(|radio| {
                         lease.allowed_frequencies.iter().any(|frequency| !radio.channels.iter().any(|c| c.frequency_mhz == *frequency && !c.disabled && !c.no_ir && !c.radar))
                     });
@@ -504,7 +504,7 @@ pub async fn run() -> io::Result<()> {
                         // same lock. Slow I/O still runs in the persistent worker.
                         let _ = begin_cleanup_locked_with(&mut state, &monitor, &lease.id, restore_child_and_lease, persist);
                         state.record_recovery_error(format!(
-                            "{}: lease stopped after helper exit, interface loss/ownership change, supplicant owner loss, unplug, regulatory change, or competing radio use", lease.interface));
+                            "{}: lease stopped after helper exit, interface loss/ownership change, supplicant owner loss, unplug/rfkill, regulatory change, or competing radio use", lease.interface));
                     }
                 }
             }
