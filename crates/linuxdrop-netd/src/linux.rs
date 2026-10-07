@@ -24,6 +24,9 @@ const HELPER_DIRECTORY: &str = match option_env!("LINUXDROP_LIBEXECDIR") {
     Some(directory) => directory,
     None => "/usr/libexec/linuxdrop",
 };
+#[path = "acquire.rs"]
+mod acquire;
+
 const JOURNAL: &str = "/var/lib/linuxdrop-netd/leases.json";
 const MAX_REQUEST: u64 = 4096;
 #[derive(Default)]
@@ -32,7 +35,7 @@ struct State {
     children: HashMap<String, tokio::process::Child>,
     recovery_errors: Vec<String>,
     attached: std::collections::HashSet<String>,
-    pending_p2p: HashMap<String, PendingP2p>,
+    producers: HashMap<String, RadioProducer>,
     cancelled_p2p: std::collections::HashSet<String>,
     cleanups: HashMap<String, CleanupReceipt>,
     group_cleanups: HashMap<String, CleanupReceipt>,
@@ -121,7 +124,7 @@ where
     };
     state.attached.remove(id);
     state.cancelled_p2p.remove(id);
-    let producer = state.pending_p2p.get(id).map(|pending| {
+    let producer = state.producers.get(id).map(|pending| {
         pending.cancel.cancel();
         pending.settled.clone()
     });
@@ -158,7 +161,7 @@ where
             Ok(()) => tokio::spawn(async move { operation(lease, child).await })
                 .await
                 .unwrap_or_else(|error| Err(format!("Cleanup operation stopped: {error}"))),
-            Err(error) => Err(format!("P2P producer did not settle: {error}")),
+            Err(error) => Err(format!("Radio producer did not settle: {error}")),
         };
         let mut state = shared.lock().await;
         state.radio_changed();
@@ -221,7 +224,7 @@ where
     }
     // A producer must settle before partial cleanup can start. Full retirement
     // owns cancellation of outstanding formation. Never guess its final group.
-    if state.pending_p2p.contains_key(id) {
+    if state.producers.contains_key(id) {
         return Err("P2P group formation is still in progress".into());
     }
     let child = state.children.remove(id);
@@ -294,7 +297,7 @@ async fn cleanup_all(shared: &Shared, ids: Vec<String>) -> Vec<(String, Result<(
     results
 }
 
-struct PendingP2p {
+struct RadioProducer {
     cancel: tokio_util::sync::CancellationToken,
     interfaces: std::collections::HashSet<String>,
     settled: CleanupReceipt,
@@ -302,7 +305,7 @@ struct PendingP2p {
 
 // The producer outlives its requesting socket. Its cancellation token requests
 // a stop; only its settlement receipt authorizes a subsequent radio retirement.
-fn spawn_p2p_with<F, Fut>(
+fn spawn_radio_with<F, Fut>(
     state: &mut State,
     shared: &Shared,
     lease_id: String,
@@ -316,9 +319,9 @@ where
 {
     let (settled, receipt) = tokio::sync::watch::channel(None);
     let (reply, receiver) = tokio::sync::oneshot::channel();
-    state.pending_p2p.insert(
+    state.producers.insert(
         lease_id.clone(),
-        PendingP2p {
+        RadioProducer {
             cancel,
             interfaces,
             settled: receipt,
@@ -330,7 +333,7 @@ where
         let (result, settlement) = match tokio::spawn(async move { operation().await }).await {
             Ok(result) => (result, Ok(())),
             Err(error) => {
-                let error = format!("P2P producer stopped unexpectedly: {error}");
+                let error = format!("Radio producer stopped unexpectedly: {error}");
                 (Err(error.clone()), Err(error))
             }
         };
@@ -342,7 +345,7 @@ where
             state.attached.remove(&lease_id);
             state.record_recovery_error(format!("{lease_id}: {error}"));
         } else {
-            state.pending_p2p.remove(&lease_id);
+            state.producers.remove(&lease_id);
         }
         settled.send_replace(Some(settlement));
         let _ = reply.send(result);
@@ -353,7 +356,7 @@ where
 fn competing_use(
     lease: &Lease,
     interface: &linuxdrop_hardware::NetworkInterface,
-    pending: Option<&PendingP2p>,
+    pending: Option<&RadioProducer>,
 ) -> bool {
     if interface.phy.as_deref() != Some(&lease.phy) || !interface.in_use() {
         return false;
@@ -475,7 +478,7 @@ pub async fn run() -> io::Result<()> {
                     let regulatory_change = inventory.radios.iter().find(|r| r.phy == lease.phy).is_some_and(|radio| {
                         lease.allowed_frequencies.iter().any(|frequency| !radio.channels.iter().any(|c| c.frequency_mhz == *frequency && !c.disabled && !c.no_ir && !c.radar))
                     });
-                    let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.pending_p2p.get(&lease.id)));
+                    let unsafe_use = inventory.interfaces.iter().any(|i| competing_use(&lease, i, state.producers.get(&lease.id)));
                     if (dead && !ipv6_survives) || radio_gone || unsafe_use || regulatory_change || owner_lost {
                         // Validate the observation and reserve cleanup under the
                         // same lock. Slow I/O still runs in the persistent worker.
@@ -565,10 +568,13 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
                             }
                         }
                     }
-                    let joining = matches!(&request, Request::JoinP2p { .. } | Request::HostP2p { .. });
+                    let preparing = matches!(&request,
+                        Request::JoinP2p { .. } | Request::HostP2p { .. }
+                        | Request::Acquire { .. } | Request::AcquireAwdl { .. }
+                        | Request::Diagnose { .. });
                     let response = tokio::select! {
                         result = apply(request, uid, &mut owned, &state) => result,
-                        result = reader.fill_buf(), if joining => {
+                        result = reader.fill_buf(), if preparing => {
                             if result?.is_empty() { break; }
                             return Err(io::Error::other("pipelined helper requests are not supported"));
                         }
@@ -729,7 +735,7 @@ async fn join_p2p(
     }
     if lease.kind != LeaseKind::DirectWifi
         || lease.p2p_group.is_some()
-        || state.pending_p2p.contains_key(&lease_id)
+        || state.producers.contains_key(&lease_id)
     {
         return Err("a free direct Wi-Fi lease is required".into());
     }
@@ -784,7 +790,7 @@ async fn join_p2p(
         frequency,
         host_auth,
     };
-    let reply = spawn_p2p_with(
+    let reply = spawn_radio_with(
         &mut state,
         shared,
         lease_id,
@@ -988,6 +994,7 @@ async fn apply(
     shared: &Shared,
 ) -> Result<Response, String> {
     if let Request::Diagnose { radio_id, channel } = request {
+        let original_owned = owned.clone();
         let acquired = Box::pin(apply(
             Request::Acquire {
                 radio_id: radio_id.clone(),
@@ -1031,7 +1038,7 @@ async fn apply(
                     .await
                     .leases
                     .values()
-                    .any(|l| l.uid == uid && !owned.contains(&l.id));
+                    .any(|l| l.uid == uid && !original_owned.contains(&l.id));
                 report.steps.push(DiagnosticStep {
                     name: "prepare".into(),
                     passed: false,
@@ -1041,6 +1048,15 @@ async fn apply(
             _ => return Err("unexpected diagnostic lease response".into()),
         }
         return Ok(Response::Diagnostic { report });
+    }
+    if let Request::Reserve { radio_id } = request {
+        return acquire::reserve_radio(shared, uid, owned, radio_id).await;
+    }
+    let awdl = matches!(&request, Request::AcquireAwdl { .. });
+    if let Request::Acquire { radio_id, channel } | Request::AcquireAwdl { radio_id, channel } =
+        request
+    {
+        return acquire::acquire_radio(shared, uid, owned, radio_id, channel, awdl).await;
     }
     if let Request::HostP2p { lease_id, auth } = request {
         if !owned.contains(&lease_id) {
@@ -1102,7 +1118,6 @@ async fn apply(
     ) {
         state.radio_changed();
     }
-    let awdl = matches!(request, Request::AcquireAwdl { .. });
     match request {
         Request::Diagnose { .. } => unreachable!(),
         Request::JoinP2p { .. } | Request::HostP2p { .. } => unreachable!(),
@@ -1117,7 +1132,7 @@ async fn apply(
             {
                 return Err("P2P operation does not belong to this user".into());
             }
-            if let Some(operation) = state.pending_p2p.get(&lease_id) {
+            if let Some(operation) = state.producers.get(&lease_id) {
                 operation.cancel.cancel();
             }
             // Also cover cancellation while JoinP2p is collecting inventory,
@@ -1143,6 +1158,8 @@ async fn apply(
                         ownership_verified: check.is_ok(),
                         detail: if state.cleanups.contains_key(&l.id) || state.group_cleanups.contains_key(&l.id) {
                             "Cleanup is in progress; the radio remains reserved".into()
+                        } else if state.producers.contains_key(&l.id) {
+                            "Radio preparation is in progress; the radio remains reserved".into()
                         } else { check.err().unwrap_or_else(|| {
                             "Orphaned lease; authorized retry restores only this owned resource".into()
                         }) },
@@ -1160,59 +1177,7 @@ async fn apply(
                     .collect(),
             })
         }
-        Request::Reserve { radio_id } => {
-            if owned.len() >= 2 {
-                return Err("two radio leases per client maximum".into());
-            }
-            let inv = inventory().await;
-            let radio = inv
-                .radios
-                .iter()
-                .find(|r| r.id == radio_id)
-                .ok_or("radio not found")?;
-            if radio.protected || radio.rfkill || radio.driver.is_none() {
-                return Err("radio is active, blocked, or has no driver".into());
-            }
-            if state.leases.values().any(|l| l.phy == radio.phy) {
-                return Err("radio is already leased".into());
-            }
-            if !radio.modes.iter().any(|m| m == "managed") {
-                return Err("managed station mode is unavailable".into());
-            }
-            let interface = inv
-                .interfaces
-                .iter()
-                .find(|i| i.phy.as_deref() == Some(&radio.phy) && !i.in_use())
-                .ok_or("no idle interface on selected radio")?;
-            let id = uuid::Uuid::new_v4().simple().to_string();
-            let lease = Lease {
-                id: id.clone(),
-                uid,
-                phy: radio.phy.clone(),
-                interface: interface.name.clone(),
-                channel: 0,
-                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                    .map_err(|e| e.to_string())?
-                    .trim()
-                    .into(),
-                awdl_interface: None,
-                allowed_frequencies: vec![],
-                kind: LeaseKind::DirectWifi,
-                connection_uuid: Some(uuid::Uuid::new_v4().to_string()),
-                p2p_group: None,
-                direct_capabilities: direct_capabilities(&radio.modes, &radio.channels),
-            };
-            state.leases.insert(id.clone(), lease.clone());
-            if let Err(e) = persist(&state) {
-                state.leases.remove(&id);
-                return Err(e.to_string());
-            }
-            state.attached.insert(id.clone());
-            owned.push(id);
-            Ok(Response::Acquired {
-                lease: Box::new(lease),
-            })
-        }
+        Request::Reserve { .. } => unreachable!(),
         Request::Status => Ok(Response::State {
             leases: state
                 .leases
@@ -1222,209 +1187,7 @@ async fn apply(
                 .collect(),
             recovery_errors: state.recovery_errors.clone(),
         }),
-        Request::Acquire { radio_id, channel } | Request::AcquireAwdl { radio_id, channel } => {
-            if owned.len() >= 2 {
-                return Err("two radio leases per client maximum".into());
-            }
-            let inventory = inventory().await;
-            let radio = inventory
-                .radios
-                .iter()
-                .find(|r| r.id == radio_id)
-                .ok_or("radio not found")?;
-            if !radio.phy.starts_with("phy") || !radio.phy[3..].chars().all(|c| c.is_ascii_digit())
-            {
-                return Err("invalid kernel radio name".into());
-            }
-            let leased = inventory
-                .radios
-                .iter()
-                .filter(|r| state.leases.values().any(|l| l.phy == r.phy))
-                .map(|r| r.id.clone())
-                .collect();
-            let decision = select_radio(
-                &inventory,
-                &SelectionRequest {
-                    preferred: Some(radio_id.clone()),
-                    leased,
-                    require_tested_awdl: false,
-                    channel: Some(channel),
-                    prefer_usb: true,
-                },
-            );
-            let candidate = decision
-                .candidates
-                .iter()
-                .find(|c| c.id == radio_id)
-                .ok_or("radio disappeared")?;
-            if !candidate.exclusions.is_empty() {
-                return Err(candidate.exclusions.join("; "));
-            }
-            let id = uuid::Uuid::new_v4().simple().to_string();
-            let lease = Lease {
-                id: id.clone(),
-                uid,
-                phy: radio.phy.clone(),
-                interface: format!("ld{}", &id[..10]),
-                channel,
-                boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                    .map_err(|e| e.to_string())?
-                    .trim()
-                    .into(),
-                awdl_interface: awdl.then(|| format!("la{}", &id[..10])),
-                kind: LeaseKind::Monitor,
-                connection_uuid: None,
-                p2p_group: None,
-                direct_capabilities: Default::default(),
-                allowed_frequencies: radio
-                    .channels
-                    .iter()
-                    .filter(|c| !c.disabled && !c.no_ir && !c.radar)
-                    .map(|c| c.frequency_mhz)
-                    .collect(),
-            };
-            state.leases.insert(id.clone(), lease.clone());
-            if let Err(e) = persist(&state) {
-                state.leases.remove(&id);
-                return Err(e.to_string());
-            }
-            // Original interfaces and NetworkManager properties remain untouched.
-            let created = async {
-                run_command(
-                    "/usr/sbin/iw",
-                    &[
-                        "phy",
-                        &lease.phy,
-                        "interface",
-                        "add",
-                        &lease.interface,
-                        "type",
-                        "monitor",
-                    ],
-                    5,
-                )
-                .await?;
-                run_command(
-                    "/usr/sbin/ip",
-                    &[
-                        "link",
-                        "set",
-                        "dev",
-                        &lease.interface,
-                        "alias",
-                        &format!("linuxdrop:{}", lease.id),
-                    ],
-                    5,
-                )
-                .await?;
-                // Recheck after VIF creation and before the first channel change:
-                // a NetworkManager activation may have raced the initial scan.
-                let current = linuxdrop_hardware::inventory().await;
-                if current.interfaces.iter().any(|i| {
-                    i.phy.as_deref() == Some(&lease.phy) && i.name != lease.interface && i.in_use()
-                }) {
-                    return Err("radio became active while preparing its lease".into());
-                }
-                run_command(
-                    "/usr/sbin/iw",
-                    &[
-                        "dev",
-                        &lease.interface,
-                        "set",
-                        "channel",
-                        &channel.to_string(),
-                    ],
-                    5,
-                )
-                .await?;
-                run_command(
-                    "/usr/sbin/ip",
-                    &["link", "set", "dev", &lease.interface, "up"],
-                    5,
-                )
-                .await
-            }
-            .await;
-            if let Err(error) = created {
-                match restore(&lease).await {
-                    Ok(()) => {
-                        state.leases.remove(&id);
-                    }
-                    Err(e) => state.record_recovery_error(e),
-                }
-                persist(&state).map_err(|e| e.to_string())?;
-                return Err(error);
-            }
-            if let Some(tap) = &lease.awdl_interface {
-                let allowed = radio
-                    .channels
-                    .iter()
-                    .filter(|c| !c.disabled && !c.no_ir && !c.radar)
-                    .map(|c| c.frequency_mhz.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let child = Command::new(format!("{HELPER_DIRECTORY}/filin"))
-                    .args([
-                        "-i",
-                        &lease.interface,
-                        "-h",
-                        tap,
-                        "-c",
-                        &channel.to_string(),
-                        "-N",
-                        "--no-http",
-                        "--no-force-master",
-                    ])
-                    .env_clear()
-                    .env("PATH", "/usr/sbin:/usr/bin")
-                    .env("LC_ALL", "C")
-                    .env("LINUXDROP_ALLOWED_FREQUENCIES", allowed)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn();
-                match child {
-                    Err(e) => {
-                        match restore(&lease).await {
-                            Ok(()) => {
-                                state.leases.remove(&id);
-                            }
-                            Err(error) => state.record_recovery_error(error),
-                        }
-                        persist(&state).map_err(|e| e.to_string())?;
-                        return Err(format!("AWDL helper unavailable: {e}"));
-                    }
-                    Ok(child) => {
-                        state.children.insert(id.clone(), child);
-                    }
-                }
-                let mut ready = false;
-                for _ in 0..30 {
-                    if !matches!(state.children.get_mut(&id).unwrap().try_wait(), Ok(None)) {
-                        break;
-                    }
-                    if Path::new("/sys/class/net").join(tap).exists() {
-                        ready = true;
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                if !ready {
-                    reap_child(state.children.remove(&id)).await?;
-                    if restore(&lease).await.is_ok() {
-                        state.leases.remove(&id);
-                    }
-                    persist(&state).map_err(|e| e.to_string())?;
-                    return Err("AWDL helper exited or did not create its interface".into());
-                }
-            }
-            state.attached.insert(id.clone());
-            owned.push(id);
-            Ok(Response::Acquired {
-                lease: Box::new(lease),
-            })
-        }
+        Request::Acquire { .. } | Request::AcquireAwdl { .. } => unreachable!(),
         Request::SetChannel { lease_id, channel } => {
             if !state.attached.contains(&lease_id) {
                 return Err("lease is revoked; complete radio recovery first".into());
@@ -1860,25 +1623,68 @@ fn persist(state: &State) -> io::Result<()> {
     std::fs::File::open(Path::new(JOURNAL).parent().unwrap())?.sync_all()
 }
 async fn run_command(program: &str, args: &[&str], seconds: u64) -> Result<(), String> {
-    let output = timeout(
-        Duration::from_secs(seconds),
-        Command::new(program)
-            .args(args)
-            .env_clear()
-            .env("PATH", "/usr/sbin:/usr/bin")
-            .env("LC_ALL", "C")
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("{program} timed out"))?
-    .map_err(|e| e.to_string())?;
-    if output.status.success() {
+    let child = Command::new(program)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    wait_command(child, program, Duration::from_secs(seconds)).await
+}
+
+async fn wait_command(
+    mut child: tokio::process::Child,
+    program: &str,
+    budget: Duration,
+) -> Result<(), String> {
+    let mut stderr = child.stderr.take().ok_or("Command stderr is unavailable")?;
+    // Drain concurrently to prevent a full pipe from blocking termination. Keep
+    // bounded diagnostics even if a utility produces unexpectedly large output.
+    let mut reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        (&mut stderr)
+            .take(64 * 1024)
+            .read_to_end(&mut bytes)
+            .await?;
+        tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+        Ok::<_, io::Error>(bytes)
+    });
+    let status = match timeout(budget, child.wait()).await {
+        Ok(Ok(status)) => status,
+        outcome => {
+            let message = match outcome {
+                Err(_) => format!("{program} timed out"),
+                Ok(Err(error)) => format!("{program}: {error}"),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            let stopped = reap_child(Some(child)).await;
+            reader.abort();
+            let _ = reader.await;
+            stopped?;
+            return Err(message);
+        }
+    };
+    let diagnostics = match timeout(Duration::from_secs(1), &mut reader).await {
+        Ok(result) => result
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?,
+        Err(_) => {
+            reader.abort();
+            let _ = reader.await;
+            return Err(format!("{program}: diagnostic pipe did not close"));
+        }
+    };
+    if status.success() {
         Ok(())
     } else {
         Err(format!(
             "{program}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&diagnostics).trim()
         ))
     }
 }
@@ -2453,7 +2259,7 @@ mod tests {
     #[test]
     fn watchdog_distinguishes_owned_p2p_from_competing_networks() {
         let mut lease = direct_lease();
-        let pending = PendingP2p {
+        let pending = RadioProducer {
             settled: tokio::sync::watch::channel(Some(Ok(()))).1,
             cancel: tokio_util::sync::CancellationToken::new(),
             interfaces: ["wlan2".into(), "sibling0".into()].into_iter().collect(),
@@ -2506,7 +2312,7 @@ mod tests {
         let mut state = shared.lock().await;
         state.leases.insert(id.clone(), lease);
         state.attached.insert(id.clone());
-        let reply = spawn_p2p_with(
+        let reply = spawn_radio_with(
             &mut state,
             &shared,
             id.clone(),
@@ -2564,7 +2370,146 @@ mod tests {
         wait_cleanup(cleanup).await.unwrap();
         assert!(restored.load(Ordering::SeqCst));
         let state = shared.lock().await;
-        assert!(state.pending_p2p.is_empty() && state.leases.is_empty());
+        assert!(state.producers.is_empty() && state.leases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_network_command_is_reaped_before_return() {
+        let child = Command::new("/usr/bin/sleep")
+            .arg("60")
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        let error = wait_command(child, "sleep fixture", Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
+    #[tokio::test]
+    async fn cancelled_acquisition_retains_late_child_until_retirement() {
+        let mut lease = direct_lease();
+        lease.kind = LeaseKind::Monitor;
+        let id = lease.id.clone();
+        let shared = Arc::new(Mutex::new(State::default()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let (spawned, child_pid) = tokio::sync::oneshot::channel();
+        let mut state = shared.lock().await;
+        state.leases.insert(id.clone(), lease.clone());
+        let reply = acquire::spawn_acquisition_with(
+            &mut state,
+            &shared,
+            lease,
+            cancel,
+            move |_, token| async move {
+                token.cancelled().await;
+                finishing.await.unwrap();
+                let child = Command::new("/usr/bin/sleep")
+                    .arg("60")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                spawned.send(child.id().unwrap()).unwrap();
+                Ok(Some(child))
+            },
+        );
+        drop(state);
+        drop(reply);
+        let cleanup = begin_cleanup_with(
+            &shared,
+            &id,
+            |_, child| async move {
+                assert!(child.is_some(), "A late child must be handed to retirement");
+                reap_child(child).await
+            },
+            |_| Ok(()),
+        )
+        .await;
+        timeout(
+            Duration::from_millis(250),
+            apply(Request::Status, 1000, &mut vec![], &shared),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(shared.lock().await.leases.contains_key(&id));
+        assert!(cleanup.borrow().is_none());
+        finish.send(()).unwrap();
+        let pid = child_pid.await.unwrap();
+        timeout(Duration::from_secs(3), wait_cleanup(cleanup))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "Acknowledgement requires child reaping"
+        );
+        let state = shared.lock().await;
+        assert!(state.leases.is_empty() && state.producers.is_empty() && state.children.is_empty());
+        assert!(
+            !state.attached.contains(&id),
+            "A cancelled producer must not attach its lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_acquisition_settles_before_queued_recovery() {
+        let mut lease = direct_lease();
+        lease.kind = LeaseKind::Monitor;
+        let id = lease.id.clone();
+        let shared = Arc::new(Mutex::new(State::default()));
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let mut state = shared.lock().await;
+        state.leases.insert(id.clone(), lease.clone());
+        let reply = acquire::spawn_acquisition_with(
+            &mut state,
+            &shared,
+            lease,
+            tokio_util::sync::CancellationToken::new(),
+            move |_, _| async move {
+                finishing.await.unwrap();
+                Err("Synthetic creation failure".into())
+            },
+        );
+        drop(state);
+        let cleanup = begin_cleanup_with(
+            &shared,
+            &id,
+            |_, child| async move {
+                assert!(child.is_none());
+                Err("Synthetic ownership mismatch".into())
+            },
+            |_| Ok(()),
+        )
+        .await;
+        let recovery = timeout(
+            Duration::from_millis(250),
+            apply(Request::RecoveryStatus, 1000, &mut vec![], &shared),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(recovery, Response::Recovery { issues, .. } if issues.len() == 1 && issues[0].detail.contains("in progress"))
+        );
+        assert!(cleanup.borrow().is_none());
+        finish.send(()).unwrap();
+        assert!(reply
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("creation failure"));
+        assert!(wait_cleanup(cleanup)
+            .await
+            .unwrap_err()
+            .contains("ownership mismatch"));
+        let state = shared.lock().await;
+        assert!(state.producers.is_empty());
+        assert!(state.leases.contains_key(&id) && !state.attached.contains(&id));
     }
 
     #[tokio::test]
@@ -2575,7 +2520,7 @@ mod tests {
         let mut state = shared.lock().await;
         state.leases.insert(id.clone(), lease);
         state.attached.insert(id.clone());
-        let reply = spawn_p2p_with(
+        let reply = spawn_radio_with(
             &mut state,
             &shared,
             id.clone(),
@@ -2606,7 +2551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_p2p_can_be_cancelled_only_by_its_authorized_user() {
+    async fn p2p_producer_can_be_cancelled_only_by_its_authorized_user() {
         let lease = direct_lease();
         let cancel = tokio_util::sync::CancellationToken::new();
         let shared = Arc::new(Mutex::new(State::default()));
@@ -2614,9 +2559,9 @@ mod tests {
             let mut state = shared.lock().await;
             state.attached.insert(lease.id.clone());
             state.leases.insert(lease.id.clone(), lease.clone());
-            state.pending_p2p.insert(
+            state.producers.insert(
                 lease.id.clone(),
-                PendingP2p {
+                RadioProducer {
                     settled: tokio::sync::watch::channel(Some(Ok(()))).1,
                     cancel: cancel.clone(),
                     interfaces: Default::default(),
