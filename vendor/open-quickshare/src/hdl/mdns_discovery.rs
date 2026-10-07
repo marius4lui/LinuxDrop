@@ -18,15 +18,20 @@ pub struct EndpointInfo {
     pub present: Option<bool>,
     /// Set for a recipient discovered over BLE (a phone on its receive screen).
     /// `ble_addr` is the peer's current LE address; `ble_psm` its L2CAP PSM.
-    /// Both rotate, so the send path re-scans by name before dialing — these are
+    /// Both rotate, so the send path re-scans by endpoint ID before dialing — these are
     /// a hint and the marker that this endpoint is reachable over BLE.
     pub ble_addr: Option<String>,
     pub ble_psm: Option<u16>,
+    #[serde(default)]
+    pub ble_endpoint_id: Option<[u8; 4]>,
 }
 
 impl EndpointInfo {
     pub fn endpoint_id(&self) -> Option<[u8; 4]> {
         use base64::Engine;
+        if self.ble_addr.is_some() {
+            return self.ble_endpoint_id;
+        }
         let label = self.fullname.split('.').next()?;
         let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(label)
@@ -205,6 +210,7 @@ async fn probe(
                     present: Some(true),
                     ble_addr: None,
                     ble_psm: None,
+                    ble_endpoint_id: None,
                 });
             }
         }

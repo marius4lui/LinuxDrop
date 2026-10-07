@@ -85,33 +85,9 @@ impl BleListener {
         let selected = crate::bluetooth_adapter().await?.name().to_owned();
         let controller =
             linuxdrop_network::bluetooth_lifetime::ControllerMonitor::new(&selected).await?;
-        let manager = Manager::new().await?;
-        let adapters = manager.adapters().await?;
-        if adapters.is_empty() {
-            return Err(anyhow!("no bluetooth adapter"));
-        }
-
-        // Resolve through the same powered-controller policy as advertising,
-        // GATT and L2CAP; never silently take the first scanner adapter.
-        let mut chosen = None;
-        for adapter in adapters {
-            let information = adapter.adapter_info().await?;
-            let name = information
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .rsplit('/')
-                .next()
-                .unwrap_or_default();
-            if name == selected {
-                chosen = Some(adapter);
-                break;
-            }
-        }
+        let adapter = selected_scanner(&selected).await?;
         Ok(Self {
-            adapter: chosen.ok_or_else(|| {
-                anyhow!("Selected Bluetooth controller is unavailable to the scanner")
-            })?,
+            adapter,
             controller,
             sender,
         })
@@ -185,6 +161,7 @@ impl BleListener {
 
         let mut last_alert: SystemTime = SystemTime::UNIX_EPOCH;
         let mut scanning = false;
+        let mut scan_turn = None;
         let mut reported = None;
         let mut report = |paused: bool| {
             *made_ready = true;
@@ -233,6 +210,7 @@ impl BleListener {
                             .context("Bluetooth stop-scan acknowledgement timed out")?
                             .context("Bluetooth scan could not stop")?;
                         scanning = false;
+                        if let Some(mut turn) = scan_turn.take() { super::scan_turn::ScanTurn::cleared(&mut turn); }
                         phase_deadline = Instant::now() + SCAN_PAUSE;
                     } else if scanning_suppressed() {
                         report(true);
@@ -250,11 +228,21 @@ impl BleListener {
                         // The service may process StartDiscovery even if its
                         // reply fails. Keep cleanup required until StopDiscovery
                         // acknowledges it; do not report another scan as active.
+                        let turn = tokio::select! {
+                            error = &mut loss => return Err(error),
+                            turn = super::scan_turn::ScanTurn::acquire(&ctk) => turn?,
+                        };
+                        let Some(mut turn) = turn else { break; };
+                        self.controller.check().await?;
+                        if scanning_suppressed() { report(true); phase_deadline = Instant::now() + SCAN_PAUSE; continue; }
+                        turn.started();
+                        scan_turn = Some(turn);
                         scanning = true;
-                        tokio::time::timeout(DBUS_CALL_TIMEOUT, self.adapter.start_scan(ScanFilter::default())).await
-                            .context("Bluetooth start-scan acknowledgement timed out")?
+                        // The D-Bus client bounds the request itself. Keep the
+                        // future until its receipt before issuing StopDiscovery.
+                        self.adapter.start_scan(ScanFilter::default()).await
                             .context("Bluetooth scan could not start")?;
-                        report(false);
+                        if !ctk.is_cancelled() { report(false); }
                         phase_deadline = Instant::now() + SCAN_WINDOW;
                     }
                 }
@@ -310,6 +298,13 @@ impl BleListener {
         } else {
             Ok(())
         };
+        if let Some(mut turn) = scan_turn {
+            if cleanup.is_ok() {
+                turn.cleared();
+            } else {
+                super::scan_turn::ScanTurn::defer_cleanup(self.adapter.clone(), turn);
+            }
+        }
         crate::lifecycle::finish(outcome, cleanup)
     }
 
@@ -362,4 +357,32 @@ impl BleListener {
         // poke, but that's no reason to tear the listener down.
         self.sender.send(()).is_ok()
     }
+}
+
+/// Open one scanner generation on the explicitly selected controller.
+pub(crate) async fn selected_scanner(selected: &str) -> anyhow::Result<Adapter> {
+    let manager = Manager::new().await?;
+    let adapters = manager.adapters().await?;
+    if adapters.is_empty() {
+        return Err(anyhow!("no bluetooth adapter"));
+    }
+
+    // Resolve through the same powered-controller policy as advertising,
+    // GATT and L2CAP; never silently take the first scanner adapter.
+    let mut chosen = None;
+    for adapter in adapters {
+        let information = adapter.adapter_info().await?;
+        let name = information
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        if name == selected {
+            chosen = Some(adapter);
+            break;
+        }
+    }
+    chosen.ok_or_else(|| anyhow!("Selected Bluetooth controller is unavailable to the scanner"))
 }

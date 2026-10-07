@@ -1,4 +1,11 @@
 #[cfg(all(feature = "experimental", target_os = "linux"))]
+mod recipient_scan;
+#[cfg(feature = "experimental")]
+mod scan_turn;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
+#[doc(hidden)]
+pub use recipient_scan::wait_for_scans;
+#[cfg(all(feature = "experimental", target_os = "linux"))]
 mod advertisement_turn;
 #[cfg(all(feature = "experimental", target_os = "linux"))]
 mod bluetooth_tasks;

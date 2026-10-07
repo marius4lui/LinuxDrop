@@ -20,14 +20,11 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::time::Instant;
 
 use bluer::l2cap::{Security, SecurityLevel, Socket, SocketAddr, Stream};
-use bluer::{
-    Adapter, AdapterEvent, Address, AddressType, DiscoveryFilter, DiscoveryTransport, Uuid, UuidExt,
-};
-use futures::StreamExt;
+use bluer::{Adapter, Address, AddressType};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::Instant;
 
 use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
@@ -41,16 +38,11 @@ use crate::utils::{DeviceType, RemoteDeviceInfo};
 
 const INNER_NAME: &str = "BleClient";
 
-const QS_SERVICE_UUID: u16 = 0xFEF3;
 /// Android caps its L2CAP transmit at 1024 bytes; extra receive room is free.
 const RECV_MTU: u16 = 4096;
 /// Hard cap on the CoC connect itself (Stage 0 measured ~0.5s; a phone that
 /// wandered out of range should fail fast, not hang the send).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
-/// How much longer a scan keeps hoping for a live advert once a cached
-/// candidate is already in hand -- the cache entry is usually still valid,
-/// so waiting out the whole window before trying it just burns seconds.
-const GHOST_WAIT: Duration = Duration::from_secs(6);
 /// How long to wait for the phone's `DataConnectionReady` after we ask.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -140,7 +132,7 @@ pub fn decode_receiver_advert(sd: &[u8]) -> Option<ReceiverAdvert> {
 }
 
 impl ReceiverAdvert {
-    fn into_target(self, addr: Address, addr_type: AddressType) -> Option<BleTarget> {
+    pub(crate) fn into_target(self, addr: Address, addr_type: AddressType) -> Option<BleTarget> {
         Some(BleTarget {
             addr,
             addr_type,
@@ -154,206 +146,131 @@ impl ReceiverAdvert {
     }
 }
 
-/// Scans (up to `timeout`) for visible receivers advertising a PSM.
-///
-/// Returns as soon as it has a usable target: the one whose device name equals
-/// `want_name` if given (essential when several phones are in receive mode at
-/// once — the phone's LE address rotates, so name is the stable selector), else
-/// the first receiver seen. Each address is logged once so the duplicate-data
-/// stream doesn't flood the log. The caller owns the adapter, so discovery is
-/// stopped (the event stream dropped) before it connects.
+/// Compatibility entry point for diagnostic examples. Names are exact filters,
+/// never identity: multiple matching endpoints are rejected as ambiguous.
 pub async fn scan_once(
     adapter: &Adapter,
     timeout: Duration,
     want_name: Option<&str>,
-) -> Result<Vec<BleTarget>, anyhow::Error> {
-    // Best-effort: BlueZ rejects a filter change while a previous discovery is
-    // still winding down (rapid re-scans). The prior filter is already LE, so
-    // proceeding is fine.
-    if let Err(e) = adapter
-        .set_discovery_filter(DiscoveryFilter {
-            transport: DiscoveryTransport::Le,
-            duplicate_data: true,
-            ..Default::default()
-        })
-        .await
-    {
-        debug!("{INNER_NAME}: set_discovery_filter: {e} (proceeding)");
-    }
-    let mut events = adapter.discover_devices_with_changes().await?;
-    let uuid = Uuid::from_u16(QS_SERVICE_UUID);
-    let deadline = Instant::now() + timeout;
-    // Pulled in when a cached candidate shows up: keep scanning for a live
-    // advert only [`GHOST_WAIT`] longer, then settle for the cache entry.
-    let mut wake = deadline;
-    let mut targets: HashMap<Address, BleTarget> = HashMap::new();
-    let mut logged: std::collections::HashSet<Address> = std::collections::HashSet::new();
-    // A DeviceAdded served straight from BlueZ's cache can carry a
-    // pre-rotation address/PSM the phone no longer answers on. A device with
-    // a live RSSI is currently on the air; cache ghosts are kept only as a
-    // deadline fallback when nothing live shows up.
-    let mut ghost: Option<BleTarget> = None;
-
-    loop {
-        let ev = tokio::select! {
-            _ = tokio::time::sleep_until(wake) => break,
-            ev = events.next() => match ev { Some(e) => e, None => break },
-        };
-        let addr = match ev {
-            AdapterEvent::DeviceAdded(a) => a,
-            _ => continue,
-        };
-        let Ok(dev) = adapter.device(addr) else {
-            continue;
-        };
-        let Ok(Some(sd)) = dev.service_data().await else {
-            continue;
-        };
-        let Some(bytes) = sd.get(&uuid) else { continue };
-        let Some(advert) = decode_receiver_advert(bytes) else {
-            continue;
-        };
-        if !advert.visible {
-            continue;
-        }
-        let addr_type = dev.address_type().await.unwrap_or(AddressType::LeRandom);
-        if let Some(t) = advert.into_target(addr, addr_type) {
-            // Skip phones other than the one we're after (name is stable across
-            // the LE address rotation; the address is not). Case-insensitive
-            // substring so a distinctive fragment selects among several phones.
-            if want_name.is_some_and(|w| !t.rdi.name.to_lowercase().contains(&w.to_lowercase())) {
-                continue;
-            }
-            let live = dev.rssi().await.ok().flatten().is_some();
-            if logged.insert(addr) {
-                info!(
-                    "{INNER_NAME}: receiver {} ({}) psm {} name {:?}{}",
-                    addr,
-                    addr_type,
-                    t.psm,
-                    t.rdi.name,
-                    if live { "" } else { " (cached)" }
-                );
-            }
-            if !live {
-                if ghost.is_none() {
-                    wake = wake.min(Instant::now() + GHOST_WAIT);
-                }
-                ghost.get_or_insert(t);
-                continue;
-            }
-            targets.insert(addr, t);
-            // Enough to connect; stop scanning so the CoC connect isn't racing
-            // an active discovery (that returns a dead, ENOTCONN socket).
-            break;
+) -> anyhow::Result<Vec<BleTarget>> {
+    let mut targets = super::recipient_scan::scan(
+        adapter.name().into(),
+        timeout,
+        None,
+        CancellationToken::new(),
+        false,
+    )
+    .await?;
+    if let Some(name) = want_name {
+        targets.retain(|target| target.rdi.name == name);
+        if targets.len() > 1 {
+            anyhow::bail!("Multiple BLE endpoints have that name; select a specific device");
         }
     }
-
-    if targets.is_empty() {
-        if let Some(g) = ghost {
-            targets.insert(g.addr, g);
-        }
-    }
-    Ok(targets.into_values().collect())
+    Ok(targets)
 }
 
-/// Collects every visible receiver seen during a full `window` (unlike
-/// [`scan_once`], which stops at the first). Used by the discovery loop.
-async fn scan_all(adapter: &Adapter, window: Duration) -> Result<Vec<BleTarget>, anyhow::Error> {
-    if let Err(e) = adapter
-        .set_discovery_filter(DiscoveryFilter {
-            transport: DiscoveryTransport::Le,
-            duplicate_data: true,
-            ..Default::default()
-        })
-        .await
-    {
-        debug!("{INNER_NAME}: set_discovery_filter: {e} (proceeding)");
-    }
-    let mut events = adapter.discover_devices_with_changes().await?;
-    let uuid = Uuid::from_u16(QS_SERVICE_UUID);
-    let deadline = Instant::now() + window;
-    let mut targets: HashMap<Address, BleTarget> = HashMap::new();
-
-    loop {
-        let ev = tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => break,
-            ev = events.next() => match ev { Some(e) => e, None => break },
-        };
-        let AdapterEvent::DeviceAdded(addr) = ev else {
-            continue;
-        };
-        let Ok(dev) = adapter.device(addr) else {
-            continue;
-        };
-        let Ok(Some(sd)) = dev.service_data().await else {
-            continue;
-        };
-        let Some(bytes) = sd.get(&uuid) else { continue };
-        let Some(advert) = decode_receiver_advert(bytes) else {
-            continue;
-        };
-        if !advert.visible {
-            continue;
-        }
-        let addr_type = dev.address_type().await.unwrap_or(AddressType::LeRandom);
-        if let Some(t) = advert.into_target(addr, addr_type) {
-            targets.insert(addr, t);
-        }
-    }
-    Ok(targets.into_values().collect())
+/// The selected endpoint is correlation data, not authentication. UKEY2 and
+/// explicit SAS/consent still authenticate the eventual transfer session.
+pub async fn scan_target(
+    adapter: &Adapter,
+    timeout: Duration,
+    endpoint: [u8; 4],
+    cancel: CancellationToken,
+) -> anyhow::Result<Vec<BleTarget>> {
+    super::recipient_scan::scan(
+        adapter.name().into(),
+        timeout,
+        Some(endpoint),
+        cancel,
+        false,
+    )
+    .await
 }
 
-const DISCOVERY_WINDOW: Duration = Duration::from_secs(3);
-const DISCOVERY_PAUSE: Duration = Duration::from_secs(4);
-
-/// Long-running discovery of phones on their Quick Share receive screen, for
-/// the *send* side. Duty-cycles a short scan (so the 0xFE2C "nudge" advert the
-/// send flow also runs still gets airtime) and emits an [`EndpointInfo`] for
-/// each visible receiver, keyed by `ble://<name>` so it stays stable across the
-/// phone's rotating LE address. Emits only "present" entries; the recipient
-/// list is cleared when the dialog reopens, so no removal flicker from a scan
-/// window that happens to miss a phone.
-pub async fn ble_discovery(sender: Sender<EndpointInfo>, ctk: CancellationToken) {
-    let adapter = match async { crate::bluetooth_adapter().await }.await {
-        Ok(a) => a,
-        Err(e) => {
-            warn!("{INNER_NAME}: discovery couldn't open the adapter: {e}");
-            return;
-        }
-    };
-    if !adapter.is_powered().await.unwrap_or(false) {
-        warn!("Bluetooth is switched off");
-        return;
-    }
-    info!("{INNER_NAME}: BLE recipient discovery starting");
-
-    loop {
+/// Recover recipient discovery independently of transfer workers. Peer entries
+/// expire instead of surviving indefinitely after a phone leaves receive mode.
+pub async fn ble_discovery(
+    sender: Sender<EndpointInfo>,
+    status: Sender<crate::channel::ChannelMessage>,
+    ctk: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut retry = Duration::from_secs(2);
+    let mut known = HashMap::<String, (EndpointInfo, tokio::time::Instant)>::new();
+    let result = loop {
         if ctk.is_cancelled() {
-            break;
+            break Ok(());
         }
-        match scan_all(&adapter, DISCOVERY_WINDOW).await {
+        let result = async {
+            let adapter =
+                tokio::time::timeout(Duration::from_secs(5), crate::bluetooth_adapter()).await??;
+            super::recipient_scan::scan(
+                adapter.name().into(),
+                Duration::from_secs(3),
+                None,
+                ctk.clone(),
+                true,
+            )
+            .await
+        }
+        .await;
+        let pause = match result {
             Ok(found) => {
-                for t in found {
-                    let _ = sender.send(EndpointInfo {
-                        id: format!("ble://{}", t.rdi.name),
-                        name: Some(t.rdi.name.clone()),
-                        rtype: Some(t.rdi.device_type),
-                        present: Some(true),
-                        ble_addr: Some(t.addr.to_string()),
-                        ble_psm: Some(t.psm),
-                        ..Default::default()
+                retry = Duration::from_secs(2);
+                if !ctk.is_cancelled() {
+                    let _ = status.send(crate::channel::ChannelMessage {
+                        id: "backend".into(),
+                        msg: crate::channel::Message::BluetoothServiceReady {
+                            component: "bluetooth-peer-discovery".into(),
+                        },
                     });
+                    for target in found {
+                        let peer = EndpointInfo {
+                            id: format!("ble://{}", hex::encode(target.endpoint_id)),
+                            name: Some(target.rdi.name),
+                            rtype: Some(target.rdi.device_type),
+                            present: Some(true),
+                            ble_addr: Some(target.addr.to_string()),
+                            ble_psm: Some(target.psm),
+                            ble_endpoint_id: Some(target.endpoint_id),
+                            ..Default::default()
+                        };
+                        known.insert(peer.id.clone(), (peer.clone(), tokio::time::Instant::now()));
+                        let _ = sender.send(peer);
+                    }
                 }
+                Duration::from_secs(4)
             }
-            Err(e) => debug!("{INNER_NAME}: discovery scan failed: {e}"),
-        }
-        tokio::select! {
-            _ = ctk.cancelled() => break,
-            _ = tokio::time::sleep(DISCOVERY_PAUSE) => {}
-        }
+            Err(error) => {
+                crate::backend_failure(&status, "bluetooth-peer-discovery", &error);
+                for (_, (mut peer, _)) in known.drain() {
+                    peer.present = Some(false);
+                    let _ = sender.send(peer);
+                }
+                if crate::lifecycle::cleanup_unconfirmed(&error) {
+                    break Err(error);
+                }
+                let pause = retry;
+                retry = (retry * 2).min(Duration::from_secs(15));
+                pause
+            }
+        };
+        known.retain(|_, (peer, seen)| {
+            if seen.elapsed() < Duration::from_secs(30) {
+                return true;
+            }
+            let mut removed = peer.clone();
+            removed.present = Some(false);
+            let _ = sender.send(removed);
+            false
+        });
+        tokio::select! { _ = ctk.cancelled() => break Ok(()), _ = tokio::time::sleep(pause) => {} }
+    };
+    for (_, (mut peer, _)) in known.drain() {
+        peer.present = Some(false);
+        let _ = sender.send(peer);
     }
-    info!("{INNER_NAME}: BLE recipient discovery stopped");
+    result
 }
 
 /// Opens the LE CoC and runs the client half of the data-connection handshake,

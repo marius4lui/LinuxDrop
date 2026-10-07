@@ -12,15 +12,21 @@ pub struct MessageStream {
     msg_match: Option<MsgMatch>,
     events: UnboundedReceiver<Message>,
     connection: Arc<SyncConnection>,
+    resource: Arc<crate::ResourceLifetime>,
 }
 
 impl MessageStream {
-    pub fn new(msg_match: MsgMatch, connection: Arc<SyncConnection>) -> Self {
+    pub(crate) fn new(
+        msg_match: MsgMatch,
+        connection: Arc<SyncConnection>,
+        resource: Arc<crate::ResourceLifetime>,
+    ) -> Self {
         let (msg_match, events) = msg_match.msg_stream();
         Self {
             msg_match: Some(msg_match),
             events,
             connection,
+            resource,
         }
     }
 }
@@ -37,8 +43,15 @@ impl Drop for MessageStream {
     fn drop(&mut self) {
         let connection = self.connection.clone();
         let msg_match = self.msg_match.take().unwrap();
+        let resource = self.resource.clone();
         tokio::spawn(async move {
-            if let Err(error) = connection.remove_match(msg_match.token()).await {
+            let _resource = resource;
+            if let Ok(Err(error)) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                connection.remove_match(msg_match.token()),
+            )
+            .await
+            {
                 if error.name() != Some("org.freedesktop.DBus.Error.MatchRuleNotFound") {
                     log::warn!("Bluetooth signal subscription cleanup: {error}");
                 }

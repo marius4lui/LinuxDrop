@@ -25,6 +25,16 @@ async fn wait_for(mut predicate: impl FnMut() -> bool) {
     .expect("Quick Share advertisement actor did not settle");
 }
 
+async fn confirmed_scan_cleanup() {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while rqs_lib::hdl::wait_for_scans().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("The original scanner did not confirm its own cleanup");
+}
+
 async fn release(bus: &zbus::Connection, state: &State) {
     let (path, owner) = {
         let mut active = state.active.lock().unwrap();
@@ -352,7 +362,9 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
     );
 
     // Exercise the complete adapter -> RQS worker tracker -> CommandSender
-    // receipt path. A recoverable scan-start error must not block shutdown;
+    // receipt path. The runner disables recipient discovery for this case;
+    // its separately owned scan is covered by recipient_scan.rs. A recoverable
+    // scan-start error must not block shutdown;
     // an unacknowledged StopDiscovery must remain visible on every retry.
     selected_scan.powered.store(true, Ordering::SeqCst);
     // Prevent the outgoing advertiser from intentionally suppressing this scanner.
@@ -363,13 +375,7 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
     let directory = tempfile::tempdir().unwrap();
     for (start_fails, cleanup_fails) in [(true, false), (false, true)] {
         selected_scan.fail_stop.store(false, Ordering::SeqCst);
-        let adapter = zbus::Proxy::new(&bus, "org.bluez", "/org/bluez/hci1", "org.bluez.Adapter1")
-            .await
-            .unwrap();
-        adapter
-            .call::<_, _, ()>("StopDiscovery", &())
-            .await
-            .unwrap();
+        confirmed_scan_cleanup().await;
         selected_scan
             .fail_start
             .store(start_fails, Ordering::SeqCst);
@@ -431,13 +437,7 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
         }
     }
     selected_scan.fail_stop.store(false, Ordering::SeqCst);
-    let adapter = zbus::Proxy::new(&bus, "org.bluez", "/org/bluez/hci1", "org.bluez.Adapter1")
-        .await
-        .unwrap();
-    adapter
-        .call::<_, _, ()>("StopDiscovery", &())
-        .await
-        .unwrap();
+    confirmed_scan_cleanup().await;
     let (alerts, _) = tokio::sync::broadcast::channel(4);
     let powered = rqs_lib::hdl::BleListener::new(alerts).await.unwrap();
     let starts = selected_scan.starts.load(Ordering::SeqCst);
@@ -483,11 +483,14 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
     let fresh_task = tokio::spawn(async move { fresh.run(run_cancel).await });
     wait_for(|| replacement_state.starts.load(Ordering::SeqCst) == 1).await;
     cancel_old.cancel();
-    tokio::time::timeout(Duration::from_secs(2), old_task)
+    let error = tokio::time::timeout(Duration::from_secs(2), old_task)
         .await
         .unwrap()
         .unwrap()
-        .unwrap();
+        .unwrap_err();
+    // The shared scan turn means the old generation has already acknowledged
+    // cleanup after owner loss before the replacement is allowed to start.
+    assert!(error.to_string().contains("owner changed"));
     assert_eq!(
         replacement_state.stops.load(Ordering::SeqCst),
         0,

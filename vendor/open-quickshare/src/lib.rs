@@ -339,9 +339,9 @@ impl RQS {
             } else {
                 let ble_sender = sender.clone();
                 let ctk_bled = ctk.clone();
+                let status = self.message_sender.clone();
                 tracker.spawn("bluetooth-peer-discovery", async move {
-                    crate::hdl::ble_discovery(ble_sender, ctk_bled).await;
-                    Ok(())
+                    crate::hdl::ble_discovery(ble_sender, status, ctk_bled).await
                 });
             }
         }

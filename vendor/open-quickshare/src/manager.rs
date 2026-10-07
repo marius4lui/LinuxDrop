@@ -21,7 +21,7 @@ pub struct SendInfo {
     pub addr: String,
     pub ob: OutboundPayload,
     /// When set, send over BLE instead of Wi-Fi/TCP: the recipient is a phone
-    /// discovered over BLE. The send path re-scans for it by `name` (its LE
+    /// discovered over BLE. The send path re-scans for its endpoint ID (its LE
     /// address and PSM rotate) and dials the fresh target. `addr`/`id` may be a
     /// placeholder in this case. Ignored on non-Linux / non-experimental builds.
     #[serde(default)]
@@ -58,16 +58,18 @@ impl TcpServer {
         network_changes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         info!("{INNER_NAME}: service starting");
 
-        loop {
+        let outcome = loop {
             let cctk = ctk.clone();
 
             tokio::select! {
                 _ = ctk.cancelled() => {
                     info!("{INNER_NAME}: tracker cancelled, breaking");
-                    break;
+                    break Ok(());
                 }
                 Some(_) = jobs.join_next(), if !jobs.is_empty() => {},
-                _ = network_changes.tick() => { self.tcp_listeners.refresh().await?; },
+                _ = network_changes.tick() => {
+                    if let Err(error) = self.tcp_listeners.refresh().await { break Err(error); }
+                },
                 Some(i) = self.connect_receiver.recv() => {
                     info!("{INNER_NAME}: connect_receiver: got {:?}", i);
                     let report_id = i.id.clone();
@@ -144,14 +146,18 @@ impl TcpServer {
                         },
                         Err(err) => {
                             error!("{INNER_NAME}: error accepting: {}", err);
-                            break;
+                            break Err(err.into());
                         }
                     }
                 }
             }
-        }
+        };
 
-        Ok(())
+        jobs.abort_all();
+        while jobs.join_next().await.is_some() {}
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        crate::hdl::wait_for_scans().await?;
+        outcome
     }
 }
 
@@ -213,13 +219,54 @@ impl TransferConnector {
     }
 
     /// Send over BLE to a phone discovered on its receive screen. Re-scans for
-    /// it by name (its LE address and PSM rotate), dials the fresh target, then
+    /// its endpoint ID (its LE address and PSM rotate), dials the fresh target, then
     /// drives the same outbound handshake over the L2CAP-backed stream.
     #[cfg(all(feature = "experimental", target_os = "linux"))]
     async fn connect_ble(&self, ctk: CancellationToken, si: SendInfo) -> Result<(), anyhow::Error> {
-        use crate::hdl::{dial, scan_once};
+        let cancel = ctk.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let transfer_id = si.id.clone();
+        let mut actions = self.sender.subscribe();
+        let work = self.connect_ble_inner(cancel.clone(), si);
+        tokio::pin!(work);
+        let mut cancelled = false;
+        loop {
+            tokio::select! {
+                result = &mut work => {
+                    if cancelled {
+                        if let Err(error) = &result && crate::lifecycle::cleanup_unconfirmed(error) {
+                            crate::backend_failure(&self.sender, "bluetooth-peer-discovery", error);
+                        }
+                        return Ok(());
+                    }
+                    return result;
+                },
+                action = actions.recv() => {
+                    if !cancelled && matches!(action, Ok(ChannelMessage {id, msg: channel::Message::Lib {action: channel::TransferAction::TransferCancel}}) if id == transfer_id) {
+                        cancelled = true;
+                        cancel.cancel();
+                        let _ = self.sender.send(ChannelMessage {
+                            id: transfer_id.clone(),
+                            msg: channel::Message::Client(MessageClient { kind: TransferKind::Outbound, state: Some(TransferState::Cancelled), metadata: None }),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
+    async fn connect_ble_inner(
+        &self,
+        ctk: CancellationToken,
+        si: SendInfo,
+    ) -> Result<(), anyhow::Error> {
+        use crate::hdl::{dial, scan_target};
         use std::time::Duration;
 
+        let selected_endpoint = si.peer_endpoint_id.ok_or_else(|| {
+            anyhow::anyhow!("The selected BLE endpoint expired; select the device again")
+        })?;
         debug!("{INNER_NAME}: BLE send to {:?}", si.name);
         let adapter = crate::bluetooth_adapter().await?;
         if !adapter.is_powered().await? {
@@ -244,11 +291,21 @@ impl TransferConnector {
                 // Give BlueZ time to wind the previous discovery/dial down --
                 // starting a new scan immediately fails with "operation
                 // already in progress".
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                tokio::select! { _ = ctk.cancelled() => anyhow::bail!("BLE connection cancelled"), _ = tokio::time::sleep(Duration::from_secs(3)) => {} }
             }
-            let targets = match scan_once(&adapter, Duration::from_secs(20), Some(&si.name)).await {
+            let targets = match scan_target(
+                &adapter,
+                Duration::from_secs(20),
+                selected_endpoint,
+                ctk.clone(),
+            )
+            .await
+            {
                 Ok(t) => t,
                 Err(e) => {
+                    if crate::lifecycle::cleanup_unconfirmed(&e) || ctk.is_cancelled() {
+                        return Err(e);
+                    }
                     warn!("{INNER_NAME}: scan round {round} failed ({e}); retrying");
                     last_err = Some(e);
                     continue;
@@ -267,7 +324,8 @@ impl TransferConnector {
                 ));
                 continue;
             };
-            match dial(&adapter, &target).await {
+            match tokio::select! { _ = ctk.cancelled() => anyhow::bail!("BLE connection cancelled"), result = dial(&adapter, &target) => result }
+            {
                 Ok(stream) => {
                     connected = Some((stream, target.rdi, target.endpoint_id));
                     break;
@@ -294,7 +352,7 @@ impl TransferConnector {
                 .ok_or_else(|| anyhow::anyhow!("File size overflow"))
         })?;
 
-        // The UI knows this transfer by `si.id` (the `ble://<name>` endpoint
+        // The UI knows this transfer by `si.id` (the `ble://<endpoint>` endpoint
         // id) -- a Disconnected report under any other id renders as a
         // detached "Unknown" card.
         let report_id = si.id.clone();

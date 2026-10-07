@@ -222,3 +222,11 @@ selected-controller retries, acknowledged readiness, short sender windows,
 receiver visibility recheck after queued admission, and terminal uncertain cleanup.
 Private BlueZ single-slot tests cover both directions without GATT recreation and
 prevent replacement after timeout. No new upstream implementation code copied.
+
+2026-10-07 local recipient scan ownership: selected-controller supervised
+recipient discovery, endpoint-ID correlation, fresh-event filtering, acknowledged
+scan turns and cancellation through shutdown. bluez-async IO lifetime follows
+sessions/signal streams to avoid leaking connections across reconstruction.
+Private-bus tests cover cache, equal names, cancellation, daemon replacement,
+uncertain cleanup and stable client count. No new upstream implementation code
+copied. See docs/acceptance/BLUETOOTH_RECIPIENT_SCANS_2026-10-07.md.

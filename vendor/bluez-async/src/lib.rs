@@ -272,6 +272,13 @@ pub struct BluetoothSession {
     connection: Arc<SyncConnection>,
     // LinuxDrop: object paths belong to one bluetoothd generation.
     owner: String,
+    _resource_lifetime: Arc<ResourceLifetime>,
+}
+struct ResourceLifetime(tokio::task::AbortHandle);
+impl Drop for ResourceLifetime {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Debug for BluetoothSession {
@@ -310,9 +317,14 @@ impl BluetoothSession {
             let err = resource.await;
             Err(SpawnError::DbusConnectionLost(err))
         });
+        let resource_lifetime = Arc::new(ResourceLifetime(dbus_handle.abort_handle()));
         Ok((
             dbus_handle.map(|res| res?),
-            BluetoothSession { connection, owner },
+            BluetoothSession {
+                connection,
+                owner,
+                _resource_lifetime: resource_lifetime,
+            },
         ))
     }
 
@@ -997,7 +1009,11 @@ impl BluetoothSession {
         for mut match_rule in BluetoothEvent::match_rules(object.cloned(), device_discovery) {
             match_rule.sender = Some(self.owner.clone().into());
             let msg_match = self.connection.add_match(match_rule).await?;
-            message_streams.push(MessageStream::new(msg_match, self.connection.clone()));
+            message_streams.push(MessageStream::new(
+                msg_match,
+                self.connection.clone(),
+                self._resource_lifetime.clone(),
+            ));
         }
         Ok(select_all(message_streams)
             .flat_map(|message| stream::iter(BluetoothEvent::message_to_events(message))))

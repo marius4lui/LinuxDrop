@@ -382,6 +382,9 @@ fn prepare_send(
     let peer = peers
         .get(peer_id)
         .context("This device is no longer nearby")?;
+    if peer.ble_addr.is_some() && peer.endpoint_id().is_none() {
+        bail!("This Bluetooth endpoint expired; select the device again");
+    }
     if files.is_empty() || files.len() > 1000 {
         bail!("Choose between 1 and 1000 files");
     }

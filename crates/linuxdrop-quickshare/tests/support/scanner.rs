@@ -12,6 +12,7 @@ pub struct State {
     pub starts: AtomicUsize,
     pub stops: AtomicUsize,
     pub hold_stop: AtomicBool,
+    pub hold_start: AtomicBool,
     pub fail_start: AtomicBool,
     pub fail_stop: AtomicBool,
     pub wake: Notify,
@@ -66,8 +67,15 @@ impl Scanner {
         _filter: std::collections::HashMap<String, zbus::zvariant::OwnedValue>,
     ) {
     }
-    fn start_discovery(&self) -> zbus::fdo::Result<()> {
+    async fn start_discovery(&self) -> zbus::fdo::Result<()> {
         self.0.starts.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let wake = self.0.wake.notified();
+            if !self.0.hold_start.load(Ordering::SeqCst) {
+                break;
+            }
+            wake.await;
+        }
         self.0.active.store(true, Ordering::SeqCst);
         if self.0.fail_start.load(Ordering::SeqCst) {
             return Err(zbus::fdo::Error::Failed(

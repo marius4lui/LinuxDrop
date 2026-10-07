@@ -32,8 +32,8 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Pin supplicant operations and journaled P2P cleanup to the original unique D-Bus owner/bus; abort owner changes and distinguish revoked leases from healthy reservations.
 - [ ] Prolonged mDNS reconfiguration/resource-bound acceptance.
 - [ ] Explicit Bluetooth controller across every scanner/advertiser/GATT/L2CAP path; cooperate with AirDrop advertisement capacity.
-- Scanner owner replacement now has [private-bus regression evidence](../acceptance/BLUETOOTH_SCANNER_OWNER_2026-10-07.md): old cleanup cannot reach a new daemon, stale starts are rejected, and explicit reconstruction works. Automatic recovery across all roles remains open.
-- The FastInit announcement scanner now has [automatic recovery](../acceptance/BLUETOOTH_SCANNER_RECOVERY_2026-10-07.md) for power, controller and daemon loss, including initial unavailability and deliberate airtime pauses. Other Bluetooth roles still need matching lifetime-safe supervision.
+- Scanner owner replacement now has [private-bus regression evidence](../acceptance/BLUETOOTH_SCANNER_OWNER_2026-10-07.md): old cleanup cannot reach a new daemon, stale starts are rejected, and explicit reconstruction works. Automatic recovery now also covers the listener, receiver, sender and recipient scanner; prolonged resource bounds and cross-protocol airtime remain open.
+- The FastInit announcement scanner now has [automatic recovery](../acceptance/BLUETOOTH_SCANNER_RECOVERY_2026-10-07.md) for power, controller and daemon loss, including initial unavailability and deliberate airtime pauses. Receiver and sender supervisors have their own lifecycle fixtures; recipient discovery and pre-connect scans now have [owned cleanup and recovery](../acceptance/BLUETOOTH_RECIPIENT_SCANS_2026-10-07.md).
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
 - [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
 - [x] Receiver-initiated dynamic role switching with advertised local identity, reserved-radio joining, consent, cancellation and encrypted channel continuity.
@@ -826,3 +826,15 @@ Final source review confirmed Google's ForBwuIntroductionAck omits the optional
 empty ACK body. Both client roles accept that event-only representation, and
 both encrypted handoff fixtures exercise it. Requiring the body would reject a
 valid Google peer; only introduction (not acknowledgment) needs its endpoint body.
+
+## Recipient scan ownership, 2026-10-07
+
+Both background recipient discovery and foreground BLE connection scans share
+acknowledged ownership with FastInit scanning. Endpoint-ID selection avoids
+same-name confusion; cache entries cannot perpetually refresh presence. Matching
+transfer cancellation reaches pre-connect scanning and preserves its terminal
+Cancelled state. Server exit drains owned scans, including listener-error exits.
+Private BlueZ fixtures cover held method replies, original-owner cleanup,
+recovery, shutdown and stable D-Bus client count. See the recipient-scan acceptance
+record. Physical interoperability and prolonged signal/resource bounds remain
+open; this does not close the overall Bluetooth/cross-protocol capacity row.
