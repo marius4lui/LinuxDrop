@@ -38,7 +38,7 @@ Details: [native UI](acceptance/UI_NATIVE_2026-10-06.md), [packaging](acceptance
 
 No physical Android, iPhone, macOS, Bluetooth or Wi-Fi adapter was available in this guest. Actual AWDL injection/channel behavior, USB unplug/recovery and Quick Share direct-Wi-Fi/BLE combinations need a suitable device matrix. Upstream compatibility claims are not LinuxDrop test results. AirDrop remains experimental and initially disabled.
 
-Also not yet validated: GNOME versions other than 46, fractional scaling and monitor hotplug, sandbox file-portal drops, a complete screen-reader traversal, booted RPM/Arch service lifecycles and Arch cross-version upgrades, exhaustive fuzzing and an independent security audit. The verified Wayland drop source was native Nautilus. These limits do not prevent the tested Ubuntu package or live local demo from running.
+Also not yet validated: GNOME versions other than 46, fractional scaling and monitor hotplug, sandbox file-portal drops, a complete screen-reader traversal, booted RPM/Arch service lifecycles, exhaustive fuzzing and an independent security audit. The verified Wayland drop source was native Nautilus. These limits do not prevent the tested Ubuntu package or live local demo from running.
 
 ## Completion scope
 

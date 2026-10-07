@@ -17,7 +17,7 @@ acceptance is separate; missing software is not a hardware limitation.
 | Hardware | Passive inventory, protected active link, AWDL lease | Systems: firmware/bands/combinations/evidence, bounded explicit diagnostic, recovery UI, reserved direct-Wi-Fi lease |
 | Daemon/IPC | JSON snapshot/revision and user service | Daemon: persisted peer preferences, history age, notification capabilities/privacy, idle close, typed shared contract, restart races |
 | File safety | Held destination descriptor, private partials, atomic no-replace | Daemon + protocols: free-space preflight, policy-driven collision handling, retained outgoing file authority |
-| Packaging | Tested Ubuntu DEB; native Fedora 44/Arch source builds and installed GTK/daemon checks, Fedora package revision upgrade | Systems: booted distro service/polkit lifecycle, Arch version upgrade, Flatpak host-client path, integration installation and license/dependency checks |
+| Packaging | Tested Ubuntu DEB; native Fedora 44/Arch source builds and installed GTK/daemon checks, Fedora/Arch package revision upgrades | Systems: booted distro service/polkit lifecycle, Flatpak host-client path, integration installation and license/dependency checks |
 | Acceptance | Baseline recorded in docs/acceptance | All: targeted regressions, new release artifacts after integration; no blanket reuse of baseline result |
 
 Focused source reviews: [UX](UX_REVIEW.md), [visual](VISUAL_REVIEW.md).

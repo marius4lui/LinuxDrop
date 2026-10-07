@@ -115,3 +115,9 @@ chooser/host-service integration, screen-reader speech and physical mixed-DPI
 acceptance remain separate software/desktop work. No new physical radio, Apple
 or Android transfer evidence is claimed. These boundaries keep the overall
 LinuxDrop completion goal open.
+
+The subsequent [GNOME 50 packaging follow-up](SHELL_50_2026-10-07.md) supersedes
+the revision-2 Fedora/revision-1 Arch artifacts above with Fedora revision 3
+and Arch revision 2. It also proves an actual Arch revision-1 to revision-2
+upgrade with retained user preferences and declares the tested 46/50 Shell
+versions. Earlier package results and hashes above remain historical evidence.
