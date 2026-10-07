@@ -275,7 +275,7 @@ async fn serve(socket: UnixStream, state: Shared) -> io::Result<()> {
                             }
                         }
                     }
-                    let joining = matches!(&request, Request::JoinP2p { .. });
+                    let joining = matches!(&request, Request::JoinP2p { .. } | Request::HostP2p { .. });
                     let response = tokio::select! {
                         result = apply(request, uid, &mut owned, &state) => result,
                         result = reader.fill_buf(), if joining => {
@@ -436,8 +436,9 @@ async fn join_p2p(
     peer_name: String,
     pin: String,
     mut frequency: u32,
-    host: bool,
+    host_auth: Option<linuxdrop_network::P2pHostAuth>,
 ) -> Result<Response, String> {
+    let host = host_auth.is_some();
     // Inventory and supplicant/DHCP I/O may take seconds. Other leased radios
     // and read-only status requests must remain serviceable throughout.
     let inv = inventory().await;
@@ -513,14 +514,23 @@ async fn join_p2p(
         cancel: cancel.clone(),
     };
     drop(state);
-    let (group, credentials) = if host {
-        let hosted =
-            linuxdrop_network::p2p::create_group(&lease.interface, frequency, cancel.clone())
-                .await
-                .map_err(|e| e.to_string())?;
+    let (group, credentials) = if let Some(auth) = host_auth {
+        let hosted = linuxdrop_network::p2p::create_group_with_auth(
+            &lease.interface,
+            frequency,
+            auth,
+            cancel.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         (
             hosted.group,
-            Some((hosted.ssid, hosted.password, hosted.frequency)),
+            Some((
+                hosted.ssid,
+                hosted.password,
+                hosted.frequency,
+                hosted.device_name,
+            )),
         )
     } else {
         let group = linuxdrop_network::p2p::connect_wps(
@@ -575,8 +585,9 @@ async fn join_p2p(
             state.pending_p2p.remove(&lease_id);
             drop(state);
             drop(operation);
-            if let Some((ssid, password, frequency)) = credentials {
+            if let Some((ssid, password, frequency, device_name)) = credentials {
                 Ok(Response::P2pHosted {
+                    device_name,
                     interface,
                     ssid,
                     password,
@@ -674,11 +685,19 @@ async fn apply(
         }
         return Ok(Response::Diagnostic { report });
     }
-    if let Request::HostP2p { lease_id } = request {
+    if let Request::HostP2p { lease_id, auth } = request {
         if !owned.contains(&lease_id) {
             return Err("lease does not belong to this connection".into());
         }
-        return join_p2p(shared, lease_id, String::new(), String::new(), 0, true).await;
+        return join_p2p(
+            shared,
+            lease_id,
+            String::new(),
+            String::new(),
+            0,
+            Some(auth),
+        )
+        .await;
     }
     if let Request::JoinP2p {
         lease_id,
@@ -690,7 +709,7 @@ async fn apply(
         if !owned.contains(&lease_id) {
             return Err("lease does not belong to this connection".into());
         }
-        return join_p2p(shared, lease_id, peer_name, pin, frequency, false).await;
+        return join_p2p(shared, lease_id, peer_name, pin, frequency, None).await;
     }
     let mut state = shared.lock().await;
     let awdl = matches!(request, Request::AcquireAwdl { .. });
@@ -2015,6 +2034,27 @@ mod tests {
     }
     #[test]
     fn protocol_rejects_unrecognized_mutations() {
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"operation":"host_p2p","lease_id":"x"}"#).unwrap(),
+            Request::HostP2p {
+                auth: linuxdrop_network::P2pHostAuth::Password,
+                ..
+            }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"operation":"host_p2p","lease_id":"x","auth":"device_name"}"#
+            )
+            .unwrap(),
+            Request::HostP2p {
+                auth: linuxdrop_network::P2pHostAuth::DeviceName,
+                ..
+            }
+        ));
+        assert!(serde_json::from_str::<Request>(
+            r#"{"operation":"host_p2p","lease_id":"x","auth":"open"}"#
+        )
+        .is_err());
         assert!(
             serde_json::from_str::<Request>(r#"{"operation":"execute","command":"rm"}"#).is_err()
         );

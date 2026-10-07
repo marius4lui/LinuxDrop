@@ -179,3 +179,11 @@ introduction ACK and preserve encrypted payload/sequence continuity. Partial
 frame reads survive competing futures; incomplete handoffs end the session.
 Isolated kernel tests include cancellation and failed-upgrade cleanup. No new
 upstream code imported; Google protocol references are in the completion log.
+
+
+2026-10-07 local device-name hosting: both bandwidth-upgrade host paths select
+negotiated password/PBC authentication through LinuxDrop's typed helper. GO
+credentials use the actual supplicant identity and omit SSID/password for
+name-based offers. Private D-Bus tests cover WPS success/failure cleanup; the
+kernel transfer fixture now exercises both host authentication modes. No new
+upstream implementation code imported; primary references are in the completion log.

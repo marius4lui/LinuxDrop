@@ -1,4 +1,4 @@
-use linuxdrop_network::{DirectWifiCapabilities, P2pConnector, P2pHosted};
+use linuxdrop_network::{DirectWifiCapabilities, P2pConnector, P2pHostAuth, P2pHosted};
 use prost::Message;
 use rqs_lib::hdl::{self, OutboundRequest};
 use rqs_lib::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
@@ -64,15 +64,17 @@ fn role_selection_respects_radio_peer_and_authentication() {
     peer.medium_role = None;
     peer.supported_wifi_direct_auth_types =
         vec![WifiDirectAuthType::WifiDirectWithDeviceName as i32];
+    for cap in [&both, &direct_only] {
+        assert_eq!(
+            hdl::host_medium_for(cap, &mediums, Some(&peer)),
+            Some(Medium::WifiDirect)
+        );
+    }
     assert_eq!(
-        hdl::host_medium_for(&both, &mediums, Some(&peer)),
-        Some(Medium::WifiHotspot)
+        hdl::host_auth_for(Some(&peer)),
+        Some(P2pHostAuth::DeviceName)
     );
-    assert_eq!(
-        hdl::host_medium_for(&direct_only, &mediums, Some(&peer)),
-        None,
-        "A device-name-only peer cannot receive a password-only offer"
-    );
+    assert_eq!(hdl::host_auth_for(None), Some(P2pHostAuth::Password));
     peer.supported_wifi_direct_auth_types = vec![999];
     assert_eq!(
         hdl::host_medium_for(&direct_only, &mediums, Some(&peer)),
@@ -91,6 +93,7 @@ impl P2pConnector for Helper {
     fn host(&self) -> BoxFuture<'_, anyhow::Result<P2pHosted>> {
         Box::pin(async {
             Ok(P2pHosted {
+                device_name: None,
                 interface: "testp2p0".into(),
                 ssid: "DIRECT-from-supplicant".into(),
                 password: "test-password".into(),
@@ -98,6 +101,14 @@ impl P2pConnector for Helper {
                 ipv4_address: "192.168.49.1".parse().unwrap(),
                 ipv6_address: Some("fe80::1234".parse().unwrap()),
             })
+        })
+    }
+    fn host_with_auth(&self, auth: P2pHostAuth) -> BoxFuture<'_, anyhow::Result<P2pHosted>> {
+        Box::pin(async move {
+            let mut hosted = self.host().await?;
+            hosted.device_name =
+                (auth == P2pHostAuth::DeviceName).then(|| "Actual supplicant name".into());
+            Ok(hosted)
         })
     }
     fn connect(
@@ -210,6 +221,24 @@ async fn connection_request_and_owned_group_offer_use_actual_capabilities() {
     drop(guard);
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         while releases.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let guard = hdl::start_direct_group_with_auth(P2pHostAuth::DeviceName)
+        .await
+        .unwrap();
+    let offer = guard.offer(61812, vec![], Medium::WifiDirect).unwrap();
+    let credentials = offer.wifi_direct_credentials.unwrap();
+    assert_eq!(credentials.device_name(), "Actual supplicant name");
+    assert!(
+        credentials.ssid.is_none() && credentials.password.is_none() && credentials.pin.is_none()
+    );
+    assert_eq!(hdl::direct_candidates(&credentials).unwrap().len(), 1);
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while releases.load(Ordering::SeqCst) < 2 {
             tokio::task::yield_now().await;
         }
     })

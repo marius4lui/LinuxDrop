@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -1270,7 +1271,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                     });
                     #[cfg(all(feature = "experimental", target_os = "linux"))]
                     if let Some(medium) = selected {
-                        return self.host_wifi_upgrade(medium == UpMedium::WifiDirect).await;
+                        let auth = if medium == UpMedium::WifiDirect {
+                            Some(
+                                crate::hdl::host_auth_for(
+                                    request.and_then(|r| r.medium_meta_data.as_ref()),
+                                )
+                                .context("Missing P2P authentication intersection")?,
+                            )
+                        } else {
+                            None
+                        };
+                        return self.host_wifi_upgrade(auth).await;
                     } else {
                         // A role switch cannot invent a medium the peer did not
                         // request or a host role our reserved radio cannot perform.
@@ -1414,19 +1425,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
     /// swap the socket. Mirror of Quick Share for Windows when sender and
     /// receiver share no LAN. The hotspot lives until the transfer ends.
     #[cfg(all(feature = "experimental", target_os = "linux"))]
-    async fn host_wifi_upgrade(&mut self, wifi_direct: bool) -> Result<bool, anyhow::Error> {
+    async fn host_wifi_upgrade(
+        &mut self,
+        auth: Option<linuxdrop_network::P2pHostAuth>,
+    ) -> Result<bool, anyhow::Error> {
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium as UpMedium;
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
             EventType, UpgradePathInfo,
         };
 
-        let medium = if wifi_direct {
+        let medium = if auth.is_some() {
             UpMedium::WifiDirect
         } else {
             UpMedium::WifiHotspot
         };
-        let hosted = if wifi_direct {
-            crate::hdl::start_direct_group().await
+        let hosted = if let Some(auth) = auth {
+            crate::hdl::start_direct_group_with_auth(auth).await
         } else {
             crate::hdl::start_hotspot().await
         };

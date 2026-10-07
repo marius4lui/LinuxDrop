@@ -6,6 +6,8 @@ pub const SOCKET_PATH: &str = "/run/linuxdrop/netd.sock";
 pub enum Request {
     HostP2p {
         lease_id: String,
+        #[serde(default)]
+        auth: linuxdrop_network::P2pHostAuth,
     },
     CancelP2p {
         lease_id: String,
@@ -96,6 +98,8 @@ pub struct RecoveryIssue {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     P2pHosted {
+        #[serde(default)]
+        device_name: Option<String>,
         interface: String,
         ssid: String,
         password: String,

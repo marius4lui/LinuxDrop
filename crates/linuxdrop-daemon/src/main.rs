@@ -330,14 +330,22 @@ impl HelperP2p {
 }
 impl linuxdrop_network::P2pConnector for HelperP2p {
     fn host(&self) -> futures_util::future::BoxFuture<'_, Result<linuxdrop_network::P2pHosted>> {
+        self.host_with_auth(linuxdrop_network::P2pHostAuth::Password)
+    }
+    fn host_with_auth(
+        &self,
+        auth: linuxdrop_network::P2pHostAuth,
+    ) -> futures_util::future::BoxFuture<'_, Result<linuxdrop_network::P2pHosted>> {
         Box::pin(async move {
             match self
                 .request(linuxdrop_netd::Request::HostP2p {
+                    auth,
                     lease_id: self.lease_id.clone(),
                 })
                 .await?
             {
                 linuxdrop_netd::Response::P2pHosted {
+                    device_name,
                     interface,
                     ssid,
                     password,
@@ -345,6 +353,7 @@ impl linuxdrop_network::P2pConnector for HelperP2p {
                     ipv4_address,
                     ipv6_address,
                 } => Ok(linuxdrop_network::P2pHosted {
+                    device_name,
                     interface,
                     ssid,
                     password,

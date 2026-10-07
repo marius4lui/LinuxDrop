@@ -35,11 +35,11 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Selected destination/files/collision policy; the UI explains that only publication is selective for bundle-based protocols.
 - [x] Payload bandwidth limit shared with all other backends and download offers; waits preserve cancellation and do not delay consent metadata.
 - [x] Receiver-initiated dynamic role switching with advertised local identity, reserved-radio joining, consent, cancellation and encrypted channel continuity.
-- [ ] WPS PIN/device-name Wi-Fi Direct authentication path, P2P group discovery and negotiated group connection.
+- [x] Device-name/PBC Wi-Fi Direct hosting and joining, optional eight-digit PIN joining, P2P discovery and negotiated group connection (software/isolated fixtures).
 - [x] Exclusive hardware lease and transfer semaphore for radio-changing upgrades, unique owned NetworkManager profiles and cancellation cleanup; isolated D-Bus lifecycle test passed.
 - [ ] Protocol metadata and upgrade failure regression tests beyond existing TCP handshake simulator.
 
-Google's wire schema distinguishes password-based joining from device-name discovery. `device_name` is field 9; field 8 is an optional PIN reserved for future use with the device-name mode, not a requirement that every such offer includes a PIN. The engine now decodes these fields and routes empty-SSID offers through the reserved supplicant helper, with PBC for an empty PIN. Discovery, group identity, cancellation, DHCP and cleanup paths exist. Password-based group hosting, capability-based role advertisement and IPv6/address-candidate paths are now implemented and have scoped simulation evidence below. Remaining work includes device-name-authenticated hosting and full peer interoperability. Receiver-as-client dynamic role switching and supplicant owner-change handling have scoped implementation and simulation evidence below. Password-based joining and an ordinary NetworkManager AP are not labelled complete Wi-Fi Direct conformance.
+Google's wire schema distinguishes password-based joining from device-name discovery. `device_name` is field 9; field 8 is an optional PIN reserved for future use with the device-name mode, not a requirement that every such offer includes a PIN. The engine now decodes these fields and routes empty-SSID offers through the reserved supplicant helper, with PBC for an empty PIN. Discovery, group identity, cancellation, DHCP and cleanup paths exist. Password-based group hosting, capability-based role advertisement and IPv6/address-candidate paths are now implemented and have scoped simulation evidence below. Device-name/PBC hosting now follows peer authentication capabilities and uses the existing supplicant identity. Full physical peer interoperability remains unverified. Receiver-as-client dynamic role switching and supplicant owner-change handling have scoped implementation and simulation evidence below. Password-based joining and an ordinary NetworkManager AP are not labelled complete Wi-Fi Direct conformance.
 
 ## AirDrop / AWDL
 
@@ -739,3 +739,38 @@ Final review also covers consent overlapping an ordinary LAN handoff: acceptance
 is retained and sent after the new transport is selected, while rejection keeps
 its distinct terminal state and protocol response. Two focused regressions cover
 these decisions; they are included in the unit count above.
+
+
+## Device-name / WPS group hosting, 2026-10-07
+
+Both sending and receiving host paths now negotiate password or device-name
+Wi-Fi Direct authentication. Legacy peers retain password defaults; an explicit
+unknown-only authentication list is refused. A device-name-only peer receives
+the actual supplicant name, group frequency, bound IPv4/IPv6 endpoint and no SSID,
+password or invented PIN. The helper request carries a typed authentication mode;
+older requests default to password and unknown modes fail decoding.
+
+On the exclusively leased group, LinuxDrop reads the parent's P2PDeviceConfig
+and checks the new GO's WPS DeviceName matches. It never rewrites the shared
+parent identity. Missing, invalid or mismatched names fail and clean up the new
+group. WPS.Start (Role=registrar, Type=pbc) is sent only to the pinned unique
+owner's newly created GO interface, after role/PHY/channel/credentials validation.
+Group disconnect removes its WPS registrar together with the owned interface.
+Socket EOF now cancels pending HostP2p as well as JoinP2p. File consent and the
+existing encrypted Nearby session remain required; Wi-Fi identity is routing
+metadata, not a trust decision.
+
+The AP/GO dispatch is verified against the primary
+[supplicant WPS handler](https://android.googlesource.com/platform/external/wpa_supplicant_8/+/refs/heads/main/wpa_supplicant/dbus/dbus_new_handlers_wps.c)
+and [D-Bus API](https://w1.fi/wpa_supplicant/devel/dbus.html).
+No upstream implementation code was copied. Device-name mode uses PBC; field 8's
+future PIN extension does not require LinuxDrop to invent a PIN hosting variant.
+Existing eight-digit PIN client offers remain accepted.
+
+Validation: private D-Bus fixtures cover password without WPS, successful GO PBC,
+WPS rejection, changed/empty device names, group cleanup, cancellation and service
+owner replacement. Both private kernel channel migration cases pass; the hosting
+case now runs password and device-name peers, checks the offered fields and
+continues encrypted TCP sequence state. The client case retains its seven
+success/failure scenarios. These checks use a simulated supplicant/helper and
+real D-Bus/TCP/kernel isolation; they do not certify a physical WPS handshake.

@@ -14,6 +14,10 @@ struct State {
     delay: bool,
     existing: bool,
     wrong_channel: bool,
+    wps_started: usize,
+    wps_reject: bool,
+    name_changed: bool,
+    name_empty: bool,
 }
 type Shared = Arc<Mutex<State>>;
 fn path(value: &str) -> OwnedObjectPath {
@@ -67,6 +71,32 @@ impl Details {
         }
     }
 }
+struct Wps(Shared);
+#[zbus::interface(name = "fi.w1.wpa_supplicant1.Interface.WPS")]
+impl Wps {
+    #[zbus(property)]
+    fn device_name(&self) -> &str {
+        if self.0.lock().unwrap().name_changed {
+            "Changed"
+        } else {
+            "Existing LinuxDrop radio"
+        }
+    }
+    fn start(
+        &self,
+        args: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<HashMap<String, OwnedValue>> {
+        assert_eq!(args.len(), 2);
+        assert_eq!(<&str>::try_from(&args["Role"]).unwrap(), "registrar");
+        assert_eq!(<&str>::try_from(&args["Type"]).unwrap(), "pbc");
+        let mut state = self.0.lock().unwrap();
+        state.wps_started += 1;
+        if state.wps_reject {
+            return Err(zbus::fdo::Error::Failed("PBC rejected".into()));
+        }
+        Ok(HashMap::new())
+    }
+}
 struct Device {
     state: Shared,
     parent: bool,
@@ -86,6 +116,17 @@ async fn started(bus: &Connection) {
 }
 #[zbus::interface(name = "fi.w1.wpa_supplicant1.Interface.P2PDevice")]
 impl Device {
+    #[zbus(property, name = "P2PDeviceConfig")]
+    fn config(&self) -> HashMap<String, Value<'_>> {
+        let name = if self.state.lock().unwrap().name_empty {
+            ""
+        } else {
+            "Existing LinuxDrop radio"
+        };
+        [("DeviceName".into(), Value::from(name))]
+            .into_iter()
+            .collect()
+    }
     #[zbus(property)]
     fn group(&self) -> OwnedObjectPath {
         path(if self.parent { "/" } else { GROUP })
@@ -171,6 +212,8 @@ async fn serve(state: Shared, added: Arc<tokio::sync::Notify>) -> Connection {
                 added: added.clone(),
             },
         )
+        .unwrap()
+        .serve_at(VIF, Wps(state.clone()))
         .unwrap()
         .serve_at(VIF, Interface)
         .unwrap()
@@ -387,4 +430,64 @@ async fn autonomous_group_credentials_cleanup_and_cancellation_race() {
         1,
         "a dead old owner must not redirect cleanup to the replacement"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly isolated dbus-run-session"]
+async fn device_name_host_uses_owned_go_and_cleans_up_failed_wps() {
+    assert_eq!(
+        std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+        Ok("1")
+    );
+    let state = Shared::default();
+    let service = serve(state.clone(), Arc::new(tokio::sync::Notify::new())).await;
+    let connection = Connection::session().await.unwrap();
+    let group = create_group_inner(
+        connection.clone(),
+        "testwifi0",
+        5180,
+        CancellationToken::new(),
+        verify,
+    )
+    .await
+    .unwrap();
+    assert!(group.device_name.is_none());
+    assert_eq!(state.lock().unwrap().wps_started, 0);
+    drop(group);
+    wait_disconnect(&state, 1).await;
+    for case in ["ok", "rejected", "changed", "empty"] {
+        {
+            let mut state = state.lock().unwrap();
+            state.wps_reject = case == "rejected";
+            state.name_changed = case == "changed";
+            state.name_empty = case == "empty";
+        }
+        let before = state.lock().unwrap().disconnected;
+        let result = create_group_authenticated(
+            connection.clone(),
+            "testwifi0",
+            5180,
+            crate::P2pHostAuth::DeviceName,
+            CancellationToken::new(),
+            verify,
+        )
+        .await;
+        if case == "ok" {
+            let hosted = result.unwrap();
+            assert_eq!(
+                hosted.device_name.as_deref(),
+                Some("Existing LinuxDrop radio")
+            );
+            assert_eq!(
+                hosted.group.identity.service_owner,
+                service.unique_name().unwrap().as_str()
+            );
+            drop(hosted);
+        } else {
+            assert!(result.is_err(), "{case}");
+        }
+        wait_disconnect(&state, before + 1).await;
+    }
+    // Invalid/changing names never start WPS, and no shared identity is written.
+    assert_eq!(state.lock().unwrap().wps_started, 2);
 }

@@ -4,7 +4,7 @@ use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upg
 use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
     ClientIntroduction, EventType,
 };
-use linuxdrop_network::{DirectWifiCapabilities, P2pConnector, P2pHosted};
+use linuxdrop_network::{DirectWifiCapabilities, P2pConnector, P2pHostAuth, P2pHosted};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -15,6 +15,7 @@ impl P2pConnector for Helper {
     fn host(&self) -> BoxFuture<'_, anyhow::Result<P2pHosted>> {
         Box::pin(async {
             Ok(P2pHosted {
+                device_name: None,
                 interface: "ld-bwu0".into(),
                 ssid: "DIRECT-kernel-fixture".into(),
                 password: "test-password".into(),
@@ -22,6 +23,14 @@ impl P2pConnector for Helper {
                 ipv4_address: "192.0.2.1".parse().unwrap(),
                 ipv6_address: Some("fe80::1234".parse().unwrap()),
             })
+        })
+    }
+    fn host_with_auth(&self, auth: P2pHostAuth) -> BoxFuture<'_, anyhow::Result<P2pHosted>> {
+        Box::pin(async move {
+            let mut hosted = self.host().await?;
+            hosted.device_name =
+                (auth == P2pHostAuth::DeviceName).then(|| "Kernel fixture GO".into());
+            Ok(hosted)
         })
     }
     fn connect(
@@ -63,6 +72,11 @@ fn keys(request: &mut InboundRequest<MigratableStream>, sender: u8, receiver: u8
 #[tokio::test]
 #[ignore = "requires run-direct-upgrade.sh private kernel network namespace"]
 async fn receiver_hosts_direct_group_and_preserves_encrypted_channel_state() {
+    for auth in [P2pHostAuth::Password, P2pHostAuth::DeviceName] {
+        receiver_hosts_group(auth).await;
+    }
+}
+async fn receiver_hosts_group(auth: P2pHostAuth) {
     fixture_network().await;
     // The ordinary LAN policy excludes this fixture radio; the reserved-radio
     // listener must independently bind it, as it does for a real group VIF.
@@ -113,7 +127,8 @@ async fn receiver_hosts_direct_group_and_preserves_encrypted_channel_state() {
                 mediums: vec![Medium::WifiDirect as i32],
                 medium_metadata: Some(crate::hdl::metadata_for(
                     &DirectWifiCapabilities {
-                        station: true,
+                        station: auth == P2pHostAuth::Password,
+                        p2p_client: auth == P2pHostAuth::DeviceName,
                         ..Default::default()
                     },
                     None,
@@ -144,7 +159,20 @@ async fn receiver_hosts_direct_group_and_preserves_encrypted_channel_state() {
         assert_eq!(offered.medium(), Medium::WifiDirect);
         assert!(offered.wifi_hotspot_credentials.is_none());
         let credentials = offered.wifi_direct_credentials.unwrap();
-        assert_eq!(credentials.ssid(), "DIRECT-kernel-fixture");
+        match auth {
+            P2pHostAuth::Password => {
+                assert_eq!(credentials.ssid(), "DIRECT-kernel-fixture");
+                assert!(credentials.device_name.is_none());
+            }
+            P2pHostAuth::DeviceName => {
+                assert_eq!(credentials.device_name(), "Kernel fixture GO");
+                assert!(
+                    credentials.ssid.is_none()
+                        && credentials.password.is_none()
+                        && credentials.pin.is_none()
+                );
+            }
+        }
         assert_eq!(credentials.frequency(), 2437);
         assert_eq!(credentials.ip_v6_address().len(), 16);
         stage = "TCP connect";

@@ -315,6 +315,7 @@ async fn connect_on(
 /// Credentials come from the running group; they are never persisted in the
 /// lease journal or supplied in process arguments. Debug deliberately redacts them.
 pub struct HostedGroup {
+    pub device_name: Option<String>,
     pub group: Group,
     pub ssid: String,
     pub password: String,
@@ -334,6 +335,15 @@ pub async fn create_group(
     frequency: u32,
     cancel: CancellationToken,
 ) -> Result<HostedGroup> {
+    create_group_with_auth(interface, frequency, crate::P2pHostAuth::Password, cancel).await
+}
+
+pub async fn create_group_with_auth(
+    interface: &str,
+    frequency: u32,
+    auth: crate::P2pHostAuth,
+    cancel: CancellationToken,
+) -> Result<HostedGroup> {
     validate(interface, "LinuxDrop", "", frequency)?;
     anyhow::ensure!(
         frequency != 0,
@@ -345,7 +355,8 @@ pub async fn create_group(
     tokio::spawn(async move {
         let result = async {
             let connection = Connection::system().await?;
-            create_group_inner(connection, &interface, frequency, cancel, verify_phy).await
+            create_group_authenticated(connection, &interface, frequency, auth, cancel, verify_phy)
+                .await
         }
         .await;
         let _ = sender.send(result);
@@ -355,10 +366,30 @@ pub async fn create_group(
     result
 }
 
+#[cfg(test)]
 async fn create_group_inner(
     connection: Connection,
     interface: &str,
     frequency: u32,
+    cancel: CancellationToken,
+    verify: fn(&GroupIdentity) -> Result<()>,
+) -> Result<HostedGroup> {
+    create_group_authenticated(
+        connection,
+        interface,
+        frequency,
+        crate::P2pHostAuth::Password,
+        cancel,
+        verify,
+    )
+    .await
+}
+
+async fn create_group_authenticated(
+    connection: Connection,
+    interface: &str,
+    frequency: u32,
+    auth: crate::P2pHostAuth,
     cancel: CancellationToken,
     verify: fn(&GroupIdentity) -> Result<()>,
 ) -> Result<HostedGroup> {
@@ -444,7 +475,43 @@ async fn create_group_inner(
             (8..=63).contains(&password.len()) && password.bytes().all(|b| (32..=126).contains(&b)),
             "Invalid P2P group passphrase"
         );
+        let device_name = if auth == crate::P2pHostAuth::DeviceName {
+            // Use the existing P2P identity: never rewrite shared parent config.
+            let mut config: HashMap<String, OwnedValue> =
+                device.get_property("P2PDeviceConfig").await?;
+            let name = String::try_from(
+                config
+                    .remove("DeviceName")
+                    .context("Supplicant has no P2P device name")?,
+            )?;
+            validate(interface, &name, "", frequency)?;
+            let wps = Proxy::new(
+                &connection,
+                destination.as_str(),
+                group.identity.interface_object.as_str(),
+                "fi.w1.wpa_supplicant1.Interface.WPS",
+            )
+            .await?;
+            let group_name: String = wps.get_property("DeviceName").await?;
+            anyhow::ensure!(
+                group_name == name,
+                "P2P group device name changed during creation"
+            );
+            // On an AP/GO, supplicant dispatches Type=pbc to its AP registrar.
+            // Do not invoke Start on the parent, where it would enroll a station.
+            let args: HashMap<&str, Value<'_>> = [
+                ("Role", Value::from("registrar")),
+                ("Type", Value::from("pbc")),
+            ]
+            .into_iter()
+            .collect();
+            let _: HashMap<String, OwnedValue> = wps.call("Start", &(args,)).await?;
+            Some(name)
+        } else {
+            None
+        };
         Ok::<_, anyhow::Error>(HostedGroup {
+            device_name,
             group,
             ssid,
             password,

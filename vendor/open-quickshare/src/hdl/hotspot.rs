@@ -44,6 +44,7 @@ pub fn upgrade_capabilities() -> linuxdrop_network::DirectWifiCapabilities {
 pub const HOTSPOT_TCP_PORT: u16 = 61812;
 
 pub struct HotspotGuard {
+    pub device_name: Option<String>,
     pub ssid: String,
     pub password: String,
     pub gateway: Ipv4Addr,
@@ -143,6 +144,11 @@ pub async fn join_p2p(peer_name: &str, pin: &str, frequency: u32) -> anyhow::Res
 /// Create an autonomous P2P group on the reserved radio. Keep the permit and
 /// cleanup guard alive from before the first await through transfer completion.
 pub async fn start_direct_group() -> anyhow::Result<HotspotGuard> {
+    start_direct_group_with_auth(linuxdrop_network::P2pHostAuth::Password).await
+}
+pub async fn start_direct_group_with_auth(
+    auth: linuxdrop_network::P2pHostAuth,
+) -> anyhow::Result<HotspotGuard> {
     anyhow::ensure!(
         upgrade_capabilities().p2p_group_owner,
         "Reserved adapter cannot host a P2P group"
@@ -160,9 +166,23 @@ pub async fn start_direct_group() -> anyhow::Result<HotspotGuard> {
         _network: None,
         p2p: Some((connector.clone(), permit)),
     };
-    let hosted = connector.host().await?;
+    let hosted = connector.host_with_auth(auth).await?;
+    anyhow::ensure!(
+        match auth {
+            linuxdrop_network::P2pHostAuth::Password => hosted.device_name.is_none(),
+            linuxdrop_network::P2pHostAuth::DeviceName =>
+                hosted
+                    .device_name
+                    .as_ref()
+                    .is_some_and(|name| !name.is_empty()
+                        && name.len() <= 128
+                        && !name.chars().any(char::is_control)),
+        },
+        "Helper returned a different P2P authentication mode"
+    );
     ownership.interface = hosted.interface.clone();
     Ok(HotspotGuard {
+        device_name: hosted.device_name,
         ssid: hosted.ssid,
         password: hosted.password,
         gateway: hosted.ipv4_address,
@@ -191,6 +211,7 @@ pub async fn start_hotspot() -> anyhow::Result<HotspotGuard> {
     };
     let network = nm::connect(lease, ssid.clone(), password.clone(), true, exclusive()).await?;
     Ok(HotspotGuard {
+        device_name: None,
         ssid,
         password,
         gateway: network
@@ -259,8 +280,9 @@ impl HotspotGuard {
         match medium {
             Medium::WifiDirect if self._p2p.is_some() => {
                 info.wifi_direct_credentials = Some(WifiDirectCredentials {
-                    ssid: Some(self.ssid.clone()),
-                    password: Some(self.password.clone()),
+                    device_name: self.device_name.clone(),
+                    ssid: self.device_name.is_none().then(|| self.ssid.clone()),
+                    password: self.device_name.is_none().then(|| self.password.clone()),
                     port: Some(port.into()),
                     frequency: Some(self.frequency),
                     gateway: Some(self.gateway.to_string()),

@@ -17,7 +17,17 @@ pub struct P2pConnection {
     pub ipv4_address: Option<Ipv4Addr>,
     pub ipv6_address: Option<Ipv6Addr>,
 }
+/// Negotiated Wi-Fi Direct authentication. DeviceName uses WPS push-button
+/// enrollment; its wire PIN is reserved by Nearby and intentionally omitted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum P2pHostAuth {
+    #[default]
+    Password,
+    DeviceName,
+}
 pub struct P2pHosted {
+    pub device_name: Option<String>,
     pub interface: String,
     pub ssid: String,
     pub password: String,
@@ -27,6 +37,18 @@ pub struct P2pHosted {
 }
 pub trait P2pConnector: Send + Sync {
     fn host(&self) -> futures_util::future::BoxFuture<'_, Result<P2pHosted>>;
+    fn host_with_auth(
+        &self,
+        auth: P2pHostAuth,
+    ) -> futures_util::future::BoxFuture<'_, Result<P2pHosted>> {
+        Box::pin(async move {
+            anyhow::ensure!(
+                auth == P2pHostAuth::Password,
+                "Helper cannot host WPS groups"
+            );
+            self.host().await
+        })
+    }
     fn connect(
         &self,
         peer_name: String,

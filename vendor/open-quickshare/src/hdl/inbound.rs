@@ -2275,7 +2275,11 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             return self.request_peer_upgrade().await;
         };
         let hosted = if medium == UpMedium::WifiDirect {
-            crate::hdl::start_direct_group().await
+            crate::hdl::start_direct_group_with_auth(
+                crate::hdl::host_auth_for(self.remote_metadata.as_ref())
+                    .context("Missing P2P authentication intersection")?,
+            )
+            .await
         } else {
             crate::hdl::start_hotspot().await
         };
