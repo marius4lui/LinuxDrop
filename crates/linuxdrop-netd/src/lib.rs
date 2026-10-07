@@ -92,7 +92,9 @@ pub struct RecoveryIssue {
 pub enum Response {
     P2pJoined {
         interface: String,
-        ipv4_address: String,
+        ipv4_address: Option<std::net::Ipv4Addr>,
+        #[serde(default)]
+        ipv6_address: Option<std::net::Ipv6Addr>,
     },
     Diagnostic {
         report: DiagnosticReport,

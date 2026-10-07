@@ -139,6 +139,15 @@ pub async fn run() -> io::Result<()> {
                     .children
                     .get_mut(&lease.id)
                     .is_some_and(|child| !matches!(child.try_wait(), Ok(None)));
+                // DHCP is optional on a group with an assigned IPv6 link-local
+                // address. Its exit must not tear down an active IPv6 transfer.
+                let ipv6_survives = dead
+                    && lease.p2p_group.is_some()
+                    && p2p_addresses(&lease).await.is_ok_and(|a| a.ipv6.is_some());
+                if ipv6_survives {
+                    state.children.remove(&lease.id);
+                }
+                let dead = dead && !ipv6_survives;
                 let radio_gone = !inventory.radios.iter().any(|r| r.phy == lease.phy);
                 let regulatory_change = inventory
                     .radios
@@ -473,22 +482,25 @@ async fn join_p2p(
     persist(&state).map_err(|e| e.to_string())?;
     group.into_journaled();
     drop(state);
-    let dhcp = tokio::select! {
-        result = start_p2p_dhcp(&lease) => result,
+    let network = tokio::select! {
+        result = start_p2p_network(&lease) => result,
         _ = cancel.cancelled() => Err("P2P radio lease ended during address acquisition".into()),
     };
     let mut state = shared.lock().await;
     let lease_exists = state.leases.contains_key(&lease_id);
     let still_owned = lease_exists && !cancel.is_cancelled();
-    match dhcp {
-        Ok((child, address)) if still_owned => {
-            state.children.insert(lease_id.clone(), child);
+    match network {
+        Ok((child, addresses)) if still_owned => {
+            if let Some(child) = child {
+                state.children.insert(lease_id.clone(), child);
+            }
             state.pending_p2p.remove(&lease_id);
             drop(state);
             drop(operation);
             Ok(Response::P2pJoined {
                 interface,
-                ipv4_address: address,
+                ipv4_address: addresses.ipv4,
+                ipv6_address: addresses.ipv6,
             })
         }
         result => {
@@ -1076,18 +1088,103 @@ async fn restore_p2p(lease: &Lease) -> Result<(), String> {
     Ok(())
 }
 
-async fn start_p2p_dhcp(lease: &Lease) -> Result<(tokio::process::Child, String), String> {
+#[derive(Debug, Default, PartialEq)]
+struct P2pAddresses {
+    ipv4: Option<std::net::Ipv4Addr>,
+    ipv6: Option<std::net::Ipv6Addr>,
+}
+
+fn parse_p2p_addresses(
+    bytes: &[u8],
+    interface: &str,
+    lease_id: &str,
+) -> Result<P2pAddresses, String> {
+    let links: Vec<serde_json::Value> = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let link = links
+        .iter()
+        .find(|link| link["ifname"] == interface)
+        .ok_or("P2P group interface disappeared")?;
+    if link["ifalias"] != format!("linuxdrop:p2p:{lease_id}") {
+        return Err("P2P interface ownership changed".into());
+    }
+    let mut addresses = P2pAddresses::default();
+    if !link["flags"]
+        .as_array()
+        .is_some_and(|flags| flags.iter().any(|f| f == "UP"))
+    {
+        return Ok(addresses);
+    }
+    for address in link["addr_info"].as_array().into_iter().flatten() {
+        // Do not report an IPv6 address until duplicate-address detection has
+        // finished. Expired and failed addresses cannot make a group ready.
+        if address["tentative"] == true
+            || address["dadfailed"] == true
+            || address["valid_life_time"] == 0
+        {
+            continue;
+        }
+        let Some(local) = address["local"].as_str() else {
+            continue;
+        };
+        match local.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip))
+                if address["family"] == "inet"
+                    && !ip.is_unspecified()
+                    && !ip.is_loopback()
+                    && !ip.is_multicast()
+                    && !ip.is_broadcast() =>
+            {
+                addresses.ipv4 = Some(ip)
+            }
+            Ok(std::net::IpAddr::V6(ip))
+                if address["family"] == "inet6" && ip.is_unicast_link_local() =>
+            {
+                addresses.ipv6 = Some(ip)
+            }
+            _ => {}
+        }
+    }
+    Ok(addresses)
+}
+
+async fn p2p_addresses(lease: &Lease) -> Result<P2pAddresses, String> {
     let group = lease.p2p_group.as_ref().ok_or("P2P group missing")?;
+    let output = timeout(
+        Duration::from_secs(2),
+        Command::new("/usr/sbin/ip")
+            .args(["-d", "-j", "address", "show", "dev", &group.interface])
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin")
+            .env("LC_ALL", "C")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| "P2P address inspection timed out")?
+    .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err("P2P address inspection failed".into());
+    }
+    parse_p2p_addresses(&output.stdout, &group.interface, &lease.id)
+}
+
+async fn start_p2p_network(
+    lease: &Lease,
+) -> Result<(Option<tokio::process::Child>, P2pAddresses), String> {
+    let group = lease.p2p_group.as_ref().ok_or("P2P group missing")?;
+    // Verify ownership before starting any DHCP traffic on this interface.
+    let mut addresses = p2p_addresses(lease).await?;
     let result_path = format!("/run/linuxdrop/{}.ipv4.json", lease.id);
     let _ = std::fs::remove_file(&result_path);
     let mut child = Command::new("/usr/bin/busybox")
         .args([
             "udhcpc",
             "-f",
-            "-n",
             "-t",
             "3",
             "-T",
+            "3",
+            "-A",
             "3",
             "-i",
             &group.interface,
@@ -1102,34 +1199,28 @@ async fn start_p2p_dhcp(lease: &Lease) -> Result<(tokio::process::Child, String)
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .map_err(|e| e.to_string())?;
+        .ok();
+    // Keep renewing/acquiring IPv4 while the lease is owned, but never require
+    // DHCP when the newly created, ownership-marked group already has IPv6.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
-        if let Ok(bytes) = tokio::fs::read(&result_path).await {
-            let value: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            let address = value["ipv4_address"]
-                .as_str()
-                .ok_or("DHCP address missing")?;
-            let parsed: std::net::Ipv4Addr = address.parse().map_err(|_| "DHCP address invalid")?;
-            if value["interface"] != group.interface
-                || parsed.is_unspecified()
-                || parsed.is_loopback()
-                || parsed.is_multicast()
-            {
-                return Err("DHCP result does not match the leased group".into());
-            }
-            return Ok((child, address.into()));
+        if child
+            .as_mut()
+            .is_some_and(|child| !matches!(child.try_wait(), Ok(None)))
+        {
+            child = None;
         }
-        if !matches!(child.try_wait(), Ok(None)) {
-            return Err("P2P DHCP client stopped before receiving an address".into());
+        if addresses.ipv6.is_some() || (addresses.ipv4.is_some() && child.is_some()) {
+            return Ok((child, addresses));
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("P2P DHCP timed out".into());
+            return Err("P2P group received neither usable IPv4 nor IPv6".into());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        addresses = p2p_addresses(lease).await?;
     }
 }
+
 fn persist(state: &State) -> io::Result<()> {
     use std::io::Write;
     let data = serde_json::to_vec(&state.leases.values().collect::<Vec<_>>())?;
@@ -1337,6 +1428,135 @@ mod tests {
             Ok(Response::State { .. })
         ));
     }
+    #[test]
+    fn p2p_readiness_requires_owned_usable_addresses() {
+        let mut link = serde_json::json!([{
+            "ifname": "p2p-test0", "ifalias": "linuxdrop:p2p:owned", "flags": ["UP"],
+            "addr_info": [{"family":"inet6", "local":"fe80::1234", "tentative": true}]
+        }]);
+        let parse = |v: &serde_json::Value| {
+            parse_p2p_addresses(&serde_json::to_vec(v).unwrap(), "p2p-test0", "owned")
+        };
+        assert_eq!(parse(&link).unwrap(), P2pAddresses::default());
+        link[0]["addr_info"][0]["tentative"] = false.into();
+        assert_eq!(
+            parse(&link).unwrap().ipv6,
+            Some("fe80::1234".parse().unwrap())
+        );
+        for flag in ["dadfailed", "tentative"] {
+            link[0]["addr_info"][0][flag] = true.into();
+            assert!(parse(&link).unwrap().ipv6.is_none());
+            link[0]["addr_info"][0][flag] = false.into();
+        }
+        link[0]["addr_info"][0]["valid_life_time"] = 0.into();
+        assert!(parse(&link).unwrap().ipv6.is_none());
+        link[0]["addr_info"][0]["valid_life_time"] = 100.into();
+        link[0]["flags"] = serde_json::json!([]);
+        assert_eq!(parse(&link).unwrap(), P2pAddresses::default());
+        link[0]["flags"] = serde_json::json!(["UP"]);
+        link[0]["addr_info"] = serde_json::json!([
+            {"family":"inet", "local":"255.255.255.255"},
+            {"family":"inet", "local":"127.0.0.1"},
+            {"family":"inet6", "local":"ff02::1"},
+            {"family":"inet6", "local":"fd00::1"}
+        ]);
+        assert_eq!(parse(&link).unwrap(), P2pAddresses::default());
+        link[0]["addr_info"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"family":"inet","local":"192.168.49.2"}));
+        assert_eq!(
+            parse(&link).unwrap().ipv4,
+            Some("192.168.49.2".parse().unwrap())
+        );
+        link[0]["ifalias"] = "somebody-else".into();
+        assert!(parse(&link).is_err());
+        link[0]["ifname"] = "other0".into();
+        assert!(parse(&link).is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a private network namespace; use run-p2p-addresses.sh"]
+    async fn ipv6_only_p2p_group_is_ready_without_dhcp() {
+        assert_eq!(
+            std::env::var("LINUXDROP_TEST_PRIVATE_P2P").as_deref(),
+            Ok("1")
+        );
+        assert_ne!(
+            std::fs::read_link("/proc/self/ns/net").unwrap(),
+            std::fs::read_link("/proc/1/ns/net").unwrap()
+        );
+        let mut lease = direct_lease();
+        lease.id = uuid::Uuid::new_v4().simple().to_string();
+        let interface = "ld-p2p0";
+        lease.p2p_group = Some(linuxdrop_network::p2p::GroupIdentity {
+            interface: interface.into(),
+            interface_object: "/test".into(),
+            group_object: "/group".into(),
+            parent_interface: "wlan2".into(),
+            peer_object: "/peer".into(),
+        });
+        run_command(
+            "/usr/sbin/ip",
+            &["link", "add", interface, "type", "dummy"],
+            3,
+        )
+        .await
+        .unwrap();
+        run_command(
+            "/usr/sbin/ip",
+            &[
+                "link",
+                "set",
+                "dev",
+                interface,
+                "alias",
+                &format!("linuxdrop:p2p:{}", lease.id),
+                "up",
+            ],
+            3,
+        )
+        .await
+        .unwrap();
+        run_command(
+            "/usr/sbin/ip",
+            &[
+                "-6",
+                "address",
+                "replace",
+                "fe80::1234/64",
+                "dev",
+                interface,
+                "nodad",
+            ],
+            3,
+        )
+        .await
+        .unwrap();
+        let (child, addresses) = timeout(Duration::from_secs(3), start_p2p_network(&lease))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(addresses.ipv4.is_none());
+        assert!(addresses.ipv6.is_some());
+        if let Some(mut child) = child {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+        run_command(
+            "/usr/sbin/ip",
+            &["link", "set", "dev", interface, "alias", "foreign"],
+            3,
+        )
+        .await
+        .unwrap();
+        assert!(p2p_addresses(&lease).await.is_err());
+        assert!(start_p2p_network(&lease).await.is_err());
+        run_command("/usr/sbin/ip", &["link", "del", interface], 3)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn process_start_is_available() {
         assert!(process_start(std::process::id() as i32).unwrap() > 0);

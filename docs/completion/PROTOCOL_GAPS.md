@@ -462,3 +462,21 @@ on the selected interface and refusing a different interface. Workspace all-targ
 Clippy passed. Native P2P group-owner role negotiation and netd's IPv4-required
 DHCP completion path still need work for full IPv6-only supplicant P2P; no physical
 radio interoperability or complete Wi-Fi Direct conformance is claimed here.
+
+
+## IPv6-only supplicant group readiness, 2026-10-07
+
+Netd now returns real optional IPv4/IPv6 addresses for an owned P2P group instead
+of requiring an IPv4 DHCP result. Readiness inspects the exact ownership-marked
+kernel interface and rejects down, tentative, duplicate-address-failed and expired
+addresses. IPv6 readiness requires a usable link-local address. DHCP acquisition
+and renewal may continue while the lease is owned, but a DHCP child exit does not
+revoke a group that retains usable IPv6. Cancellation and group restoration retain
+the existing lease boundary; no host DNS or default routes are configured.
+
+Passed: six netd unit tests and `crates/linuxdrop-netd/tests/run-p2p-addresses.sh`
+with its built binary. The latter uses a verified private kernel network namespace,
+creates a marked group-like interface, proves immediate IPv6-only readiness without
+a DHCP server, and rejects changed ownership. Workspace all-target Clippy passed.
+The test does not emulate radio negotiation: complete P2P group-owner roles and
+physical device interoperability still require their separate work/acceptance.

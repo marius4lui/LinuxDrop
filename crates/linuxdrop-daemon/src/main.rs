@@ -345,9 +345,11 @@ impl linuxdrop_network::P2pConnector for HelperP2p {
                 linuxdrop_netd::Response::P2pJoined {
                     interface,
                     ipv4_address,
+                    ipv6_address,
                 } => Ok(linuxdrop_network::P2pConnection {
                     interface,
-                    ipv4_address: ipv4_address.parse()?,
+                    ipv4_address,
+                    ipv6_address,
                 }),
                 linuxdrop_netd::Response::Error { message } => anyhow::bail!(message),
                 _ => anyhow::bail!("Unexpected P2P helper response"),

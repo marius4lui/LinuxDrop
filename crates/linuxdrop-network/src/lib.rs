@@ -3,7 +3,8 @@ pub mod nm;
 pub mod p2p;
 pub struct P2pConnection {
     pub interface: String,
-    pub ipv4_address: Ipv4Addr,
+    pub ipv4_address: Option<Ipv4Addr>,
+    pub ipv6_address: Option<Ipv6Addr>,
 }
 pub trait P2pConnector: Send + Sync {
     fn connect(
