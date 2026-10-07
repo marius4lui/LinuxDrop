@@ -281,6 +281,33 @@ impl Ui {
     }
 
     pub fn open_received_file(self: &Rc<Self>, path: &str, show_folder: bool) {
+        if !std::path::Path::new("/.flatpak-info").is_file() {
+            self.launch_received_file(path, show_folder);
+            return;
+        }
+        let ui = self.clone();
+        let path = path.to_owned();
+        let proxy = self.proxy.borrow().clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = async {
+                let proxy = match proxy {
+                    Some(proxy) => proxy,
+                    None => crate::ipc::connect().await?,
+                };
+                crate::ipc::string_result(
+                    crate::ipc::call(&proxy, "ExportReceivedFile", Some((path,).to_variant()))
+                        .await?,
+                )
+            }
+            .await;
+            match result {
+                Ok(exported) => ui.launch_received_file(&exported, show_folder),
+                Err(error) => ui.toast(&error),
+            }
+        });
+    }
+
+    fn launch_received_file(self: &Rc<Self>, path: &str, show_folder: bool) {
         let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
         let weak = Rc::downgrade(self);
         let completed = move |result: Result<(), glib::Error>| {

@@ -2,6 +2,7 @@ mod helper;
 mod history;
 mod lifecycle;
 mod notifications;
+mod portal;
 mod preferences;
 mod receive;
 mod settings;
@@ -634,6 +635,36 @@ impl Manager {
             .files
             .extend(files);
         Ok(id)
+    }
+    /// Grant the installed sandbox read access only to a completed receipt.
+    async fn export_received_file(&self, path: String) -> zbus::fdo::Result<String> {
+        if path.len() > 4096 || !std::path::Path::new(&path).is_absolute() {
+            return Err(failed("Invalid received file path"));
+        }
+        {
+            let d = self.0.data.lock().await;
+            if !d.transfers.values().any(|transfer| {
+                transfer.direction == "incoming"
+                    && transfer.state == "completed"
+                    && transfer.saved_paths.contains(&path)
+            }) {
+                return Err(failed(
+                    "This file is no longer in completed incoming transfers",
+                ));
+            }
+        }
+        let connection = self
+            .0
+            .connection
+            .get()
+            .ok_or_else(|| failed("Sharing service is offline"))?;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            portal::export_received(connection, path),
+        )
+        .await
+        .map_err(|_| failed("The file portal did not respond"))?
+        .map_err(failed)
     }
     async fn discard_draft(&self, draft_id: String) {
         self.0.data.lock().await.drafts.remove(&draft_id);

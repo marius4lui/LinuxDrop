@@ -36,6 +36,7 @@ Service `io.github.marius4lui.LinuxDrop`, object `/io/github/marius4lui/LinuxDro
 | GetSettings / GetDiagnostics | none | JSON configuration / operational state |
 | PrepareSend | absolute host file paths (legacy CLI contract) | temporary draft ID |
 | PrepareSendFiles | draft ID (empty to create), array of `(logical name, Unix FD)` | draft ID; append 1?16 regular files atomically |
+| ExportReceivedFile | completed incoming saved path | read-only session document-portal path for the installed Flatpak client |
 | DiscardDraft | draft ID | release selection |
 | StartSend | draft ID, peer ID, protocol ID | transfer ID |
 | AcceptTransfer / RejectTransfer / CancelTransfer | transfer ID | consent / terminal action |

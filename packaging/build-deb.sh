@@ -10,6 +10,7 @@ if [ "${LINUXDROP_SKIP_BUILD:-0}" != 1 ]; then
     cargo build --release --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs
 fi
 stage=$(mktemp -d)
+chmod 755 "$stage"
 trap 'rm -rf -- "$stage"' EXIT HUP INT TERM
 DESTDIR="$stage" sh packaging/install.sh
 install -d "$stage/DEBIAN" dist
@@ -32,6 +33,6 @@ install -m755 packaging/debian/postrm "$stage/DEBIAN/postrm"
 dpkg-deb --root-owner-group --build "$stage" "dist/linuxdrop_${version}_${arch}.deb"
 # Ship the actual build inputs, including vendor patches and Cargo.lock. Avoid
 # git archive here because local review packages can contain uncommitted work.
-tar --exclude='./.git' --exclude='./target' --exclude='./dist' --exclude='./.dev' --exclude='*/target' --exclude='*/__pycache__' -czf "dist/linuxdrop_${version}_source.tar.gz" .
+tar --exclude='./.git' --exclude='./target' --exclude='./dist' --exclude='./.dev' --exclude='./.flatpak-builder' --exclude='*/target' --exclude='*/__pycache__' -czf "dist/linuxdrop_${version}_source.tar.gz" .
 
 (cd dist && sha256sum "linuxdrop_${version}_${arch}.deb" "linuxdrop_${version}_source.tar.gz" > SHA256SUMS)

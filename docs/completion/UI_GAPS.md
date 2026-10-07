@@ -33,7 +33,7 @@ items retain their remaining acceptance scope even where code now exists.
 - [ ] Pointer-monitor option, position pinned during interaction, monitor removal recovery; configurable drag dwell and keyboard shortcut without conflict.
 - [x] Adaptive wide-window navigation and targeted 480x600 and wide rendering.
 - [ ] Fractional rendering acceptance.
-- [x] Portal-origin file acceptance validated with a real document-portal export and descriptor handoff; revocation/closed-client lifetime and daemon access tested. Full installed Flatpak chooser acceptance remains in system packaging work.
+- [x] Portal-origin file acceptance validated with a real document-portal export and descriptor handoff; revocation/closed-client lifetime and daemon access tested. Installed Flatpak chooser, descriptor transfer, registered MIME opening and folder-reveal portal actions now pass; receive-folder persistence remains in system packaging work.
 - [ ] Assess folder/GVfs import safely; the original plan explicitly deferred these beyond regular local files, so any added import requires clear staging/cancel semantics rather than silent rejection.
 - [ ] Redigierte Diagnose als Datei speichern; reset/restart dialogs explain active transfer impact.
 - [x] Targeted native tests cover the reviewed draft, protocol, focus, settings and incoming decision regressions.
