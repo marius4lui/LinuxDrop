@@ -41,7 +41,7 @@ jobs:
             apt-get update
             apt-get install -y --no-install-recommends ca-certificates git tar locales passwd \
               gnome-shell gjs dbus-daemon dbus-x11 python3-dbusmock python3-gi gir1.2-adw-1 \
-              libgl1-mesa-dri libegl-mesa0 orca
+              libgl1-mesa-dri libegl-mesa0 orca nautilus
             localedef -i de_DE -f UTF-8 de_DE.UTF-8
           else
             dnf -y --setopt=install_weak_deps=False install ca-certificates git tar shadow-utils \
@@ -65,4 +65,11 @@ jobs:
           runuser -u linuxdrop-ci -- env LANG=de_DE.UTF-8 LANGUAGE=de \
             LINUXDROP_SMOKE_ORCA=1 LINUXDROP_SMOKE_MOCK_LOGIND=1 \
             LINUXDROP_SMOKE_TEXT_SCALE=1.5 LINUXDROP_SMOKE_MONITOR=800x600 \
+            bash extensions/gnome-shell/tests/run-bubble-smoke.sh
+      - name: Completed transfer opens the real file manager
+        if: matrix.distro == 'ubuntu'
+        run: |
+          runuser -u linuxdrop-ci -- env LANG=de_DE.UTF-8 LANGUAGE=de \
+            LINUXDROP_SMOKE_COMPLETION=1 LINUXDROP_SMOKE_MOCK_LOGIND=1 \
+            LINUXDROP_SMOKE_MONITOR=800x600 \
             bash extensions/gnome-shell/tests/run-bubble-smoke.sh

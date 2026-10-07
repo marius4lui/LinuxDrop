@@ -26,6 +26,7 @@ source = target.read_text()
 marker = '        this._poll = GLib.timeout_add_seconds'
 assert source.count(marker) == 1
 probe_name = 'orca-smoke.js' if os.environ.get('LINUXDROP_SMOKE_ORCA') == '1' else 'bubble-smoke.js'
+if os.environ.get('LINUXDROP_SMOKE_COMPLETION') == '1': probe_name = 'completion-smoke.js'
 probe = Path('extensions/gnome-shell/tests', probe_name).read_text()
 target.write_text(source.replace(marker, probe + '\n' + marker))
 PY
@@ -37,7 +38,11 @@ dbus-run-session -- bash -c '
     shell_pid=
     logind_pid=
     orca_pid=
-    trap '\''kill ${orca_pid:-} ${shell_pid:-} ${logind_pid:-} "$fixture_pid" 2>/dev/null || true'\'' EXIT
+    cleanup() {
+        if [ "${LINUXDROP_SMOKE_COMPLETION:-0}" = 1 ]; then nautilus --quit 2>/dev/null || true; fi
+        kill ${orca_pid:-} ${shell_pid:-} ${logind_pid:-} "$fixture_pid" 2>/dev/null || true
+    }
+    trap cleanup EXIT
     if [ "${LINUXDROP_SMOKE_MOCK_LOGIND:-0}" = 1 ]; then
         export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" XDG_SESSION_ID=linuxdrop_ci
         python3 -m dbusmock --session -t logind > "$LINUXDROP_SMOKE_ROOT/logind.log" 2>&1 &
@@ -73,6 +78,7 @@ dbus-run-session -- bash -c '
                 grep "SPEECH: Speak" "$LINUXDROP_SMOKE_ROOT/orca-debug.log"
                 exit 0
             fi
+            if [ "${LINUXDROP_SMOKE_COMPLETION:-0}" = 1 ]; then exit 0; fi
             extension="$XDG_DATA_HOME/gnome-shell/extensions/linuxdrop@marius4lui.github.io"
             # Shell keeps private typelibs/libraries in the distro lib directory.
             for library in /usr/lib/gnome-shell /usr/lib64/gnome-shell /usr/lib/*/gnome-shell; do

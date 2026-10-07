@@ -36,10 +36,11 @@ items retain their remaining acceptance scope even where code now exists.
   found and fixed unnamed device toggles. [Shell Orca traversal](../acceptance/ORCA_SHELL_2026-10-07.md)
   additionally verifies actual keyboard navigation, spoken consent context and
   progress; it found and fixed the outer-container focus trap.
-- [ ] Notch multiple-transfer selection remains stable; completion/error/open-folder actions; summary does not randomly change peer.
+- [x] Notch multiple-transfer selection remains stable; completion/error/open-folder actions; summary does not randomly change peer.
   Native GNOME now verifies completed selection/focus across reordered snapshots
-  and the available completion actions. Actual Shell folder-handler launch remains
-  outside this fixture; see the keyboard evidence above.
+  and the available completion actions. [Real Nautilus folder-launch acceptance](../acceptance/NOTCH_COMPLETION_2026-10-07.md)
+  additionally verifies keyboard activation, exact parent URI (including spaces),
+  a visible file-manager window and Bubble dismissal.
 - [x] Primary/pointer/fixed monitor policy, pinned interaction, layout-change dismissal and fallback; configurable drag dwell and optional shortcut with actual conflict refusal. Native settings and controlled-layout evidence: [Notch shortcut acceptance](../acceptance/NOTCH_SHORTCUT_2026-10-07.md). Physical monitor hotplug remains below.
 - [x] Adaptive wide-window navigation and targeted 480x600 and wide rendering.
 - [ ] Fractional rendering acceptance.
