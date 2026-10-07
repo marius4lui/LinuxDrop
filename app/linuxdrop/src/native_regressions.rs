@@ -86,7 +86,9 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let batches = Rc::new(RefCell::new(Vec::new()));
     let discarded = Rc::new(Cell::new(false));
     let fail_next_stop = Rc::new(Cell::new(true));
-    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='StopDownloadOffer'/><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
+    let fail_next_preference = Rc::new(Cell::new(false));
+    let preference_calls = Rc::new(Cell::new(0));
+    let info = gio::DBusNodeInfo::for_xml(&format!("<node><interface name='{}'><method name='StopDownloadOffer'/><method name='UpdatePeerPreferences'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><method name='GetSnapshot'><arg type='s' direction='out'/></method><method name='PrepareSendFiles'><arg type='s' direction='in'/><arg type='a(sh)' direction='in'/><arg type='s' direction='out'/></method><method name='DiscardDraft'><arg type='s' direction='in'/></method><method name='StartSend'><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='in'/><arg type='s' direction='out'/></method><method name='AcceptTransferWithOptions'><arg type='s' direction='in'/><arg type='s' direction='in'/></method><signal name='Changed'><arg type='t'/></signal></interface></node>",ipc::INTERFACE)).unwrap();
     let state = snapshot.clone();
     let sent = sent_protocol.clone();
     let accepted = accepted_options.clone();
@@ -94,6 +96,8 @@ fn native_draft_focus_protocol_and_settings_regressions() {
     let sent_batches = batches.clone();
     let was_discarded = discarded.clone();
     let fail_stop = fail_next_stop.clone();
+    let fail_preference = fail_next_preference.clone();
+    let preference_count = preference_calls.clone();
     let registration = bus
         .register_object(ipc::PATH, &info.interfaces()[0])
         .method_call(
@@ -111,6 +115,26 @@ fn native_draft_focus_protocol_and_settings_regressions() {
                         state.borrow_mut()["download_link_active"] = json!(false);
                         invocation.return_value(None);
                     }
+                }
+                "UpdatePeerPreferences" => {
+                    preference_count.set(preference_count.get() + 1);
+                    let (_, patch) = parameters.get::<(String, String)>().unwrap();
+                    let patch: Value = serde_json::from_str(&patch).unwrap();
+                    let fail = fail_preference.replace(false);
+                    let state = state.clone();
+                    glib::timeout_add_local_once(Duration::from_millis(250), move || {
+                        if fail {
+                            invocation.return_dbus_error(
+                                "io.github.marius4lui.Error",
+                                "Test preference save failed",
+                            );
+                        } else {
+                            for (key, value) in patch.as_object().unwrap() {
+                                state.borrow_mut()["peers"][0][key] = value.clone();
+                            }
+                            invocation.return_value(None);
+                        }
+                    });
                 }
                 "PrepareSendFiles" => {
                     use std::os::fd::FromRawFd;
@@ -479,6 +503,65 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         glib::timeout_future(Duration::from_millis(400)).await;
         capture(&ui, "completed-received-files.png");
         received.force_close();
+        ui.refresh();
+        settle().await;
+        snapshot.borrow_mut()["peers"][0]["display_name"] = json!("<b>Pixel & tablet</b>");
+        ui.refresh();
+        settle().await;
+        let devices = ui.manage_devices();
+        let device = find(&devices, "device:pixel").unwrap().downcast::<adw::ExpanderRow>().unwrap();
+        assert!(!device.uses_markup(), "Device names must remain literal text");
+        assert_eq!(device.title(), "<b>Pixel & tablet</b>");
+        device.set_expanded(true);
+        let block = find(&devices, "device:pixel:blocked").unwrap().downcast::<adw::SwitchRow>().unwrap();
+        let status = find(&devices, "device:pixel:status").unwrap().downcast::<gtk::Label>().unwrap();
+        fail_next_preference.set(true);
+        block.set_active(true);
+        assert!(!device.is_sensitive(), "Pending writes prevent conflicting edits");
+        assert_eq!(status.text(), tr("Saving device preference…"));
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert!(!block.is_active(), "A failed block must not appear saved");
+        assert!(device.is_sensitive() && status.is_visible());
+        assert!(status.text().contains("Test preference save failed"));
+        assert_eq!(preference_calls.get(), 1, "Rollback must not issue another write");
+        capture(&ui, "device-preference-failed.png");
+        block.set_active(true);
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert!(block.is_active() && !status.is_visible());
+        fail_next_preference.set(true);
+        block.set_active(false);
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert!(block.is_active(), "Rollback uses the latest confirmed value");
+        assert_eq!(preference_calls.get(), 3);
+        let protocol = find(&devices, "device:pixel:preferred_protocol").unwrap().downcast::<adw::ComboRow>().unwrap();
+        protocol.set_selected(2);
+        glib::timeout_future(Duration::from_millis(400)).await;
+        fail_next_preference.set(true);
+        protocol.set_selected(3);
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(protocol.selected(), 2, "Failed protocol change restores the confirmed selection");
+        assert_eq!(preference_calls.get(), 5);
+        let alias = find(&devices, "device:pixel:display_name").unwrap().downcast::<adw::EntryRow>().unwrap();
+        alias.set_text("My tablet");
+        fail_next_preference.set(true);
+        alias.emit_by_name::<()>("apply", &[]);
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(alias.text(), "My tablet", "Failed alias saves preserve the draft");
+        assert_eq!(device.title(), "<b>Pixel & tablet</b>", "The heading keeps the saved name");
+        alias.emit_by_name::<()>("apply", &[]);
+        glib::timeout_future(Duration::from_millis(400)).await;
+        assert_eq!(device.title(), "My tablet");
+        assert!(!status.is_visible());
+        ui.service_error("test device preference offline");
+        ui.proxy.borrow_mut().take();
+        let calls = preference_calls.get();
+        block.set_active(false);
+        settle().await;
+        assert!(block.is_active() && device.is_sensitive());
+        assert!(status.is_visible());
+        assert!(status.text().contains(&tr("Background service unavailable")));
+        assert_eq!(preference_calls.get(), calls, "Offline edits must not silently stick");
+        devices.force_close();
         ui.allow_close.set(true);
         ui.window.close();
     });

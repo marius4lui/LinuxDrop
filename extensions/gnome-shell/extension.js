@@ -67,6 +67,9 @@ export default class LinuxDropExtension extends Extension {
         this._serviceState = 'connecting';
         this._actionPending = false;
         this._actionError = null;
+        this._pending = null;
+        this._refreshDirty = false;
+        this._ownerGeneration = 0;
         this._revision = '';
         this._peerMenuSignature = null;
         this._signals = [];
@@ -128,13 +131,14 @@ export default class LinuxDropExtension extends Extension {
         this._connect(dnd, 'dnd-leave', () => this._cancelDragHover());
         this._connect(this._settings, 'changed', () => { this._position(); this._visibility(); });
         this._position(); this._render(); this._visibility();
-        Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, null, BUS, PATH, IFACE, this._cancellable, (source, result) => {
-            if (!this._alive) return;
+        const session = this._cancellable;
+        Gio.DBusProxy.new_for_bus(Gio.BusType.SESSION, Gio.DBusProxyFlags.NONE, null, BUS, PATH, IFACE, session, (source, result) => {
+            if (!this._alive || this._cancellable !== session) return;
             try {
                 this._proxy = Gio.DBusProxy.new_for_bus_finish(result);
                 this._connect(this._proxy, 'g-signal', (_, _sender, signal) => { if (signal === 'Changed') this._refresh(); });
-                this._connect(this._proxy, 'notify::g-name-owner', () => this._refresh());
-                this._refresh();
+                this._connect(this._proxy, 'notify::g-name-owner', () => this._ownerChanged());
+                this._ownerChanged();
             } catch (error) { this._serviceState = 'offline'; this._render(); this._error(error.message); }
         });
         this._poll = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => { this._refresh(); return GLib.SOURCE_CONTINUE; });
@@ -151,10 +155,12 @@ export default class LinuxDropExtension extends Extension {
     }
 
     call(method, parameters = null, callback = null) {
-        if (!this._proxy || !this._alive || this._actionPending) return;
+        if (!this._proxy || !this._alive || this._actionPending || this._serviceState !== 'ready' || !this._proxy.get_name_owner()) return;
+        const session = this._cancellable;
+        const generation = this._ownerGeneration;
         this._actionPending = true; this._actionError = null; this._render();
         this._proxy.call(method, parameters, Gio.DBusCallFlags.NONE, 30000, this._cancellable, (proxy, result) => {
-            if (!this._alive) return;
+            if (!this._alive || this._cancellable !== session || generation !== this._ownerGeneration) return;
             this._actionPending = false;
             try { const value = proxy.call_finish(result); if (callback) callback(value.deep_unpack()); else this._refresh(); }
             catch (error) { this._error(error.message); }
@@ -162,12 +168,32 @@ export default class LinuxDropExtension extends Extension {
         });
     }
 
+    _ownerChanged() {
+        // A replacement daemon owns a different set of consent requests. Retire
+        // both the old view and its in-flight callbacks before showing actions.
+        this._ownerGeneration++;
+        this._pending = null;
+        this._refreshDirty = false;
+        this._snapshot = null;
+        this._revision = '';
+        this._selectedTransfer = null;
+        this._actionPending = false;
+        this._actionError = null;
+        this._serviceState = this._proxy.get_name_owner() ? 'connecting' : 'offline';
+        this._render();
+        this._refresh();
+    }
+
     _refresh() {
-        if (!this._proxy || this._pending || !this._alive) return;
-        this._pending = true;
+        if (!this._proxy || !this._alive || !this._proxy.get_name_owner()) return;
+        if (this._pending) { this._refreshDirty = true; return; }
+        const request = {};
+        const session = this._cancellable;
+        this._pending = request;
+        this._refreshDirty = false;
         this._proxy.call('GetSnapshot', null, Gio.DBusCallFlags.NONE, 5000, this._cancellable, (proxy, result) => {
-            this._pending = false;
-            if (!this._alive) return;
+            if (!this._alive || this._cancellable !== session || this._pending !== request) return;
+            this._pending = null;
             try {
                 const [json] = proxy.call_finish(result).deep_unpack();
                 const snapshot = JSON.parse(json);
@@ -177,6 +203,9 @@ export default class LinuxDropExtension extends Extension {
             } catch (_error) {
                 this._snapshot = null; this._revision = ''; this._serviceState = 'offline'; this._actionError = null; this._render();
             }
+            // Changed can arrive while GetSnapshot is in flight. Read again so
+            // completed transfers and new requests need not wait for polling.
+            if (this._refreshDirty) this._refresh();
         });
     }
 
@@ -505,6 +534,7 @@ export default class LinuxDropExtension extends Extension {
     }
 
     openApp(option = '') {
+        const selectedTransfer = this._selectedTransfer;
         if (option === '--notch-drop') {
             if (!this._expanded || this._dropRequested || this._dropWindow) return;
             this._dropRequested = true;
@@ -524,16 +554,22 @@ export default class LinuxDropExtension extends Extension {
         } else this._setExpanded(false);
         Main.panel.statusArea.quickSettings.menu.close();
         try {
-            if (!option) {
-                const app = Shell.AppSystem.get_default().lookup_app(`${BUS}.desktop`);
-                if (app) { app.activate(); return; }
-            }
-            Gio.Subprocess.new(['linuxdrop', ...(option ? [option] : ['open'])], Gio.SubprocessFlags.NONE);
+            this._launchApp(option);
         } catch (error) {
             this._dropRequested = false; this._dropLaunchPending = false;
             if (this._dropTimeout) { GLib.source_remove(this._dropTimeout); this._dropTimeout = 0; }
+            this._selectedTransfer = selectedTransfer;
+            this._setExpanded(true);
             this._error(error.message); this._scheduleCollapse();
         }
+    }
+
+    _launchApp(option) {
+        if (!option) {
+            const app = Shell.AppSystem.get_default().lookup_app(`${BUS}.desktop`);
+            if (app) { app.activate(); return; }
+        }
+        Gio.Subprocess.new(['linuxdrop', ...(option ? [option] : ['open'])], Gio.SubprocessFlags.NONE);
     }
 
     disable() {

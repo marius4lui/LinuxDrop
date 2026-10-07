@@ -73,11 +73,58 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                     this._render();
                     check(this._body.get_children().some(child => child instanceof St.Label && child.text === t(current.error)), 'Helper failure must show its translated recovery explanation');
                     check(!find(this._body, 'Cancel') && find(this._body, 'Details') && find(this._body, 'Done'), 'Failed transfer must replace stale cancellation with recovery navigation');
+                    const launchApp = this._launchApp;
+                    this._launchApp = () => { throw new Error('Launch failure for smoke test'); };
+                    try {
+                        this.openApp('--transfers');
+                        check(this._expanded && this._notch.visible && this._selectedTransfer === current.id, 'Launch failure must restore the bubble and selected transfer');
+                        check(this._body.get_children().some(child => child instanceof St.Label && child.text === 'Launch failure for smoke test'), 'Launch failure must remain visible with retry navigation');
+                        check(find(this._body, 'Details').reactive, 'Failed launch must allow retry');
+                    } finally { this._launchApp = launchApp; }
                     this._actionPending = false; this._serviceState = 'offline'; this._snapshot = null; this._render();
                     check(!find(this._body, 'Cancel') && find(this._body, 'Open LinuxDrop'), 'Offline state must replace stale transfer actions');
+                    const realProxy = this._proxy;
+                    const requests = [];
+                    let owner = ':smoke.old';
+                    const snapshot = revision => ({epoch: owner, revision, peers: [], backends: [], transfers: [{id: 'reconnect', state: 'verification', direction: 'incoming', peer_name: 'Reconnect peer', verification_code: '123456', files: [{name: 'review.txt', size: 10}]}]});
+                    const reply = (request, value) => request.callback(this._proxy, {deep_unpack: () => [JSON.stringify(value)]});
+                    this._proxy = {
+                        get_name_owner: () => owner,
+                        call: (method, _parameters, _flags, _timeout, _cancellable, callback) => requests.push({method, callback}),
+                        call_finish: result => result,
+                    };
+                    try {
+                        this._ownerChanged();
+                        check(this._serviceState === 'connecting' && !find(this._body, 'Codes match'), 'Connecting must not expose stale consent');
+                        const firstRead = requests.shift();
+                        this._refresh(); this._refresh();
+                        check(requests.length === 0, 'Concurrent changes must coalesce behind the pending snapshot');
+                        reply(firstRead, snapshot(1));
+                        check(requests.length === 1 && find(this._body, 'Codes match'), 'Dirty snapshot must immediately refresh while restoring current consent');
+                        const oldRead = requests.shift();
+                        this.call('AcceptTransfer', new GLib.Variant('(s)', ['reconnect']));
+                        const oldAction = requests.shift();
+                        check(this._actionPending, 'Consent action must enter pending state');
+                        owner = null; this._ownerChanged();
+                        check(!this._snapshot && !this._actionPending && this._serviceState === 'offline' && !find(this._body, 'Codes match'), 'Owner loss must immediately retire pending consent and transfer data');
+                        reply(oldRead, snapshot(99));
+                        check(!this._snapshot && this._serviceState === 'offline', 'Late old snapshot must not resurrect disconnected transfers');
+                        owner = ':smoke.new'; this._ownerChanged();
+                        const newRead = requests.shift();
+                        reply(newRead, snapshot(1));
+                        check(this._serviceState === 'ready' && find(this._body, 'Codes match'), 'New owner must recover without requiring the polling timer');
+                        this.call('AcceptTransfer', new GLib.Variant('(s)', ['reconnect']));
+                        const newAction = requests.shift();
+                        oldAction.callback(this._proxy, {deep_unpack: () => []});
+                        check(this._actionPending && requests.length === 0, 'Old action completion must not unlock a new owner action');
+                        newAction.callback(this._proxy, {deep_unpack: () => []});
+                        check(!this._actionPending && requests.length === 1, 'Current action completion must refresh normally');
+                        reply(requests.shift(), {...snapshot(2), transfers: []});
+                        check(!find(this._body, 'Codes match') && find(this._body, 'Drop files'), 'Fresh empty state must retire the completed request');
+                    } finally { this._proxy = realProxy; }
                     this._setExpanded(false);
                     check(!this._notch.visible && global.stage.get_key_focus() === this._panelButton, 'Close must hide and restore panel focus');
-                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, PIN, progress, busy, helper failure, offline, focus');
+                    console.log('LINUXDROP_SMOKE_PASSED: hidden/open, keyboard scrolling, verification, chooser focus, PIN, progress, busy, helper failure, launch recovery, offline, owner replacement, stale consent callbacks, coalesced refresh, focus');
                 });
             });
         });

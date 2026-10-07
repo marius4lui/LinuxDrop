@@ -213,3 +213,29 @@ Root reviewed captures `ui/completion/settings-search-empty.png` and
 `ui/completion/shell-focus-de150.png`. Real screen-reader traversal and physical
 mixed-DPI hotplug remain unverified. Installed packages and the live demo were
 not changed.
+
+
+## 2026-10-07: device preference recovery and Shell reconnection
+
+Two further Astra/high agents worked in disjoint GTK and Shell directories.
+Device preferences now serialize edits per device, display pending status, and
+restore the last confirmed favorite/block/protocol value on failure. Failed
+name edits retain their draft and apply action. Ownerless/replaced service
+responses do not appear saved. External names render literally, including markup
+characters, and Forget has a device-specific accessible name.
+
+The Shell immediately retires transfer/consent actions on daemon owner changes.
+Late snapshots and action completions from an old owner or extension session
+cannot revive them or unlock a newer operation. Changes received during a
+snapshot are coalesced into an immediate follow-up read. A failed app launch
+reopens the bubble with its selected transfer, visible error and retry action.
+
+Passed: isolated native German GTK regression at 480x600 (including failed save,
+retry, latest-value rollback, protocol/name handling and offline edits); isolated
+GNOME 46 smoke at normal text and German 150%, including native preferences;
+all-target Clippy for the app and affected core/network/daemon/Quick Share crates.
+The Shell race cases use controlled replies inside real GNOME, not a physical
+service failure. Root reviewed `ui/completion/device-preference-failed.png`.
+The general GTK snapshot owner-generation race in `ui.rs` remains open; this pass
+fixes device write receipts and Shell state. Physical mixed-DPI, screen-reader
+and installed-package acceptance remain separate. Live demo unchanged.

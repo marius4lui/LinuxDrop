@@ -58,3 +58,11 @@ unchecked rows remain open where their full acceptance scope exceeds those check
 filename review, launcher feedback and Shell keyboard transfer selection are
 implemented and covered by native tests. See the acceptance record for exact
 scope; broader accessibility and mixed-DPI acceptance remain open.
+
+
+2026-10-07 additional Astra/high pass: per-device writes now have pending,
+rollback and retry feedback; external device names are literal. Shell owner
+replacement invalidates consent immediately, ignores stale completions and
+coalesces in-flight updates; launcher failure remains visible. Native evidence
+is in the acceptance record. The GTK general snapshot owner-generation guard is
+still required even though the Shell side and device write receipts are fixed.

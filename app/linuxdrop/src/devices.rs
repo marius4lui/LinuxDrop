@@ -5,11 +5,14 @@ use crate::{
 };
 use adw::prelude::*;
 use gtk::glib;
-use serde_json::json;
-use std::rc::Rc;
+use serde_json::{json, Value};
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 impl Ui {
-    pub fn manage_devices(self: &Rc<Self>) {
+    pub fn manage_devices(self: &Rc<Self>) -> adw::Dialog {
         let snapshot = self.snapshot.borrow().clone();
         let mut peers = snapshot["known_peers"]
             .as_array()
@@ -64,20 +67,29 @@ impl Ui {
                 .filter(|name| !name.is_empty())
                 .or_else(|| peer["name"].as_str())
                 .unwrap_or(&id);
-            let row = adw::ExpanderRow::builder()
-                .title(name)
-                .subtitle(if peer["available"].as_bool().unwrap_or(false) {
-                    tr("Nearby now")
-                } else {
-                    tr("Not currently nearby")
-                })
-                .build();
+            let row = adw::ExpanderRow::new();
+            row.set_use_markup(false);
+            row.set_title(name);
+            row.set_subtitle(&tr(if peer["available"].as_bool().unwrap_or(false) {
+                "Nearby now"
+            } else {
+                "Not currently nearby"
+            }));
+            row.set_widget_name(&format!("device:{id}"));
+            let status = label("", "compact-note");
+            status.set_widget_name(&format!("device:{id}:status"));
+            status.set_visible(false);
+            status.set_margin_top(8);
+            status.set_margin_bottom(8);
+            status.set_margin_start(12);
+            status.set_margin_end(12);
+            row.add_row(&status);
             let favorite = adw::SwitchRow::builder()
                 .title(tr("Favorite"))
                 .subtitle(tr("Show this device first"))
                 .active(peer["favorite"].as_bool().unwrap_or(false))
                 .build();
-            connect_preference(self, &favorite, &id, "favorite");
+            connect_preference(self, &row, &status, &favorite, &id, "favorite");
             row.add_row(&favorite);
             let alias = adw::EntryRow::builder()
                 .title(tr("Local display name"))
@@ -86,17 +98,44 @@ impl Ui {
                 .build();
             let weak = Rc::downgrade(self);
             let peer_id = id.clone();
+            let parent = row.downgrade();
+            let feedback = status.clone();
+            let saved_alias = Rc::new(RefCell::new(alias.text().to_string()));
+            let original_name = peer["name"].as_str().unwrap_or(&id).to_owned();
+            alias.set_widget_name(&format!("device:{id}:display_name"));
             alias.connect_apply(move |entry| {
-                if let Some(ui) = weak.upgrade() {
-                    ui.mutate(
-                        "UpdatePeerPreferences",
-                        (
-                            peer_id.clone(),
-                            json!({"display_name":entry.text().as_str()}).to_string(),
-                        )
-                            .to_variant(),
-                    );
+                let (Some(ui), Some(parent)) = (weak.upgrade(), parent.upgrade()) else {
+                    return;
+                };
+                if !parent.is_sensitive() {
+                    return;
                 }
+                let requested = entry.text().to_string();
+                let saved = saved_alias.clone();
+                let entry = entry.clone();
+                let title = parent.clone();
+                let original_name = original_name.clone();
+                update_preference(
+                    ui,
+                    parent,
+                    feedback.clone(),
+                    peer_id.clone(),
+                    json!({"display_name":requested}),
+                    move |success| {
+                        if success {
+                            *saved.borrow_mut() = requested.clone();
+                            title.set_title(if requested.is_empty() {
+                                &original_name
+                            } else {
+                                &requested
+                            });
+                        } else {
+                            // Re-arm EntryRow's apply action without losing the unsaved draft.
+                            entry.set_text(&saved.borrow());
+                            entry.set_text(&requested);
+                        }
+                    },
+                );
             });
             row.add_row(&alias);
             let protocols = ["auto", "localsend", "quickshare", "airdrop"];
@@ -126,19 +165,37 @@ impl Ui {
                 .build();
             let weak = Rc::downgrade(self);
             let peer_id = id.clone();
+            let parent = row.downgrade();
+            let feedback = status.clone();
+            let saved_protocol = Rc::new(Cell::new(protocol.selected()));
+            protocol.set_widget_name(&format!("device:{id}:preferred_protocol"));
             protocol.connect_selected_notify(move |row| {
-                if let Some(ui) = weak.upgrade() {
-                    if let Some(protocol) = protocols.get(row.selected() as usize) {
-                        ui.mutate(
-                            "UpdatePeerPreferences",
-                            (
-                                peer_id.clone(),
-                                json!({"preferred_protocol":protocol}).to_string(),
-                            )
-                                .to_variant(),
-                        );
-                    }
+                let (Some(ui), Some(parent)) = (weak.upgrade(), parent.upgrade()) else {
+                    return;
+                };
+                if !parent.is_sensitive() {
+                    return;
                 }
+                let requested = row.selected();
+                let Some(protocol) = protocols.get(requested as usize) else {
+                    return;
+                };
+                let saved = saved_protocol.clone();
+                let row = row.clone();
+                update_preference(
+                    ui,
+                    parent,
+                    feedback.clone(),
+                    peer_id.clone(),
+                    json!({"preferred_protocol":protocol}),
+                    move |success| {
+                        if success {
+                            saved.set(requested);
+                        } else {
+                            row.set_selected(saved.get());
+                        }
+                    },
+                );
             });
             row.add_row(&protocol);
             let block = adw::SwitchRow::builder()
@@ -148,7 +205,7 @@ impl Ui {
                 ))
                 .active(peer["blocked"].as_bool().unwrap_or(false))
                 .build();
-            connect_preference(self, &block, &id, "blocked");
+            connect_preference(self, &row, &status, &block, &id, "blocked");
             row.add_row(&block);
             let forget = adw::ActionRow::builder()
                 .title(tr("Forget device preferences"))
@@ -157,10 +214,15 @@ impl Ui {
             let button = gtk::Button::from_icon_name("user-trash-symbolic");
             button.set_valign(gtk::Align::Center);
             button.set_tooltip_text(Some(&tr("Forget device preferences")));
+            button.update_property(&[gtk::accessible::Property::Label(&format!(
+                "{}: {name}",
+                tr("Forget device preferences")
+            ))]);
+            button.set_widget_name(&format!("device:{id}:forget"));
             let weak = Rc::downgrade(self);
             let parent = dialog.downgrade();
             button.connect_clicked(move |_|{
-                let Some(ui)=weak.upgrade()else{return;};let Some(proxy)=ui.proxy.borrow().clone()else{return;};
+                let Some(ui)=weak.upgrade()else{return;};let Some(proxy)=ui.proxy.borrow().clone()else{ui.toast("Background service unavailable");return;};
                 let confirmation=adw::AlertDialog::builder().heading(tr("Forget device preferences?")).body(tr("This removes the local label, favorite and block preference. It does not delete transferred files.")).build();
                 confirmation.add_responses(&[("cancel",&tr("Cancel")),("forget",&tr("Forget"))]);confirmation.set_close_response("cancel");confirmation.set_response_appearance("forget",adw::ResponseAppearance::Destructive);
                 let id=id.clone();let parent=parent.clone();let owned=ui.clone();
@@ -184,18 +246,102 @@ impl Ui {
         ));
         dialog.set_child(Some(&toolbar));
         dialog.present(Some(&self.window));
+        dialog
     }
 }
 
-fn connect_preference(ui: &Rc<Ui>, row: &adw::SwitchRow, id: &str, key: &'static str) {
+fn connect_preference(
+    ui: &Rc<Ui>,
+    parent: &adw::ExpanderRow,
+    status: &gtk::Label,
+    row: &adw::SwitchRow,
+    id: &str,
+    key: &'static str,
+) {
     let weak = Rc::downgrade(ui);
+    let parent = parent.downgrade();
+    let status = status.clone();
+    let saved = Rc::new(Cell::new(row.is_active()));
+    row.set_widget_name(&format!("device:{id}:{key}"));
     let id = id.to_owned();
     row.connect_active_notify(move |row| {
-        if let Some(ui) = weak.upgrade() {
-            ui.mutate(
-                "UpdatePeerPreferences",
-                (id.clone(), json!({key:row.is_active()}).to_string()).to_variant(),
-            );
+        let (Some(ui), Some(parent)) = (weak.upgrade(), parent.upgrade()) else {
+            return;
+        };
+        if !parent.is_sensitive() {
+            return;
+        }
+        let requested = row.is_active();
+        let saved = saved.clone();
+        let row = row.clone();
+        update_preference(
+            ui,
+            parent,
+            status.clone(),
+            id.clone(),
+            json!({key:requested}),
+            move |success| {
+                if success {
+                    saved.set(requested);
+                } else {
+                    row.set_active(saved.get());
+                }
+            },
+        );
+    });
+}
+
+fn update_preference(
+    ui: Rc<Ui>,
+    row: adw::ExpanderRow,
+    status: gtk::Label,
+    id: String,
+    patch: Value,
+    completed: impl FnOnce(bool) + 'static,
+) {
+    // Serialize edits for a device, and suppress change handlers while rolling back.
+    row.set_sensitive(false);
+    status.remove_css_class("error");
+    status.set_label(&tr("Saving device preference…"));
+    status.set_visible(true);
+    let proxy = ui
+        .proxy
+        .borrow()
+        .clone()
+        .filter(|proxy| proxy.g_name_owner().is_some());
+    glib::MainContext::default().spawn_local(async move {
+        let result = match proxy {
+            Some(proxy) => {
+                let owner = proxy.g_name_owner();
+                let result = ipc::call(
+                    &proxy,
+                    "UpdatePeerPreferences",
+                    Some((id, patch.to_string()).to_variant()),
+                )
+                .await
+                .map(|_| ());
+                if proxy.g_name_owner() != owner {
+                    Err(tr("Background service unavailable"))
+                } else {
+                    result
+                }
+            }
+            None => Err(tr("Background service unavailable")),
+        };
+        completed(result.is_ok());
+        row.set_sensitive(true);
+        match result {
+            Ok(()) => {
+                status.set_visible(false);
+                ui.refresh();
+            }
+            Err(error) => {
+                status.add_css_class("error");
+                status.set_label(&format!(
+                    "{}\n{error}",
+                    tr("Change was not saved. Try again.")
+                ));
+            }
         }
     });
 }
