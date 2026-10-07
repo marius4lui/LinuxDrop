@@ -515,14 +515,54 @@ impl Manager {
     }
     async fn export_diagnostics(&self) -> String {
         let d = self.0.data.lock().await;
-        let backends: Vec<_> = d
+        let backends = d
             .backends
             .values()
-            .map(|b| json!({"id":b.id,"state":b.state}))
+            .map(|b| linuxdrop_ipc::RedactedBackend {
+                id: b.id.clone(),
+                state: b.state.clone(),
+            })
             .collect();
-        let radios: Vec<_> = d.hardware.radios.iter().map(|view| { let r = &view.radio; json!({"driver":r.driver,"firmware":r.driver_details.firmware,"bands":r.bands,"rfkill":r.rfkill,"protected":r.protected,"monitor":r.monitor}) }).collect();
-        json!({"version":env!("CARGO_PKG_VERSION"),"platform":"linux","backends":backends,"radios":radios,"active_transfers":d.transfers.values().filter(|t|!t.is_terminal()).count(),"redacted":true,"omitted":["names","addresses","serials","paths","keys","PINs","file names","error details"]}).to_string()
+        let radios = d
+            .hardware
+            .radios
+            .iter()
+            .map(|view| {
+                let r = &view.radio;
+                linuxdrop_ipc::RedactedRadio {
+                    driver: r.driver.clone(),
+                    firmware: r.driver_details.firmware.clone(),
+                    bands: r.bands.clone(),
+                    rfkill: r.rfkill,
+                    protected: r.protected,
+                    monitor: r.monitor.clone(),
+                }
+            })
+            .collect();
+        serde_json::to_string(&linuxdrop_ipc::RedactedDiagnostics {
+            version: env!("CARGO_PKG_VERSION").into(),
+            platform: "linux".into(),
+            backends,
+            radios,
+            active_transfers: d.transfers.values().filter(|t| !t.is_terminal()).count() as u64,
+            redacted: true,
+            omitted: [
+                "names",
+                "addresses",
+                "serials",
+                "paths",
+                "keys",
+                "PINs",
+                "file names",
+                "error details",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        })
+        .expect("diagnostic export contains JSON values")
     }
+
     async fn restart_backends(&self) -> zbus::fdo::Result<()> {
         let mut d = self.0.data.lock().await;
         d.accepting_transfers()?;
@@ -566,8 +606,16 @@ impl Manager {
     }
     async fn get_diagnostics(&self) -> String {
         let d = self.0.data.lock().await;
-        json!({"version":env!("CARGO_PKG_VERSION"),"epoch":d.epoch,"backends":d.backends,"hardware":d.hardware,"active_transfers":d.transfers.values().filter(|t|!t.is_terminal()).count()}).to_string()
+        serde_json::to_string(&linuxdrop_ipc::Diagnostics {
+            version: env!("CARGO_PKG_VERSION").into(),
+            epoch: d.epoch.clone(),
+            backends: d.backends.clone(),
+            hardware: d.hardware.clone(),
+            active_transfers: d.transfers.values().filter(|t| !t.is_terminal()).count() as u64,
+        })
+        .expect("diagnostics contain JSON values")
     }
+
     async fn prepare_send(&self, paths: Vec<String>) -> zbus::fdo::Result<String> {
         let mut d = self.0.data.lock().await;
         if d.stop_when_idle {
@@ -773,7 +821,13 @@ impl Manager {
             linuxdrop_localsend::reverse::start_sources_with_budget(config, sources, budget)
                 .await
                 .map_err(failed)?;
-        let result=json!({"url":format!("http://{}",offer.address),"pin":offer.pin,"expires_in":600,"encrypted":false}).to_string();
+        let result = serde_json::to_string(&linuxdrop_ipc::DownloadOffer {
+            url: format!("http://{}", offer.address),
+            pin: offer.pin.clone(),
+            expires_in: 600,
+            encrypted: false,
+        })
+        .map_err(failed)?;
         *current = Some(offer);
         d.drafts.remove(&draft_id);
         drop(current);
@@ -991,7 +1045,18 @@ impl Manager {
             .request(&linuxdrop_netd::Request::RecoveryStatus)
             .await
             .map_err(failed)?;
-        serde_json::to_string(&response).map_err(failed)
+        match response {
+            linuxdrop_netd::Response::Recovery {
+                issues,
+                recent_errors,
+            } => serde_json::to_string(&linuxdrop_ipc::RecoveryReport::Recovery {
+                issues,
+                recent_errors,
+            })
+            .map_err(failed),
+            linuxdrop_netd::Response::Error { message } => Err(failed(message)),
+            _ => Err(failed("Unexpected recovery response")),
+        }
     }
     async fn reject_transfer(&self, id: String) -> zbus::fdo::Result<()> {
         self.0.action(&id, "reject").await

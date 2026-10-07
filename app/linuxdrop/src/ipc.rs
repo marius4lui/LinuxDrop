@@ -69,16 +69,14 @@ pub async fn json(proxy: &gio::DBusProxy, method: &str) -> Result<Value, String>
     let (text,) = result
         .get::<(String,)>()
         .ok_or("Invalid service response")?;
-    let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    if matches!(method, "GetSettings" | "GetDefaults") {
-        linuxdrop_ipc::Settings::from_value(&value)
-            .map_err(|_| crate::i18n::tr("Sharing service contract mismatch"))?;
-    }
-    if method == "GetSnapshot" {
-        linuxdrop_ipc::Snapshot::from_value(&value)
-            .map_err(|_| crate::i18n::tr("Sharing service contract mismatch"))?;
-    }
-    Ok(value)
+    parse_json(method, &text)
+}
+
+pub fn parse_json(method: &str, text: &str) -> Result<Value, String> {
+    let mismatch = || crate::i18n::tr("Sharing service contract mismatch");
+    let value: Value = serde_json::from_str(text).map_err(|_| mismatch())?;
+    let method = linuxdrop_ipc::ManagerMethod::from_name(method).ok_or_else(mismatch)?;
+    linuxdrop_ipc::validate_response(method, value).map_err(|_| mismatch())
 }
 
 pub fn string_result(value: glib::Variant) -> Result<String, String> {

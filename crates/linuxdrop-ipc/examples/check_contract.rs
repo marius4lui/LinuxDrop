@@ -20,6 +20,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(*event.args()?.revision() > snapshot["revision"].as_u64().ok_or("Missing revision")?);
     linuxdrop_ipc::Settings::from_value(&serde_json::from_str(&proxy.get_defaults().await?)?)?;
     linuxdrop_ipc::Settings::from_value(&serde_json::from_str(&proxy.get_settings().await?)?)?;
+    linuxdrop_ipc::validate_response(
+        linuxdrop_ipc::ManagerMethod::GetDiagnostics,
+        serde_json::from_str(&proxy.get_diagnostics().await?)?,
+    )?;
+    linuxdrop_ipc::validate_response(
+        linuxdrop_ipc::ManagerMethod::ExportDiagnostics,
+        serde_json::from_str(&proxy.export_diagnostics().await?)?,
+    )?;
     assert!(proxy
         .prepare_send_files(String::new(), Vec::new())
         .await

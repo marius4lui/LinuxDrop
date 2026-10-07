@@ -122,3 +122,9 @@ valid subsequent snapshot. Hardware inventory and reservation annotations now us
 including capability evidence and active-interface protection. See
 [status acceptance](acceptance/SHELL_STATUS_SCHEMA_2026-10-07.md) and
 [hardware payload acceptance](acceptance/HARDWARE_PAYLOAD_2026-10-07.md).
+
+Non-status JSON responses also use shared models. GTK validates them by
+ManagerMethod; redacted exports use a field projection, and malformed successful
+download-offer replies trigger owner-bound revocation before retry. Helper and
+daemon share diagnostic step/report types without changing their socket shape.
+See [diagnostic/offer acceptance](acceptance/DIAGNOSTIC_OFFER_TYPES_2026-10-07.md).

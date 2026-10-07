@@ -135,3 +135,44 @@ fn hardware_preserves_evidence_and_rejects_unsafe_shapes() {
         .push(radio);
     assert!(Snapshot::from_value(&value).is_err(), "Duplicate radio");
 }
+
+#[test]
+fn report_and_offer_contracts_reject_misleading_results() {
+    use linuxdrop_ipc::{validate_response, ManagerMethod::*};
+    let offer =
+        json!({"url":"http://127.0.0.1:53318","pin":"123456","expires_in":600,"encrypted":false});
+    validate_response(CreateDownloadOffer, offer.clone()).unwrap();
+    for (field, bad) in [
+        ("url", json!("file:///tmp/secret")),
+        ("url", json!("http://name.invalid:53318")),
+        ("url", json!("http://127.0.0.1:0")),
+        ("url", json!("http://127.0.0.1:53318/path")),
+        ("pin", json!(false)),
+        ("pin", json!("1234\n")),
+        ("expires_in", json!(0)),
+        ("encrypted", json!(true)),
+    ] {
+        let mut value = offer.clone();
+        value[field] = bad;
+        assert!(
+            validate_response(CreateDownloadOffer, value).is_err(),
+            "{field}"
+        );
+    }
+    let mut report = json!({"radio_id":"radio-test","restored":false,"transmitted_frames":0,"steps":[{"name":"restore","passed":false,"detail":"pending cleanup"}]});
+    validate_response(RunHardwareDiagnostic, report.clone()).unwrap();
+    report["restored"] = json!("true");
+    assert!(validate_response(RunHardwareDiagnostic, report).is_err());
+    let recovery = json!({"status":"recovery","issues":[{"lease_id":"test","interface":"ld0","ownership_verified":false,"detail":"inspect"}],"recent_errors":[]});
+    validate_response(GetRecoveryStatus, recovery.clone()).unwrap();
+    let mut bad = recovery;
+    bad["status"] = json!("ok");
+    assert!(validate_response(GetRecoveryStatus, bad).is_err());
+    let export = json!({"version":"test","platform":"linux","backends":[{"id":"localsend","state":"ready","detail":"private"}],"radios":[],"active_transfers":0,"redacted":true,"omitted":[],"private_extension":"secret"});
+    let projected = validate_response(ExportDiagnostics, export.clone()).unwrap();
+    assert!(projected.get("private_extension").is_none());
+    assert!(projected["backends"][0].get("detail").is_none());
+    let mut bad = export;
+    bad["redacted"] = json!(false);
+    assert!(validate_response(ExportDiagnostics, bad).is_err());
+}

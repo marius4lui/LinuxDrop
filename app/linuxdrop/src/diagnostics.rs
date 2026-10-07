@@ -118,9 +118,15 @@ pub fn show_report(ui: &Rc<Ui>, method: &'static str, title: &'static str) {
         ui.toast("The sharing service is not connected yet");
         return;
     };
+    let generation = ui.service_generation();
+    let owner = proxy.g_name_owner();
     let ui = ui.clone();
     glib::MainContext::default().spawn_local(async move {
-        match ipc::json(&proxy, method).await {
+        let result = ipc::json(&proxy, method).await;
+        if generation != ui.service_generation() || proxy.g_name_owner() != owner {
+            return;
+        }
+        match result {
             Ok(report) => report_dialog(&ui, title, &report),
             Err(error) => ui.toast(&error),
         }
@@ -147,6 +153,7 @@ pub fn report_dialog(ui: &Rc<Ui>, title: &str, report: &Value) {
         .extra_child(&scroll)
         .build();
     dialog.add_response("close", &tr("Close"));
+    ui.track_service_dialog(&dialog);
     dialog.present(Some(&ui.window));
 }
 
@@ -252,7 +259,7 @@ impl Ui {
                     return;
                 }
                 match result {
-                    Ok(text) => match serde_json::from_str(&text) {
+                    Ok(text) => match ipc::parse_json("RunHardwareDiagnostic", &text) {
                         Ok(report) => report_dialog(&ui, "Hardware diagnostic", &report),
                         Err(error) => ui.toast(&error.to_string()),
                     },

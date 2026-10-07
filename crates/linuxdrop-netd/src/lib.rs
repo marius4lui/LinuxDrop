@@ -74,26 +74,7 @@ pub enum LeaseKind {
     Monitor,
     DirectWifi,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DiagnosticStep {
-    pub name: String,
-    pub passed: bool,
-    pub detail: String,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DiagnosticReport {
-    pub radio_id: String,
-    pub steps: Vec<DiagnosticStep>,
-    pub restored: bool,
-    pub transmitted_frames: u64,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecoveryIssue {
-    pub lease_id: String,
-    pub interface: String,
-    pub ownership_verified: bool,
-    pub detail: String,
-}
+pub use linuxdrop_hardware::{DiagnosticReport, DiagnosticStep, RecoveryIssue};
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {

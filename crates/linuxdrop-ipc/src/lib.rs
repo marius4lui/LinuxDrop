@@ -20,3 +20,6 @@ pub use schema::snapshot_schema;
 
 mod hardware;
 pub use hardware::*;
+
+mod reports;
+pub use reports::*;

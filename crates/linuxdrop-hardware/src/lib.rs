@@ -2,6 +2,8 @@
 //! `iw` is the kernel nl80211 client; it is invoked directly, never through a shell.
 pub mod allocation;
 pub mod details;
+mod reports;
+pub use reports::*;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,

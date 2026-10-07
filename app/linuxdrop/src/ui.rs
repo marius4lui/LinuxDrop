@@ -1569,7 +1569,19 @@ impl Ui {
                             ipc::call(&proxy, "DiscardDraft", Some((draft,).to_variant())).await;
                     }
                     let result = ipc::string_result(reply?)?;
-                    serde_json::from_str(&result).map_err(|error| error.to_string())
+                    let offer = ipc::parse_json("CreateDownloadOffer", &result);
+                    if offer.is_err()
+                        && generation == ui.service_generation()
+                        && proxy.g_name_owner() == owner
+                    {
+                        // The service may have created a real offer even though
+                        // its reply cannot safely be displayed. Revoke it.
+                        let cleanup =
+                            ipc::call(&proxy, "StopDownloadOffer", Some(().to_variant())).await;
+                        ui.refresh();
+                        cleanup?;
+                    }
+                    offer
                 }
                 .await;
                 // A snapshot failure can take the UI offline while this same
