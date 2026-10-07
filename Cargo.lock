@@ -2124,6 +2124,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bluer",
+ "bluez-async",
+ "futures-util",
  "linuxdrop-core",
  "linuxdrop-network",
  "linuxdrop-storage",

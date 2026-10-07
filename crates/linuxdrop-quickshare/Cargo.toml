@@ -16,6 +16,8 @@ uuid = { version = "1", features = ["v4"] }
 bluer = { version = "0.17", features = ["bluetoothd"] }
 
 [dev-dependencies]
+bluez-async = "0.8.2"
+futures-util.workspace = true
 prost = "0.13"
 zbus.workspace = true
 tokio-util.workspace = true

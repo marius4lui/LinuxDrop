@@ -230,3 +230,10 @@ sessions/signal streams to avoid leaking connections across reconstruction.
 Private-bus tests cover cache, equal names, cancellation, daemon replacement,
 uncertain cleanup and stable client count. No new upstream implementation code
 copied. See docs/acceptance/BLUETOOTH_RECIPIENT_SCANS_2026-10-07.md.
+
+2026-10-07 local bluez-async event bounds: shared 256-message / 2-MiB retained
+payload FIFO across subscription match rules, terminal overflow and bounded
+subscription cleanup. FastInit treats stream termination as a recoverable error.
+Unit and private-bus flood tests cover bounds, complete termination and scanner
+recovery only after cleanup. No upstream implementation code copied. See
+docs/acceptance/BLUETOOTH_SIGNAL_BOUNDS_2026-10-07.md.

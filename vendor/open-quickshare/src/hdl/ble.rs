@@ -246,7 +246,8 @@ impl BleListener {
                         phase_deadline = Instant::now() + SCAN_WINDOW;
                     }
                 }
-                Some(e) = events.next() => {
+                event = events.next() => {
+                    let Some(e) = event else { anyhow::bail!("Bluetooth scanner event stream ended"); };
                     match e {
                         CentralEvent::ServiceDataAdvertisement { id, service_data } => {
                             // Sanity check as per: https://github.com/Martichou/rquickshare/issues/74

@@ -42,7 +42,7 @@ use dbus::arg::{PropMap, Variant};
 use dbus::nonblock::stdintf::org_freedesktop_dbus::{Introspectable, ObjectManager, Properties};
 use dbus::nonblock::{Proxy, SyncConnection};
 use dbus_tokio::connection::IOResourceError;
-use futures::stream::{self, StreamExt, select_all};
+use futures::stream::{self, StreamExt};
 use futures::{FutureExt, Stream};
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Display, Formatter};
@@ -1005,18 +1005,14 @@ impl BluetoothSession {
         object: Option<&P>,
         device_discovery: bool,
     ) -> Result<impl Stream<Item = BluetoothEvent> + use<P>, BluetoothError> {
-        let mut message_streams = vec![];
+        let mut messages =
+            MessageStream::new(self.connection.clone(), self._resource_lifetime.clone());
         for mut match_rule in BluetoothEvent::match_rules(object.cloned(), device_discovery) {
             match_rule.sender = Some(self.owner.clone().into());
             let msg_match = self.connection.add_match(match_rule).await?;
-            message_streams.push(MessageStream::new(
-                msg_match,
-                self.connection.clone(),
-                self._resource_lifetime.clone(),
-            ));
+            messages.add_match(msg_match);
         }
-        Ok(select_all(message_streams)
-            .flat_map(|message| stream::iter(BluetoothEvent::message_to_events(message))))
+        Ok(messages.flat_map(|message| stream::iter(BluetoothEvent::message_to_events(message))))
     }
 }
 

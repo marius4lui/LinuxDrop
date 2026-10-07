@@ -838,3 +838,13 @@ Private BlueZ fixtures cover held method replies, original-owner cleanup,
 recovery, shutdown and stable D-Bus client count. See the recipient-scan acceptance
 record. Physical interoperability and prolonged signal/resource bounds remain
 open; this does not close the overall Bluetooth/cross-protocol capacity row.
+
+## Bluetooth event queue bounds, 2026-10-07
+
+The bluez-async queue identified in the recipient-scan review is now bounded by
+both count and retained serialized bytes across all matches in a subscription.
+Overflow ends the whole stream; FastInit reports failure and rebuilds only after
+scan cleanup. Queue-level and private D-Bus flood/recovery tests pass. See
+[signal bounds](../acceptance/BLUETOOTH_SIGNAL_BOUNDS_2026-10-07.md). Broader
+long-running resource acceptance, other signal consumers and cross-protocol
+capacity still need their own evidence; this is not a blanket memory-safety claim.

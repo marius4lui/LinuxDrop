@@ -44,3 +44,7 @@ Remaining acceptance: physical phone/radio interoperability, long-running event
 flood/resource bounds and shared airtime with other protocols. The underlying
 BlueZ signal queue is still unbounded; the result/backlog limits above do not
 claim to solve that separate concern. No live-demo restart or browser use.
+
+Follow-up: the bluez-async signal queue limitation above is addressed by
+[bounded subscriptions](BLUETOOTH_SIGNAL_BOUNDS_2026-10-07.md). Broader long-running
+resource and physical acceptance remain open.
