@@ -185,10 +185,10 @@ impl Ui {
                 "compact-note",
             ));
         }
-        let destination = adw::ActionRow::builder()
-            .title(tr("Save files to"))
-            .subtitle(folder.borrow().as_str())
-            .build();
+        let destination = adw::ActionRow::new();
+        destination.set_use_markup(false);
+        destination.set_title(&tr("Save files to"));
+        destination.set_subtitle(folder.borrow().as_str());
         destination.set_widget_name("incoming-destination");
         let choose = gtk::Button::from_icon_name("folder-open-symbolic");
         choose.set_valign(gtk::Align::Center);
@@ -324,8 +324,9 @@ impl Ui {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .into_owned();
-            let row = adw::ActionRow::builder().title(&name).build();
+            let row = adw::ActionRow::new();
             row.set_use_markup(false);
+            row.set_title(&name);
             row.set_title_lines(2);
             row.set_tooltip_text(Some(path));
             let open = gtk::Button::from_icon_name("document-open-symbolic");

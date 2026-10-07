@@ -106,3 +106,13 @@ all GTK categories. Every user-facing schema field has a control; schema_version
 is internal metadata. Two numeric mismatches were corrected: zero-minute
 visibility and the full byte-precise receiving limit. This source inventory does
 not prove that every setting has passed an installed-session end-to-end test.
+
+2026-10-07 final bounded Astra/high journey review: file removal preserves
+keyboard focus, picker failures become visible, and incoming paths/received
+filenames are literal from construction. The Shell clears an obsolete launch
+error after an accepted retry. Existing isolated GTK and GNOME smoke scenarios
+passed; see [GTK journey acceptance](../acceptance/UI_GTK_JOURNEYS_FINAL_2026-10-07.md)
+and [Shell retry acceptance](../acceptance/UI_SHELL_RETRY_RECOVERY_2026-10-07.md).
+The parent also inspected the compact German incoming-dialog render. These
+scoped fixes do not close the broader installed-session or physical acceptance
+items above. No live demo restart was performed.

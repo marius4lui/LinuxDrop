@@ -109,6 +109,11 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
                         check(this._body.get_children().some(child => child instanceof St.Label && child.text === 'Launch failure for smoke test'), 'Launch failure must remain visible with retry navigation');
                         check(this._indicator.toggle.subtitle === t('Needs attention'), 'Quick Settings must expose action failures');
                         check(find(this._body, 'Details').reactive, 'Failed launch must allow retry');
+                        this._launchApp = () => {};
+                        this.openApp('--transfers');
+                        this._setExpanded(true);
+                        check(!this._actionError && this._indicator.toggle.subtitle !== t('Needs attention'), 'Successful launch retry must retire its old error when the bubble reopens');
+                        check(!this._body.get_children().some(child => child instanceof St.Label && child.text === 'Launch failure for smoke test'), 'Successful launch retry must remove stale failure text');
                     } finally { this._launchApp = launchApp; }
                     this._actionPending = false; this._serviceState = 'offline'; this._snapshot = null; this._render();
                     check(!find(this._body, 'Cancel') && find(this._body, 'Open LinuxDrop'), 'Offline state must replace stale transfer actions');

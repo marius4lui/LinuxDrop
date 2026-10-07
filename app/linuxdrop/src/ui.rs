@@ -1009,15 +1009,21 @@ impl Ui {
             .title(tr("Choose files to share"))
             .accept_label(tr("Add files"))
             .build();
-        dialog.open_multiple(Some(&self.window), gio::Cancellable::NONE, move |result| {
-            if let Ok(files) = result {
-                ui.add_files(
+        dialog.open_multiple(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            move |result| match result {
+                Ok(files) => ui.add_files(
                     (0..files.n_items())
                         .filter_map(|i| files.item(i).and_downcast::<gio::File>())
                         .collect(),
-                );
-            }
-        });
+                ),
+                Err(error)
+                    if error.matches(gtk::DialogError::Dismissed)
+                        || error.matches(gtk::DialogError::Cancelled) => {}
+                Err(error) => ui.toast(&error.to_string()),
+            },
+        );
     }
     pub fn add_files(self: &Rc<Self>, files: Vec<gio::File>) {
         let mut added = Vec::new();
@@ -1136,10 +1142,27 @@ impl Ui {
             let file = file.clone();
             remove.connect_clicked(move |_| {
                 if let Some(ui) = weak.upgrade() {
+                    let next_focus = {
+                        let files = ui.files.borrow();
+                        files
+                            .iter()
+                            .position(|entry| entry == &file)
+                            .and_then(|index| {
+                                files
+                                    .get(index + 1)
+                                    .or_else(|| {
+                                        index.checked_sub(1).and_then(|index| files.get(index))
+                                    })
+                                    .map(|file| format!("remove:{}", file.uri()))
+                            })
+                    };
                     ui.files.borrow_mut().retain(|f| f != &file);
                     ui.file_checks.borrow_mut().remove(file.uri().as_str());
                     ui.render_files();
                     ui.update_send();
+                    if !next_focus.is_some_and(|name| restore_focus(&ui.file_box, &name)) {
+                        ui.choose_button.grab_focus();
+                    }
                 }
             });
             row.append(&remove);

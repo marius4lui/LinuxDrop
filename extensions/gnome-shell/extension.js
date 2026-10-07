@@ -608,6 +608,9 @@ export default class LinuxDropExtension extends Extension {
         Main.panel.statusArea.quickSettings.menu.close();
         try {
             this._launchApp(option);
+            // A retry accepted by the launcher retires the previous failure.
+            // Drop-area startup still reports a new error if its window times out.
+            if (this._actionError) { this._actionError = null; this._render(); }
         } catch (error) {
             this._dropRequested = false; this._dropLaunchPending = false;
             if (this._dropTimeout) { GLib.source_remove(this._dropTimeout); this._dropTimeout = 0; }

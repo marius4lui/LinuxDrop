@@ -296,11 +296,12 @@ fn native_draft_focus_protocol_and_settings_regressions() {
             Some(FileCheck::Invalid(_))
         ));
         assert!(!ui.send.is_sensitive());
-        ui.files
-            .borrow_mut()
-            .retain(|file| file.path().as_ref() != Some(&root));
-        ui.render_files();
-        ui.update_send();
+        let remove = find(&ui.file_box, &format!("remove:{}", gio::File::for_path(&root).uri())).unwrap().downcast::<gtk::Button>().unwrap();
+        remove.grab_focus();
+        remove.emit_clicked();
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&ui.window),
+            find(&ui.file_box, &format!("remove:{}", gio::File::for_path(&first).uri())),
+            "Removing an invalid file keeps keyboard focus on the neighboring file action");
         assert!(ui.send.is_sensitive());
         ui.start_send();
         glib::timeout_future(Duration::from_millis(30)).await;
@@ -313,6 +314,14 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         );
         assert_eq!(ui.files.borrow()[0].path(), Some(second.clone()));
         assert_eq!(&*sent_protocol.borrow(), "quickshare");
+        ui.stack.set_visible_child_name("send");
+        let remove = find(&ui.file_box, &format!("remove:{}", gio::File::for_path(&second).uri())).unwrap().downcast::<gtk::Button>().unwrap();
+        remove.grab_focus();
+        remove.emit_clicked();
+        assert_eq!(gtk::prelude::GtkWindowExt::focus(&ui.window), Some(ui.choose_button.clone().upcast()),
+            "Removing the final file focuses Choose files so keyboard users can continue");
+        ui.add_files(vec![gio::File::for_path(&second)]);
+        settle().await;
         ui.stack.set_visible_child_name("settings");
         settle().await;
         let entry = find(&ui.settings_body, "setting:general.device_name")
@@ -525,8 +534,11 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         ui.window.set_default_size(480,600);
         ui.stack.set_visible_child_name("transfers");
         let long_name = format!("{}.txt", "long-filename-without-spaces".repeat(8));
-        let dialog = ui.accept_request(&json!({"id":"incoming-verification","peer_name":"Prüfgerät","protocol":"quickshare","direction":"incoming","state":"verification","verification_code":"1234","total_bytes":100,"receive_directory":"/tmp/Reviewed-Sender","selection_mode":"publish_selected","files":[{"name":long_name,"size":75},{"name":"excluded.txt","size":25}]}));
+        let dialog = ui.accept_request(&json!({"id":"incoming-verification","peer_name":"Prüfgerät","protocol":"quickshare","direction":"incoming","state":"verification","verification_code":"1234","total_bytes":100,"receive_directory":"/tmp/Reviewed <Sender> & files","selection_mode":"publish_selected","files":[{"name":long_name,"size":75},{"name":"excluded.txt","size":25}]}));
         settle().await;
+        let destination = find(&dialog, "incoming-destination").unwrap().downcast::<adw::ActionRow>().unwrap();
+        assert!(!destination.uses_markup(), "The receiving directory must be literal text");
+        assert_eq!(destination.subtitle().as_deref(), Some("/tmp/Reviewed <Sender> & files"));
         let long_file = find(&dialog, "incoming-file-0").unwrap();
         assert!(long_file.measure(gtk::Orientation::Horizontal, -1).0 < 400,
             "Unbroken filenames must wrap without forcing incoming review wider than a compact window");
@@ -557,13 +569,13 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         settle().await;
         let retry = ui.window.visible_dialog().expect("Failed acceptance must reopen the review").downcast::<adw::AlertDialog>().unwrap();
         assert!(!find(&retry,"incoming-file-1").unwrap().downcast::<gtk::CheckButton>().unwrap().is_active(), "Retry must preserve excluded files");
-        assert_eq!(find(&retry,"incoming-destination").unwrap().downcast::<adw::ActionRow>().unwrap().subtitle().as_deref(),Some("/tmp/Reviewed-Sender"));
+        assert_eq!(find(&retry,"incoming-destination").unwrap().downcast::<adw::ActionRow>().unwrap().subtitle().as_deref(),Some("/tmp/Reviewed <Sender> & files"));
         assert_eq!(find(&retry,"incoming-collision").unwrap().downcast::<adw::ComboRow>().unwrap().selected(),1,"Retry must preserve collision policy");
         glib::timeout_future(Duration::from_millis(400)).await;
         capture(&ui, "incoming-retry-review.png");
         retry.emit_by_name::<()>("response",&[&"accept"]);
         settle().await;
-        assert_eq!(accepted_options.borrow()["directory"],"/tmp/Reviewed-Sender","Acceptance must preserve the exact previewed destination, including automatic subfolders");
+        assert_eq!(accepted_options.borrow()["directory"],"/tmp/Reviewed <Sender> & files","Acceptance must preserve the exact previewed destination, including automatic subfolders");
         assert_eq!(accepted_options.borrow()["selected_indices"],json!([0]),"Quick Share publishes only the selected files");
         assert_eq!(accepted_options.borrow()["collision_policy"],"reject");
         retry.force_close();
