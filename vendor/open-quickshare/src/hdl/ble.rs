@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use btleplug::api::{
     AddressType, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter,
 };
@@ -10,7 +10,7 @@ use futures::stream::StreamExt;
 use tokio::sync::broadcast::Sender;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::{Uuid, uuid};
+use uuid::{uuid, Uuid};
 
 const SERVICE_UUID_SHARING: Uuid = uuid!("0000fe2c-0000-1000-8000-00805f9b34fb");
 
@@ -87,7 +87,9 @@ impl BleListener {
             return Err(anyhow!("no bluetooth adapter"));
         }
 
-        let selected = crate::bluetooth_adapter_name();
+        // Resolve through the same powered-controller policy as advertising,
+        // GATT and L2CAP; never silently take the first scanner adapter.
+        let selected = crate::bluetooth_adapter().await?.name().to_owned();
         let mut chosen = None;
         for adapter in adapters {
             let information = adapter.adapter_info().await?;
@@ -98,7 +100,7 @@ impl BleListener {
                 .rsplit('/')
                 .next()
                 .unwrap_or_default();
-            if selected.as_deref().is_none_or(|selected| name == selected) {
+            if name == selected {
                 chosen = Some(adapter);
                 break;
             }
@@ -131,6 +133,7 @@ impl BleListener {
         // Fires immediately, which opens the first scan window.
         let mut phase_deadline = Instant::now();
 
+        let outcome: Result<(), anyhow::Error> = async {
         loop {
             // While a window is open, wake early every 500ms so a suppressor
             // appearing mid-window (a slot-0 fetch or weave session starting)
@@ -151,11 +154,9 @@ impl BleListener {
                         continue;
                     }
                     if scanning {
-                        match tokio::time::timeout(DBUS_CALL_TIMEOUT, self.adapter.stop_scan()).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => debug!("{INNER_NAME}: couldn't stop the scan: {e}"),
-                            Err(_) => debug!("{INNER_NAME}: stop-scan timed out"),
-                        }
+                        tokio::time::timeout(DBUS_CALL_TIMEOUT, self.adapter.stop_scan()).await
+                            .context("Bluetooth stop-scan acknowledgement timed out")?
+                            .context("Bluetooth scan could not stop")?;
                         scanning = false;
                         phase_deadline = Instant::now() + SCAN_PAUSE;
                     } else if scanning_suppressed() {
@@ -169,25 +170,14 @@ impl BleListener {
                         // fetch timeout, so stay off the air until it's done.
                         phase_deadline = Instant::now() + SCAN_PAUSE;
                     } else {
-                        match tokio::time::timeout(
-                            DBUS_CALL_TIMEOUT,
-                            self.adapter.start_scan(ScanFilter::default()),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {
-                                scanning = true;
-                                phase_deadline = Instant::now() + SCAN_WINDOW;
-                            }
-                            Ok(Err(e)) => {
-                                warn!("{INNER_NAME}: couldn't start the scan: {e}");
-                                phase_deadline = Instant::now() + SCAN_PAUSE;
-                            }
-                            Err(_) => {
-                                warn!("{INNER_NAME}: start-scan timed out");
-                                phase_deadline = Instant::now() + SCAN_PAUSE;
-                            }
-                        }
+                        // The service may process StartDiscovery even if its
+                        // reply fails. Keep cleanup required until StopDiscovery
+                        // acknowledges it; do not report another scan as active.
+                        scanning = true;
+                        tokio::time::timeout(DBUS_CALL_TIMEOUT, self.adapter.start_scan(ScanFilter::default())).await
+                            .context("Bluetooth start-scan acknowledgement timed out")?
+                            .context("Bluetooth scan could not start")?;
+                        phase_deadline = Instant::now() + SCAN_WINDOW;
                     }
                 }
                 Some(e) = events.next() => {
@@ -231,11 +221,24 @@ impl BleListener {
             }
         }
 
-        if scanning {
-            let _ = self.adapter.stop_scan().await;
-        }
-
         Ok(())
+        }.await;
+        let cleanup = if scanning {
+            match tokio::time::timeout(DBUS_CALL_TIMEOUT, self.adapter.stop_scan()).await {
+                Ok(result) => result.context("Bluetooth scan cleanup failed"),
+                Err(error) => Err(anyhow::Error::new(error)
+                    .context("Bluetooth stop-scan acknowledgement timed out")),
+            }
+        } else {
+            Ok(())
+        };
+        match (outcome, cleanup) {
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("Scanner cleanup also failed: {cleanup:#}")))
+            }
+            (Err(error), _) => Err(error),
+            (_, result) => result,
+        }
     }
 
     /// Is a phone currently connected to us over LE?

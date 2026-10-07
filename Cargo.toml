@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/linuxdrop-core", "crates/linuxdrop-storage", "crates/linuxdrop-network", "crates/linuxdrop-localsend", "crates/linuxdrop-daemon", "crates/linuxdrop-hardware", "crates/linuxdrop-netd", "crates/linuxdrop-quickshare", "crates/linuxdrop-airdrop", "app/linuxdrop"]
-exclude = ["vendor/opendrop-rs", "vendor/open-quickshare", "vendor/bluer"]
+exclude = ["vendor/opendrop-rs", "vendor/open-quickshare", "vendor/bluer", "vendor/bluez-async"]
 
 [workspace.package]
 version = "0.1.0"
@@ -33,3 +33,4 @@ lto = "thin"
 
 [patch.crates-io]
 bluer = { path = "vendor/bluer" }
+bluez-async = { path = "vendor/bluez-async" }

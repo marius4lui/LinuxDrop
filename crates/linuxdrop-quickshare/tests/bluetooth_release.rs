@@ -1,11 +1,13 @@
 //! Real Quick Share advertisement actors against the isolated BlueZ mock.
 #[path = "../../linuxdrop-network/tests/support/bluez.rs"]
 mod bluez;
+#[path = "support/scanner.rs"]
+mod scanner;
 use bluez::{Adapter, Advertising, State};
 use std::{
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
     time::Duration,
 };
@@ -145,4 +147,88 @@ async fn receiver_recovers_release_and_sender_reports_loss_on_the_selected_contr
     assert!(error.to_string().contains("no longer active"));
     assert!(second.active.lock().unwrap().is_empty());
     assert_eq!(first.registrations.load(Ordering::SeqCst), 0);
+
+    // Exercise the real btleplug/bluez-async scanner against the same private
+    // bus, with the full Adapter1 property schema that it reads.
+    bus.object_server()
+        .remove::<Adapter, _>("/org/bluez/hci0")
+        .await
+        .unwrap();
+    bus.object_server()
+        .remove::<Adapter, _>("/org/bluez/hci1")
+        .await
+        .unwrap();
+    let first_scan = Arc::new(scanner::State::default());
+    let selected_scan = Arc::new(scanner::State::default());
+    first_scan.powered.store(true, Ordering::SeqCst);
+    selected_scan.powered.store(true, Ordering::SeqCst);
+    bus.object_server()
+        .at("/org/bluez/hci0", scanner::Scanner(first_scan.clone()))
+        .await
+        .unwrap();
+    bus.object_server()
+        .at("/org/bluez/hci1", scanner::Scanner(selected_scan.clone()))
+        .await
+        .unwrap();
+    let (alerts, _) = tokio::sync::broadcast::channel(4);
+    let listener = rqs_lib::hdl::BleListener::new(alerts.clone())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let running = tokio::spawn(async move { listener.run(run_cancel).await });
+    wait_for(|| selected_scan.starts.load(Ordering::SeqCst) == 1 || running.is_finished()).await;
+    assert!(
+        !running.is_finished(),
+        "Scanner ended before its first scan: {:?}",
+        running.await
+    );
+    selected_scan.hold_stop.store(true, Ordering::SeqCst);
+    cancel.cancel();
+    wait_for(|| selected_scan.stops.load(Ordering::SeqCst) == 1).await;
+    assert!(
+        !running.is_finished(),
+        "Scanner must retain its cleanup until acknowledgement"
+    );
+    selected_scan.hold_stop.store(false, Ordering::SeqCst);
+    selected_scan.wake.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!selected_scan.active.load(Ordering::SeqCst));
+    assert_eq!(first_scan.starts.load(Ordering::SeqCst), 0);
+
+    selected_scan.fail_start.store(true, Ordering::SeqCst);
+    let listener = rqs_lib::hdl::BleListener::new(alerts.clone())
+        .await
+        .unwrap();
+    let error = listener.run(CancellationToken::new()).await.unwrap_err();
+    assert!(error.to_string().contains("could not start"));
+    assert_eq!(selected_scan.stops.load(Ordering::SeqCst), 2);
+    assert!(!selected_scan.active.load(Ordering::SeqCst));
+    selected_scan.fail_start.store(false, Ordering::SeqCst);
+
+    selected_scan.fail_stop.store(true, Ordering::SeqCst);
+    let listener = rqs_lib::hdl::BleListener::new(alerts.clone())
+        .await
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let run_cancel = cancel.clone();
+    let running = tokio::spawn(async move { listener.run(run_cancel).await });
+    wait_for(|| selected_scan.starts.load(Ordering::SeqCst) == 3).await;
+    cancel.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("cleanup failed"));
+    assert_eq!(first_scan.starts.load(Ordering::SeqCst), 0);
+    selected_scan.powered.store(false, Ordering::SeqCst);
+    assert!(
+        rqs_lib::hdl::BleListener::new(alerts).await.is_err(),
+        "An unavailable selection must not switch to hci0"
+    );
 }

@@ -96,3 +96,21 @@ these monitors to coexist with standard adapter/GATT event routing. Cleanup stay
 pinned to the registering owner. Private-bus tests cover spoofed signals, power-off,
 removed controllers and replacing BlueZ while old/new owners coexist, plus the
 real Quick Share receiver's re-registration against that replacement.
+
+## bluez-async controller power policy
+
+`vendor/bluez-async` pins crates.io 0.8.2 (registry checksum
+`84ae4213cc2a8dc663acecac67bbdad05142be4d8ef372b6903abf878b0c690a`),
+upstream commit `6c0204b0e28804cc8b4937eec43cba9c72e0bfd5` in
+[bluez-rs/bluez-async](https://github.com/bluez-rs/bluez-async).
+The MIT and Apache-2.0 license texts are retained from that exact upstream
+commit and installed in binary packages. Registry cache markers and the upstream
+package lockfile are omitted. The sole behavioral patch removes the implicit
+`Powered=true` write when starting discovery; the related API documentation
+reflects this policy. Explicit power-control APIs are unchanged.
+
+Quick Share resolves its scanner through LinuxDrop's selected powered controller,
+reports scan start/stop failures, and awaits bounded cleanup after cancellation
+or an uncertain start reply. A private BlueZ test uses read-only Powered properties
+to ensure no implicit power writes, checks exact-controller discovery, held stop
+acknowledgements, failed-start cleanup and failed-stop reporting.
