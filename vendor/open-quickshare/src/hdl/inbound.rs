@@ -228,6 +228,7 @@ pub struct InboundRequest<S = TcpStream> {
     /// handoff; consumed by the BLE session loop (which owns a MigratableStream).
     bwu_pending: bool,
     bwu_peer_last_write: bool,
+    deferred_accept: bool,
     /// Wi-Fi upgrade retries used so far (the phone's Wi-Fi often returns a
     /// few seconds into a BLE-only transfer).
     bwu_attempts: u8,
@@ -295,6 +296,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             local_endpoint_id: None,
             bwu_pending: false,
             bwu_peer_last_write: false,
+            deferred_accept: false,
             bwu_attempts: 0,
             post_accept_lan_tries: 0,
             bwu_retry_at: None,
@@ -510,7 +512,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
     }
 
     pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
-        // Buffer for the 4-byte length
+        // A LAN handoff may overlap the consent UI. Send the queued acceptance
+        // only after the handoff has selected the current transport.
+        if std::mem::take(&mut self.deferred_accept) {
+            self.accept_transfer().await?;
+            return Ok(());
+        }
+        // The framing reader retains partial input across control messages.
         tokio::select! {
             i = self.receiver.recv() => {
                 match i {

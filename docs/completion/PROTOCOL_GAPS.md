@@ -727,10 +727,15 @@ No additional upstream implementation code was copied. Device-name hosting,
 remaining outbound handoff validation, full Bluetooth recovery/resource
 coordination and physical interoperability remain separate completion work.
 
-Validation for this pass: nine protocol-library unit tests, sixteen Quick Share
+Validation for this pass: eleven protocol-library unit tests, sixteen Quick Share
 adapter/integration tests (including the real UKEY2/file transfer), and both
 private-kernel receiver-upgrade cases passed. The client case contains seven
 success/failure scenarios. Protocol library/test Clippy and Quick Share all-target
 Clippy passed with warnings denied; the unrelated upstream `tx_probe` example
 still emits its existing dead-field warning when included in a combined
 all-target invocation. Edited Rust files were formatted and diff checks passed.
+
+Final review also covers consent overlapping an ordinary LAN handoff: acceptance
+is retained and sent after the new transport is selected, while rejection keeps
+its distinct terminal state and protocol response. Two focused regressions cover
+these decisions; they are included in the unit count above.

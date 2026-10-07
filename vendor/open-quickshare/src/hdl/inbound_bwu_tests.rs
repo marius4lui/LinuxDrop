@@ -679,3 +679,118 @@ async fn client_scenario(scenario: &str) {
         "Each join owns exactly one cleanup"
     );
 }
+
+#[tokio::test]
+async fn consent_during_prior_channel_drain_is_preserved() {
+    let (local, remote) = tokio::io::duplex(16384);
+    let (events, _) = tokio::sync::broadcast::channel(32);
+    let mut receiver = InboundRequest::new(
+        MigratableStream::Ble(local),
+        "consent".into(),
+        events.clone(),
+    );
+    let mut peer =
+        InboundRequest::new(MigratableStream::Ble(remote), "peer".into(), events.clone());
+    keys(&mut receiver, 1, 2);
+    keys(&mut peer, 2, 1);
+    receiver.state.state = TransferState::WaitingForUserConsent;
+    let task = tokio::spawn(async move {
+        receiver.drain_prior_channel().await.unwrap();
+        receiver
+    });
+    assert_eq!(
+        bwu_event(peer.read_encrypted_offline_frame().await.unwrap()),
+        EventType::LastWriteToPriorChannel
+    );
+    events
+        .send(ChannelMessage {
+            id: "consent".into(),
+            msg: channel::Message::Lib {
+                action: TransferAction::ConsentAccept,
+            },
+        })
+        .unwrap();
+    peer.encrypt_and_send(&InboundRequest::<MigratableStream>::bwu_frame(
+        EventType::LastWriteToPriorChannel,
+        None,
+        None,
+    ))
+    .await
+    .unwrap();
+    peer.encrypt_and_send(&InboundRequest::<MigratableStream>::bwu_frame(
+        EventType::SafeToClosePriorChannel,
+        None,
+        None,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        bwu_event(peer.read_encrypted_offline_frame().await.unwrap()),
+        EventType::SafeToClosePriorChannel
+    );
+    let mut receiver = task.await.unwrap();
+    assert!(receiver.deferred_accept);
+    assert_eq!(receiver.state.state, TransferState::WaitingForUserConsent);
+    receiver.handle().await.unwrap();
+    assert_eq!(receiver.state.state, TransferState::ReceivingFiles);
+    let confirmation = peer.read_encrypted_offline_frame().await.unwrap();
+    let packet = confirmation
+        .v1
+        .unwrap()
+        .payload_transfer
+        .unwrap()
+        .payload_chunk
+        .unwrap();
+    let sharing = sharing_nearby::Frame::decode(packet.body().as_ref()).unwrap();
+    assert_eq!(
+        sharing.v1.unwrap().connection_response.unwrap().status(),
+        sharing_nearby::connection_response_frame::Status::Accept
+    );
+    receiver.state.state = TransferState::Finished;
+    peer.state.state = TransferState::Finished;
+}
+
+#[tokio::test]
+async fn rejecting_during_upgrade_remains_a_rejection() {
+    let (local, remote) = tokio::io::duplex(16384);
+    let (events, _) = tokio::sync::broadcast::channel(32);
+    let mut receiver = InboundRequest::new(
+        MigratableStream::Ble(local),
+        "reject".into(),
+        events.clone(),
+    );
+    let mut peer =
+        InboundRequest::new(MigratableStream::Ble(remote), "peer".into(), events.clone());
+    keys(&mut receiver, 1, 2);
+    keys(&mut peer, 2, 1);
+    receiver.state.state = TransferState::WaitingForUserConsent;
+    events
+        .send(ChannelMessage {
+            id: "reject".into(),
+            msg: channel::Message::Lib {
+                action: TransferAction::ConsentDecline,
+            },
+        })
+        .unwrap();
+    assert!(
+        receiver
+            .next_upgrade_frame(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .is_err()
+    );
+    assert_eq!(receiver.state.state, TransferState::Rejected);
+    let rejection = peer.read_encrypted_offline_frame().await.unwrap();
+    let packet = rejection
+        .v1
+        .unwrap()
+        .payload_transfer
+        .unwrap()
+        .payload_chunk
+        .unwrap();
+    let sharing = sharing_nearby::Frame::decode(packet.body()).unwrap();
+    assert_eq!(
+        sharing.v1.unwrap().connection_response.unwrap().status(),
+        sharing_nearby::connection_response_frame::Status::Reject
+    );
+    peer.state.state = TransferState::Finished;
+}

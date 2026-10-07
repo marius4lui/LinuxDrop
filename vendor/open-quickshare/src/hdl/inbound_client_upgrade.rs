@@ -33,11 +33,22 @@ impl InboundRequest<MigratableStream> {
                     let message = message.context("Upgrade control channel closed or lagged")?;
                     if message.id != self.state.id && message.id != "*" { continue; }
                     match message.msg {
-                        channel::Message::Lib { action: TransferAction::TransferCancel | TransferAction::ConsentDecline } => {
-                            self.update_state(|state| state.state = TransferState::Cancelled, true).await;
-                            let _ = tokio::time::timeout(Duration::from_secs(2), self.disconnection()).await;
+                        channel::Message::Lib { action: action @ (TransferAction::TransferCancel | TransferAction::ConsentDecline) } => {
+                            let declined = matches!(action, TransferAction::ConsentDecline);
+                            self.update_state(|state| state.state = if declined { TransferState::Rejected } else { TransferState::Cancelled }, true).await;
+                            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                                if declined {
+                                    self.reject_transfer(Some(sharing_nearby::connection_response_frame::Status::Reject)).await
+                                } else {
+                                    self.disconnection().await
+                                }
+                            }).await;
                             return Err(anyhow!(crate::errors::AppError::NotAnError));
                         }
+                        channel::Message::Lib { action: TransferAction::ConsentAccept }
+                            if self.state.state == TransferState::WaitingForUserConsent => {
+                                self.deferred_accept = true;
+                            }
                         _ => continue,
                     }
                 }
