@@ -709,7 +709,11 @@ fn native_draft_focus_protocol_and_settings_regressions() {
         assert!(amount.is_sensitive());
         assert!(amount.grab_focus(), "Numeric edit must actually acquire focus");
         settle().await;
-        assert!(gtk::prelude::GtkWindowExt::focus(&ui.window).is_some_and(|focus| focus == amount.clone().upcast::<gtk::Widget>() || focus.is_ancestor(&amount)), "The edited row must own actual keyboard focus");
+        // The real polling loop can rebuild settings while settling. Inspect
+        // and edit the current visible row, not an obsolete widget instance.
+        let amount = find(&ui.settings_body, "setting:receive.max_bytes").unwrap().downcast::<adw::SpinRow>().unwrap();
+        let numeric_focus = gtk::prelude::GtkWindowExt::focus(&ui.window);
+        assert!(numeric_focus.as_ref().is_some_and(|focus| *focus == amount.clone().upcast::<gtk::Widget>() || focus.is_ancestor(&amount)), "The edited row must own actual keyboard focus: {numeric_focus:?}; row rooted: {}", amount.root().is_some());
         amount.set_value(107_374.182_401);
         assert_eq!((amount.value() * 1_000_000.0).round() as u64, 107_374_182_401);
         find(&ui.settings_body, "setting:search").unwrap().grab_focus();

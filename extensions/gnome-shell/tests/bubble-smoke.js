@@ -1,5 +1,8 @@
 // Injected only into the isolated test copy by run-bubble-smoke.sh.
 GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
+    if (GLib.getenv('LINUXDROP_SMOKE_SCALE') &&
+        !GLib.file_test(`${GLib.getenv('LINUXDROP_SMOKE_ROOT')}/monitor-scale.json`, GLib.FileTest.EXISTS))
+        return GLib.SOURCE_CONTINUE;
     const check = (condition, message) => { if (!condition) throw new Error(message); };
     const settle = () => new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => { resolve(); return GLib.SOURCE_REMOVE; }));
     const later = callback => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
@@ -60,6 +63,12 @@ GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1200, () => {
             check(find(this._body, 'Codes match'), 'Verification action must be available');
             check(find(this._body, 'Drop files') && find(this._body, 'Settings'), 'Incoming verification must retain send and settings access');
             check(this._body.width <= this._notch.width, 'Body must fit the bubble');
+            const bounds = this._monitor();
+            const [bubbleX, bubbleY] = this._notch.get_transformed_position();
+            const [bubbleWidth, bubbleHeight] = this._notch.get_transformed_size();
+            check(bubbleX >= bounds.x && bubbleX + bubbleWidth <= bounds.x + bounds.width &&
+                bubbleY >= bounds.y + Main.panel.height && bubbleY + bubbleHeight <= bounds.y + bounds.height,
+                'Bubble must fit the actual logical monitor below the panel');
             for (const name of ['Codes match', 'Decline', 'Details']) {
                 const button = find(this._body, name);
                 check(button.width <= this._body.width, `${name} must fit the body`);

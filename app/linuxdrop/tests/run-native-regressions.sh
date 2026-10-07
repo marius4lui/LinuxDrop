@@ -36,7 +36,17 @@ cat > "$runtime/session.conf" <<EOF
 </busconfig>
 EOF
 export GDK_BACKEND=x11 GSK_RENDERER=cairo LIBGL_ALWAYS_SOFTWARE=1
+if [ -n "${LINUXDROP_NATIVE_WAYLAND_DISPLAY:-}" ]; then
+    # An absolute socket path keeps the private compositor while this runner
+    # isolates the application bus, configuration and protocol fixture again.
+    test -S "$LINUXDROP_NATIVE_WAYLAND_DISPLAY"
+    export GDK_BACKEND=wayland WAYLAND_DISPLAY="$LINUXDROP_NATIVE_WAYLAND_DISPLAY"
+fi
 export LANG=de_DE.UTF-8 LINUXDROP_REVIEW_SIZE=480x600
 exec_status=0
-dbus-run-session --config-file="$runtime/session.conf" -- xvfb-run -a "$1" --ignored --test-threads=1 --nocapture || exec_status=$?
+if [ "$GDK_BACKEND" = wayland ]; then
+    dbus-run-session --config-file="$runtime/session.conf" -- "$1" --ignored --test-threads=1 --nocapture || exec_status=$?
+else
+    dbus-run-session --config-file="$runtime/session.conf" -- xvfb-run -a "$1" --ignored --test-threads=1 --nocapture || exec_status=$?
+fi
 exit "$exec_status"

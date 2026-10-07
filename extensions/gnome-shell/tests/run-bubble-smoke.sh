@@ -4,6 +4,9 @@
 # LINUXDROP_SMOKE_MONITOR can constrain the isolated virtual monitor (default 1440x900).
 # LINUXDROP_SMOKE_REAL_DROP=1 also opens the installed GTK drop surface on this
 # private display; LINUXDROP_SMOKE_CAPTURE_DROP optionally records it.
+# LINUXDROP_SMOKE_SCALE applies real Mutter logical-monitor scaling (1.25/1.5/2).
+# LINUXDROP_SMOKE_GTK_TEST optionally runs the native GTK test executable on the
+# same Wayland compositor with another private application bus.
 set -eu
 if [ "$(id -u)" = 0 ]; then echo 'Run this isolated test as an unprivileged user.' >&2; exit 1; fi
 runroot=$(mktemp -d /tmp/linuxdrop-bubble-smoke.XXXXXX)
@@ -56,11 +59,17 @@ dbus-run-session -- bash -c '
     gsettings set org.gnome.desktop.interface enable-hot-corners false
     gsettings set org.gnome.desktop.notifications show-banners false
     gsettings set org.gnome.desktop.session idle-delay 0
+    if [ -n "${LINUXDROP_SMOKE_SCALE:-}" ]; then
+        gsettings set org.gnome.mutter experimental-features "[\"scale-monitor-framebuffer\"]"
+    fi
     if [ "${LINUXDROP_SMOKE_ORCA:-0}" = 1 ]; then
         gsettings set org.gnome.desktop.interface toolkit-accessibility true
     fi
     gnome-shell --headless --wayland --no-x11 --wayland-display=linuxdrop-bubble-smoke --virtual-monitor="${LINUXDROP_SMOKE_MONITOR:-1440x900}" > "$LINUXDROP_SMOKE_ROOT/shell.log" 2>&1 &
     shell_pid=$!
+    if [ -n "${LINUXDROP_SMOKE_SCALE:-}" ]; then
+        python3 extensions/gnome-shell/tests/monitor-scale.py
+    fi
     if [ "${LINUXDROP_SMOKE_ORCA:-0}" = 1 ]; then
         for attempt in {1..50}; do
             [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ] || break
@@ -87,6 +96,10 @@ dbus-run-session -- bash -c '
                 export LD_LIBRARY_PATH="$library${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             done
             gjs -m "$extension/tests/prefs-smoke.js" "$extension"
+            if [ -n "${LINUXDROP_SMOKE_GTK_TEST:-}" ]; then
+                LINUXDROP_NATIVE_WAYLAND_DISPLAY="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" \
+                    timeout 90 sh app/linuxdrop/tests/run-native-regressions.sh "$LINUXDROP_SMOKE_GTK_TEST"
+            fi
             exit 0
         fi
     done

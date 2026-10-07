@@ -66,6 +66,15 @@ jobs:
             LINUXDROP_SMOKE_ORCA=1 LINUXDROP_SMOKE_MOCK_LOGIND=1 \
             LINUXDROP_SMOKE_TEXT_SCALE=1.5 LINUXDROP_SMOKE_MONITOR=800x600 \
             bash extensions/gnome-shell/tests/run-bubble-smoke.sh
+      - name: Actual monitor scaling
+        if: matrix.distro == 'ubuntu'
+        run: |
+          for scale in 1.25 1.5 2; do
+            runuser -u linuxdrop-ci -- env LANG=de_DE.UTF-8 LANGUAGE=de \
+              LINUXDROP_SMOKE_SCALE="$scale" LINUXDROP_SMOKE_MOCK_LOGIND=1 \
+              LINUXDROP_SMOKE_MONITOR=1920x1200 \
+              bash extensions/gnome-shell/tests/run-bubble-smoke.sh
+          done
       - name: Completed transfer opens the real file manager
         if: matrix.distro == 'ubuntu'
         run: |
