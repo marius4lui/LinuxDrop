@@ -187,3 +187,10 @@ credentials use the actual supplicant identity and omit SSID/password for
 name-based offers. Private D-Bus tests cover WPS success/failure cleanup; the
 kernel transfer fixture now exercises both host authentication modes. No new
 upstream implementation code imported; primary references are in the completion log.
+
+
+2026-10-07 local handoff validation: persistent outbound framing, negotiated ACK
+validation and strict prior-channel completion; shared bounded host introduction
+checks against retained BLE/mDNS/ConnectionRequest endpoint identity. Encrypted
+TCP/duplex and private-kernel regressions cover malformed introductions, ACKs,
+cancellation and incomplete drains. No additional upstream code was copied.

@@ -150,7 +150,7 @@ async fn send_frame_on<W: AsyncWrite + Unpin>(
 /// Retain partially read framing across competing upgrade/control futures.
 /// Cancelling `read` never discards bytes already consumed from the transport.
 #[derive(Debug, Default)]
-struct FrameReader {
+pub(super) struct FrameReader {
     length: [u8; 4],
     length_read: usize,
     body: Vec<u8>,
@@ -158,7 +158,10 @@ struct FrameReader {
     deadline: Option<tokio::time::Instant>,
 }
 impl FrameReader {
-    async fn read<S: AsyncRead + Unpin>(&mut self, socket: &mut S) -> anyhow::Result<Vec<u8>> {
+    pub(super) async fn read<S: AsyncRead + Unpin>(
+        &mut self,
+        socket: &mut S,
+    ) -> anyhow::Result<Vec<u8>> {
         while self.length_read < 4 {
             let read = socket.read(&mut self.length[self.length_read..]);
             let count = if let Some(deadline) = self.deadline {
@@ -224,6 +227,7 @@ pub struct InboundRequest<S = TcpStream> {
     /// encrypted connection is established.
     bwu_tcp_port: Option<u16>,
     local_endpoint_id: Option<[u8; 4]>,
+    remote_endpoint_id: Option<[u8; 4]>,
     /// Set by the state machine when it's time to run the bandwidth-upgrade
     /// handoff; consumed by the BLE session loop (which owns a MigratableStream).
     bwu_pending: bool,
@@ -294,6 +298,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             bandwidth: crate::payload_budget::current(),
             bwu_tcp_port: None,
             local_endpoint_id: None,
+            remote_endpoint_id: None,
             bwu_pending: false,
             bwu_peer_last_write: false,
             deferred_accept: false,
@@ -441,6 +446,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
     }
 
     /// Build a plaintext CLIENT_INTRODUCTION_ACK (sent over the new TCP channel).
+    #[cfg(test)]
     fn bwu_ack_frame() -> OfflineFrame {
         use location_nearby_connections::BandwidthUpgradeNegotiationFrame;
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
@@ -466,6 +472,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
     /// Read one encrypted frame from the current channel and return the decrypted
     /// OfflineFrame (advancing client_seq). Used to drain the BLE channel during a
     /// bandwidth upgrade without dispatching to the payload state machine.
+    #[cfg(test)]
     async fn read_encrypted_offline_frame(&mut self) -> Result<OfflineFrame, anyhow::Error> {
         let data = self.framing.read(&mut self.socket).await?;
         self.decrypt_offline_frame(&data).await
@@ -670,6 +677,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> InboundRequest<S> {
             .as_ref()
             .ok_or_else(|| anyhow!("Missing required fields"))?;
 
+        self.remote_endpoint_id = connection_request.endpoint_id().as_bytes().try_into().ok();
         self.remote_mediums = connection_request.mediums.clone();
         self.remote_metadata = connection_request.medium_metadata.clone();
 
@@ -2121,8 +2129,6 @@ impl InboundRequest<crate::hdl::MigratableStream> {
     /// streams over Wi-Fi with the same keys/sequence numbers. Setup failures
     /// retain BLE; a broken encrypted handoff ends the session.
     pub async fn do_bwu(&mut self) -> Result<(), anyhow::Error> {
-        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
-
         if matches!(self.socket, crate::hdl::MigratableStream::Tcp(_)) {
             return Ok(());
         }
@@ -2170,64 +2176,23 @@ impl InboundRequest<crate::hdl::MigratableStream> {
             .collect();
         self.send_upgrade_path_available(&addresses).await?;
 
-        // Wait for the phone to connect over TCP -- while KEEPING the BLE
-        // channel read: a phone whose Wi-Fi is still down reports
-        // UPGRADE_FAILURE over BLE and then waits for the session to carry
-        // on. Blocking deaf in accept() here stalled exactly those transfers
-        // to death. Generous deadline: rejoining Wi-Fi can take beyond 15s.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let mut tcp = loop {
-            tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((s, peer)) => {
-                        if !s.local_addr().is_ok_and(|local| crate::lan_policy::permits(local.ip(), peer.ip())) { continue; }
-                        info!("BWU: phone connected over TCP from {peer}");
-                        break s;
-                    }
-                    Err(e) => {
-                        warn!("BWU: TCP accept failed ({e}); staying on BLE");
-                        self.bwu_failure_fallback();
-                        return Ok(());
-                    }
-                },
-                frame = self.read_encrypted_offline_frame() => {
-                    let offline = frame?;
-                    let is_upgrade_failure = offline
-                        .v1
-                        .as_ref()
-                        .filter(|v| {
-                            v.r#type()
-                                == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
-                        })
-                        .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
-                        .map(|b| b.event_type() == EventType::UpgradeFailure)
-                        .unwrap_or(false);
-                    if is_upgrade_failure {
-                        warn!("BWU: phone reported UPGRADE_FAILURE; continuing over BLE");
-                        self.bwu_failure_fallback();
-                        return Ok(());
-                    }
-                    // Keep the handshake moving (paired-key frames, keep-alives,
-                    // even the consent response arrive here).
-                    self.process_offline_frame(offline).await?;
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    warn!("BWU: no TCP upgrade within timeout; staying on BLE");
-                    self.bwu_failure_fallback();
-                    return Ok(());
-                }
+        let Some(expected) = self.remote_endpoint_id else {
+            self.bwu_failure_fallback();
+            return Ok(());
+        };
+        let tcp = match self
+            .during_upgrade(
+                super::upgrade_introduction::accept(&listener, expected, true),
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            )
+            .await?
+        {
+            Ok(tcp) => tcp,
+            Err(_) => {
+                self.bwu_failure_fallback();
+                return Ok(());
             }
         };
-
-        // Plaintext CLIENT_INTRODUCTION → CLIENT_INTRODUCTION_ACK on the new socket.
-        let intro = read_frame_from(&mut tcp).await?;
-        if let Ok(f) = OfflineFrame::decode(&*intro) {
-            debug!(
-                "BWU: TCP intro frame type={:?}",
-                f.v1.as_ref().map(|v| v.r#type())
-            );
-        }
-        send_frame_on(&mut tcp, &Self::bwu_ack_frame().encode_to_vec()).await?;
 
         // Drain the BLE channel completely, then swap (see drain_prior_channel).
         self.drain_prior_channel().await?;
@@ -2305,61 +2270,24 @@ impl InboundRequest<crate::hdl::MigratableStream> {
         ))
         .await?;
 
-        // The phone must enable its radio, join our network and get DHCP —
-        // allow generously, while keeping the BLE channel read.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-        let mut tcp = loop {
-            tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((s, peer)) => {
-                        info!("BWU: sender joined our hotspot and connected from {peer}");
-                        break s;
-                    }
-                    Err(e) => {
-                        warn!("BWU: accept on the hotspot failed ({e}); staying on BLE");
-                        self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
-                        self.schedule_bwu_retry();
-                        return Ok(());
-                    }
-                },
-                frame = self.read_encrypted_offline_frame() => {
-                    let offline = frame?;
-                    let is_upgrade_failure = offline
-                        .v1
-                        .as_ref()
-                        .filter(|v| {
-                            v.r#type()
-                                == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
-                        })
-                        .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
-                        .map(|b| b.event_type() == EventType::UpgradeFailure)
-                        .unwrap_or(false);
-                    if is_upgrade_failure {
-                        warn!("BWU: sender couldn't join our hotspot (UPGRADE_FAILURE); staying on BLE");
-                        self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
-                        self.schedule_bwu_retry();
-                        return Ok(());
-                    }
-                    self.process_offline_frame(offline).await?;
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    warn!("BWU: sender never joined our hotspot; staying on BLE");
-                    self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
-                    self.schedule_bwu_retry();
-                    return Ok(());
-                }
+        let Some(expected) = self.remote_endpoint_id else {
+            self.schedule_bwu_retry();
+            return Ok(());
+        };
+        let tcp = match self
+            .during_upgrade(
+                super::upgrade_introduction::accept(&listener, expected, false),
+                tokio::time::Instant::now() + Duration::from_secs(45),
+            )
+            .await?
+        {
+            Ok(tcp) => tcp,
+            Err(_) => {
+                self.bwu_try_hotspot = crate::utils::local_lan_ip().is_none();
+                self.schedule_bwu_retry();
+                return Ok(());
             }
         };
-
-        // Plaintext CLIENT_INTRODUCTION → CLIENT_INTRODUCTION_ACK on the new socket.
-        let intro = read_frame_from(&mut tcp).await?;
-        if let Ok(f) = OfflineFrame::decode(&*intro) {
-            debug!(
-                "BWU: hotspot intro frame type={:?}",
-                f.v1.as_ref().map(|v| v.r#type())
-            );
-        }
-        send_frame_on(&mut tcp, &Self::bwu_ack_frame().encode_to_vec()).await?;
 
         // Drain the BLE channel completely, then swap (see drain_prior_channel).
         self.drain_prior_channel().await?;

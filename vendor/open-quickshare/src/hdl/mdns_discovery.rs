@@ -25,6 +25,18 @@ pub struct EndpointInfo {
 }
 
 impl EndpointInfo {
+    pub fn endpoint_id(&self) -> Option<[u8; 4]> {
+        use base64::Engine;
+        let label = self.fullname.split('.').next()?;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(label)
+            .ok()?;
+        if decoded.len() != 10 || decoded[0] != 0x23 || decoded[5..8] != [0xfc, 0x9f, 0x5e] {
+            return None;
+        }
+        decoded[1..5].try_into().ok()
+    }
+
     pub fn socket_address(&self) -> Result<std::net::SocketAddr, anyhow::Error> {
         use anyhow::Context;
         let ip = self.ip.as_deref().context("Missing endpoint address")?;

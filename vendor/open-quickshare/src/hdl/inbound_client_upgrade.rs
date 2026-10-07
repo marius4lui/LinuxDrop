@@ -63,7 +63,7 @@ impl InboundRequest<MigratableStream> {
     /// Continue consuming BLE payload/control while the dedicated radio joins,
     /// TCP connects, or the peer acknowledges our introduction. The outer error
     /// ends a damaged/cancelled session; the inner error permits BLE fallback.
-    async fn during_upgrade<T>(
+    pub(super) async fn during_upgrade<T>(
         &mut self,
         operation: impl Future<Output = anyhow::Result<T>>,
         deadline: Instant,

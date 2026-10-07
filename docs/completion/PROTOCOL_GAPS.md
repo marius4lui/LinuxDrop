@@ -37,7 +37,7 @@ Audit date: 2026-10-06. Checked boxes mean software implemented and locally exer
 - [x] Receiver-initiated dynamic role switching with advertised local identity, reserved-radio joining, consent, cancellation and encrypted channel continuity.
 - [x] Device-name/PBC Wi-Fi Direct hosting and joining, optional eight-digit PIN joining, P2P discovery and negotiated group connection (software/isolated fixtures).
 - [x] Exclusive hardware lease and transfer semaphore for radio-changing upgrades, unique owned NetworkManager profiles and cancellation cleanup; isolated D-Bus lifecycle test passed.
-- [ ] Protocol metadata and upgrade failure regression tests beyond existing TCP handshake simulator.
+- [x] Protocol metadata and upgrade failure regressions beyond the TCP handshake: role/auth selection, consent, introduction/ACK checks, strict handoff, cancellation and isolated owned-radio cleanup.
 
 Google's wire schema distinguishes password-based joining from device-name discovery. `device_name` is field 9; field 8 is an optional PIN reserved for future use with the device-name mode, not a requirement that every such offer includes a PIN. The engine now decodes these fields and routes empty-SSID offers through the reserved supplicant helper, with PBC for an empty PIN. Discovery, group identity, cancellation, DHCP and cleanup paths exist. Password-based group hosting, capability-based role advertisement and IPv6/address-candidate paths are now implemented and have scoped simulation evidence below. Device-name/PBC hosting now follows peer authentication capabilities and uses the existing supplicant identity. Full physical peer interoperability remains unverified. Receiver-as-client dynamic role switching and supplicant owner-change handling have scoped implementation and simulation evidence below. Password-based joining and an ordinary NetworkManager AP are not labelled complete Wi-Fi Direct conformance.
 
@@ -774,3 +774,47 @@ case now runs password and device-name peers, checks the offered fields and
 continues encrypted TCP sequence state. The client case retains its seven
 success/failure scenarios. These checks use a simulated supplicant/helper and
 real D-Bus/TCP/kernel isolation; they do not certify a physical WPS handshake.
+
+
+## Checked bandwidth-upgrade handoffs, 2026-10-07
+
+Outbound upgrade reads now share the persistent frame reader used by receivers;
+a competing control/network future cannot discard a partially read header or
+body. During radio joining, TCP connection, introduction acknowledgment and
+prior-channel drain, local cancellation remains active and old-channel frames
+continue through the encrypted dispatcher. The sender reads an introduction ACK
+only when the offer advertises it, and checks version/type/event/body. Both
+sender roles require LAST_WRITE and SAFE_TO_CLOSE before committing the swap.
+EOF, invalid sequence/signature, timeout or rejection during that drain ends the
+session; process_consent no longer turns a damaged handoff into BLE fallback.
+Setup failures before LAST_WRITE retain BLE, report the failed medium, and
+release any owned joined network. Early peer LAST_WRITE is retained; failure
+after it is terminal.
+
+Both receiver host paths and sender-hosted upgrades use the same bounded
+introduction acceptor. It checks version, frame type, event, body and exact
+four-byte endpoint before acknowledging. Failed, oversized or stray TCP clients
+are closed while the established encrypted/control channel remains serviced.
+Each introduction is limited to 1 KiB and five seconds, inside the existing
+overall offer deadline. Sender identity comes from the fresh BLE target or the
+mDNS service bytes carried into SendInfo, never from display names or IPs.
+Receivers retain the endpoint from ConnectionRequest. This plaintext identity
+is routing correlation, not authentication; encryption stays enabled and the
+existing UKEY2 keys, sequence numbers and consent remain required.
+
+Evidence: fourteen protocol unit tests, sixteen Quick Share wrapper/integration
+tests (including UKEY2/exact file bytes), and both isolated kernel handoff tests
+pass. The outbound regression has ten scenarios: ACK/no-ACK, wrong type, missing
+body, wrong version, oversized ACK, early LAST_WRITE with valid/invalid ACK,
+truncated drain and local cancellation. Successful cases continue encrypted TCP
+with matching sequence state. Both receiver host authentication modes reject a
+closed client, wrong endpoint and oversized introduction before accepting the
+correct client. Parser and discovery identity checks have focused regressions.
+Physical peer acceptance remains separate; these fixtures do not prove a real
+Android/Apple radio transfer. Full sender-hosted radio acceptance and broader
+Bluetooth recovery remain in the overall completion audit.
+
+Primary event/frame references: Google's
+[bandwidth-upgrade manager](https://chromium.googlesource.com/external/github.com/google/nearby-connections/+/02354e29683393549b588a3ce2599a717f6da98e/connections/implementation/bwu_manager.cc)
+and [frame constructors](https://chromium.googlesource.com/external/github.com/google/nearby-connections/+/8efa219dcfb6157fcc0791e45ef45989d681518b/connections/implementation/offline_frames.cc).
+No upstream implementation code was copied.

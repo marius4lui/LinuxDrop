@@ -26,6 +26,8 @@ pub struct SendInfo {
     /// placeholder in this case. Ignored on non-Linux / non-experimental builds.
     #[serde(default)]
     pub ble: bool,
+    #[serde(default)]
+    pub peer_endpoint_id: Option<[u8; 4]>,
 }
 
 pub struct TcpServer {
@@ -199,6 +201,8 @@ impl TransferConnector {
             },
         );
 
+        or.set_peer_endpoint(si.peer_endpoint_id);
+
         // Send connection request
         or.send_connection_request().await?;
         // Send UKEY init
@@ -265,7 +269,7 @@ impl TransferConnector {
             };
             match dial(&adapter, &target).await {
                 Ok(stream) => {
-                    connected = Some((stream, target.rdi));
+                    connected = Some((stream, target.rdi, target.endpoint_id));
                     break;
                 }
                 Err(e) => {
@@ -278,7 +282,7 @@ impl TransferConnector {
                 }
             }
         }
-        let Some((stream, rdi)) = connected else {
+        let Some((stream, rdi, peer_endpoint)) = connected else {
             return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("BLE connect failed")));
         };
 
@@ -302,6 +306,7 @@ impl TransferConnector {
             si.ob,
             rdi,
         );
+        or.set_peer_endpoint(Some(peer_endpoint));
         if total_bytes <= SMALL_SEND_BYTES {
             // BLE_L2CAP (10) only: the phone (advertiser) has no Wi-Fi medium
             // in common with us, so it never offers an upgrade.

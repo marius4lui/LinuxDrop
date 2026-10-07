@@ -159,6 +159,7 @@ async fn main() -> Result<(), anyhow::Error> {
         };
         let is_ble = ei.ble_addr.is_some();
         let si = SendInfo {
+            peer_endpoint_id: ei.endpoint_id(),
             id: ei.id.clone(),
             name: ei.name.clone().unwrap_or_default(),
             addr: if is_ble {

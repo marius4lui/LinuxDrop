@@ -188,6 +188,54 @@ async fn receiver_hosts_group(auth: P2pHostAuth) {
                 supports_disabling_encryption: Some(false),
             }),
         );
+        // A wrong endpoint and an oversized unauthenticated introduction must
+        // close only their own TCP socket, never the established BLE session.
+        let mut rogue =
+            tokio::net::TcpStream::connect((credentials.gateway(), credentials.port() as u16))
+                .await
+                .unwrap();
+        let mut wrong = introduction.clone();
+        wrong
+            .v1
+            .as_mut()
+            .unwrap()
+            .bandwidth_upgrade_negotiation
+            .as_mut()
+            .unwrap()
+            .client_introduction
+            .as_mut()
+            .unwrap()
+            .endpoint_id = Some("NOPE".into());
+        // Close the initially accepted socket first, so the fixture verifies
+        // failed reads too and lets the listener move to the rogue connection.
+        tcp.shutdown().await.unwrap();
+        send_frame_on(&mut rogue, &wrong.encode_to_vec())
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut rogue, &mut byte)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut oversized =
+            tokio::net::TcpStream::connect((credentials.gateway(), credentials.port() as u16))
+                .await
+                .unwrap();
+        tokio::io::AsyncWriteExt::write_u32(&mut oversized, 1025)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::io::AsyncReadExt::read(&mut oversized, &mut byte)
+                .await
+                .unwrap(),
+            0
+        );
+        let mut tcp =
+            tokio::net::TcpStream::connect((credentials.gateway(), credentials.port() as u16))
+                .await
+                .unwrap();
         send_frame_on(&mut tcp, &introduction.encode_to_vec())
             .await
             .unwrap();

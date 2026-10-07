@@ -380,6 +380,7 @@ fn prepare_send(
     }
     Ok((
         SendInfo {
+            peer_endpoint_id: peer.endpoint_id(),
             id: id.into(),
             name: transfer.peer_name.clone(),
             addr: if peer.ble_addr.is_some() {

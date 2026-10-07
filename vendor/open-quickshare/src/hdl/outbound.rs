@@ -78,7 +78,7 @@ async fn read_plain_frame<R: tokio::io::AsyncRead + Unpin>(
     let mut len_buf = [0u8; 4];
     stream_read_exact(stream, &mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > SANE_FRAME_LENGTH as usize {
+    if len == 0 || len > 1024 {
         return Err(anyhow!("bad frame length {len}"));
     }
     let mut data = vec![0u8; len];
@@ -163,9 +163,11 @@ impl OutboundPayload {
 #[derive(Debug)]
 pub struct OutboundRequest<S = TcpStream> {
     endpoint_id: [u8; 4],
+    peer_endpoint_id: Option<[u8; 4]>,
     socket: S,
-    length_buf: [u8; 4],
-    length_read: usize,
+    framing: super::inbound::FrameReader,
+    bwu_peer_last_write: bool,
+    bwu_offer_medium: Option<i32>,
     pub state: InnerState,
     sender: Sender<ChannelMessage>,
     receiver: Receiver<ChannelMessage>,
@@ -211,9 +213,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
 
         Self {
             endpoint_id,
+            peer_endpoint_id: None,
             socket,
-            length_buf: [0; 4],
-            length_read: 0,
+            framing: super::inbound::FrameReader::default(),
+            bwu_peer_last_write: false,
+            bwu_offer_medium: None,
             state: InnerState {
                 id,
                 server_seq: 0,
@@ -250,6 +254,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
 
     /// Override the mediums advertised in the ConnectionRequest. Call before
     /// [`Self::send_connection_request`]. Used by the BLE send path.
+    pub fn set_peer_endpoint(&mut self, endpoint: Option<[u8; 4]>) {
+        self.peer_endpoint_id = endpoint;
+    }
+
     pub fn set_mediums(&mut self, mediums: Vec<i32>) {
         self.mediums = mediums;
     }
@@ -286,35 +294,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                     }
                 }
             },
-            h = tokio::io::AsyncReadExt::read(&mut self.socket, &mut self.length_buf[self.length_read..]) => {
-                let n = h?;
-                if n == 0 { return Err(anyhow!("Peer closed connection")); }
-                self.length_read += n;
-                if self.length_read < 4 { return Ok(()); }
-                let length_buf = self.length_buf; self.length_read = 0;
-                self._handle(length_buf).await?
+            frame = self.framing.read(&mut self.socket) => {
+                self.process_frame(frame?).await?;
             }
         }
-
         Ok(())
     }
 
-    pub async fn _handle(&mut self, length_buf: [u8; 4]) -> Result<(), anyhow::Error> {
-        let msg_length = u32::from_be_bytes(length_buf) as usize;
-        // Ensure the message length is not unreasonably big to avoid allocation attacks
-        if msg_length > SANE_FRAME_LENGTH as usize {
-            error!("Message length too big");
-            return Err(anyhow!("value"));
-        }
-
-        // Allocate buffer for the actual message and read it
-        let mut frame_data = vec![0u8; msg_length];
-        tokio::time::timeout(
-            Duration::from_secs(30),
-            stream_read_exact(&mut self.socket, &mut frame_data),
-        )
-        .await??;
-
+    async fn process_frame(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
         let current_state = &self.state;
         // Now determine what will be the request type based on current state
         match current_state.state {
@@ -645,6 +632,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         }
 
         let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
+        self.process_offline_frame(offline).await
+    }
+
+    async fn process_offline_frame(&mut self, offline: OfflineFrame) -> Result<(), anyhow::Error> {
         let v1_frame = offline
             .v1
             .as_ref()
@@ -991,6 +982,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
 
     /// Plaintext CLIENT_INTRODUCTION_ACK, sent over the newly-established
     /// upgrade channel.
+    #[cfg(test)]
     fn bwu_ack_frame() -> OfflineFrame {
         use location_nearby_connections::BandwidthUpgradeNegotiationFrame;
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
@@ -1017,16 +1009,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
     /// client_seq), and return the OfflineFrame without dispatching to the
     /// payload state machine.
     async fn read_encrypted_offline_frame(&mut self) -> Result<OfflineFrame, anyhow::Error> {
-        let mut len_buf = [0u8; 4];
-        stream_read_exact(&mut self.socket, &mut len_buf).await?;
-        let msg_len = u32::from_be_bytes(len_buf) as usize;
-        if msg_len == 0 || msg_len > SANE_FRAME_LENGTH as usize {
-            return Err(anyhow!("bad frame length {msg_len}"));
-        }
-        let mut data = vec![0u8; msg_len];
-        stream_read_exact(&mut self.socket, &mut data).await?;
-
-        let smsg = SecureMessage::decode(&*data)?;
+        let data = self.framing.read(&mut self.socket).await?;
+        self.decrypt_offline_frame(&data).await
+    }
+    async fn decrypt_offline_frame(&mut self, data: &[u8]) -> anyhow::Result<OfflineFrame> {
+        let smsg = SecureMessage::decode(data)?;
         let mut hmac = HmacSha256::new_from_slice(
             self.state
                 .recv_hmac_key
@@ -1065,6 +1052,142 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         Ok(OfflineFrame::decode(d2d_msg.message())?)
     }
 
+    async fn decline_upgrade(&mut self) -> anyhow::Result<()> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            EventType, UpgradePathInfo,
+        };
+        let info = self.bwu_offer_medium.map(|medium| UpgradePathInfo {
+            medium: Some(medium),
+            ..Default::default()
+        });
+        self.encrypt_and_send(&Self::bwu_frame(EventType::UpgradeFailure, info, None))
+            .await
+    }
+
+    fn join_guard_release(&mut self) {
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        self.join_guard.take();
+    }
+
+    async fn next_upgrade_frame(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Option<OfflineFrame>> {
+        loop {
+            tokio::select! {
+                biased;
+                message = self.receiver.recv() => {
+                    let message = message.context("Upgrade control channel closed or lagged")?;
+                    if message.id != self.state.id && message.id != "*" { continue; }
+                    if let channel::Message::Lib { action: TransferAction::TransferCancel | TransferAction::ConsentDecline } = message.msg {
+                        self.update_state(|s| s.state = TransferState::Cancelled, true).await;
+                        let _ = tokio::time::timeout(Duration::from_secs(2), self.disconnection()).await;
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+                bytes = self.framing.read(&mut self.socket) => return Ok(Some(self.decrypt_offline_frame(&bytes?).await?)),
+            }
+        }
+    }
+
+    async fn during_upgrade<T>(
+        &mut self,
+        operation: impl std::future::Future<Output = anyhow::Result<T>>,
+        timeout: Duration,
+    ) -> anyhow::Result<anyhow::Result<T>> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::pin!(operation);
+        loop {
+            tokio::select! {
+                result = &mut operation => {
+                    anyhow::ensure!(result.is_ok() || !self.bwu_peer_last_write, "New channel failed after prior-channel LAST_WRITE");
+                    return Ok(result);
+                }
+                frame = self.next_upgrade_frame(deadline) => {
+                    let Some(frame) = frame? else {
+                        anyhow::ensure!(!self.bwu_peer_last_write, "Upgrade timed out after prior-channel LAST_WRITE");
+                        return Ok(Err(anyhow!("Bandwidth upgrade setup timed out")));
+                    };
+                    let event = frame.v1.as_ref()
+                        .filter(|v| v.r#type() == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation)
+                        .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref()).map(|b| b.event_type());
+                    if event == Some(EventType::LastWriteToPriorChannel) {
+                        self.bwu_peer_last_write = true;
+                        continue;
+                    }
+                    anyhow::ensure!(!self.bwu_peer_last_write, "Traffic after prior-channel LAST_WRITE before handoff");
+                    if event == Some(EventType::UpgradeFailure) { return Ok(Err(anyhow!("Peer rejected upgrade"))); }
+                    Box::pin(self.process_offline_frame(frame)).await?;
+                }
+            }
+        }
+    }
+
+    async fn drain_prior_channel(&mut self) -> anyhow::Result<()> {
+        use location_nearby_connections::{
+            bandwidth_upgrade_negotiation_frame::EventType, v1_frame::FrameType,
+        };
+        self.encrypt_and_send(&Self::bwu_frame(
+            EventType::LastWriteToPriorChannel,
+            None,
+            None,
+        ))
+        .await?;
+        let mut last_write = self.bwu_peer_last_write;
+        if last_write {
+            self.encrypt_and_send(&Self::bwu_frame(
+                EventType::SafeToClosePriorChannel,
+                None,
+                None,
+            ))
+            .await?;
+        }
+        let mut safe = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while !(last_write && safe) {
+            let frame = self
+                .next_upgrade_frame(deadline)
+                .await?
+                .context("Incomplete prior-channel handoff")?;
+            let v1 = frame.v1.as_ref().context("Missing prior-channel frame")?;
+            match v1.r#type() {
+                FrameType::BandwidthUpgradeNegotiation => match v1
+                    .bandwidth_upgrade_negotiation
+                    .as_ref()
+                    .context("Missing negotiation")?
+                    .event_type()
+                {
+                    EventType::LastWriteToPriorChannel => {
+                        last_write = true;
+                        self.encrypt_and_send(&Self::bwu_frame(
+                            EventType::SafeToClosePriorChannel,
+                            None,
+                            None,
+                        ))
+                        .await?;
+                    }
+                    EventType::SafeToClosePriorChannel => safe = true,
+                    EventType::UpgradeFailure => {
+                        anyhow::bail!("Peer rejected handoff after LAST_WRITE")
+                    }
+                    _ => {}
+                },
+                FrameType::KeepAlive => {} // No new keepalive writes after LAST_WRITE.
+                FrameType::Disconnection => {
+                    anyhow::bail!("Peer disconnected before handoff completed")
+                }
+                _ => {
+                    anyhow::ensure!(!last_write, "Payload after prior-channel LAST_WRITE");
+                    Box::pin(self.process_offline_frame(frame)).await?;
+                }
+            }
+        }
+        self.bwu_peer_last_write = false;
+        Ok(())
+    }
+
     /// As the SENDER (the *discoverer*), take the Wi-Fi upgrade the phone (the
     /// *advertiser*) offers: the phone hosts and sends UPGRADE_PATH_AVAILABLE
     /// with its own ip:port; we connect out to it, introduce ourselves, drain the
@@ -1091,17 +1214,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         // LAN, we connect to it) or an UPGRADE_PATH_REQUEST (no shared LAN —
         // the phone asks US to host; the Quick Share for Windows path).
         let mut deadline = tokio::time::Instant::now() + BWU_OFFER_TIMEOUT;
-        let candidates = loop {
+        let (candidates, requires_ack) = loop {
             let offline = if let Some(stashed) = self.pending_bwu.take() {
                 stashed
             } else {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(deadline) => {
-                        info!("BWU(send): phone offered no Wi-Fi upgrade within timeout; staying on BLE");
-                        return Ok(false);
-                    }
-                    frame = self.read_encrypted_offline_frame() => frame?,
-                }
+                let Some(frame) = self.next_upgrade_frame(deadline).await? else {
+                    return Ok(false);
+                };
+                frame
             };
             let bwu = offline
                 .v1
@@ -1125,12 +1245,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
             match bwu.event_type() {
                 EventType::UpgradePathAvailable => {
                     let upi = bwu.upgrade_path_info.as_ref();
+                    self.bwu_offer_medium = upi.and_then(|u| u.medium);
                     let medium = upi.map(|u| u.medium());
                     match medium {
                         Some(UpMedium::WifiLan) => {
                             if let Some(w) = upi.and_then(|u| u.wifi_lan_socket.as_ref()) {
                                 if let Ok(candidates) = crate::lan_policy::upgrade_candidates(w) {
-                                    break candidates;
+                                    break (
+                                        candidates,
+                                        upi.is_some_and(|info| {
+                                            info.supports_client_introduction_ack()
+                                        }),
+                                    );
                                 }
                             }
                             info!("BWU(send): WIFI_LAN offer had no usable socket; staying on BLE");
@@ -1238,7 +1364,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                                     None
                                 };
                                 return self
-                                    .join_and_upgrade(&ssid, &password, &candidates, p2p)
+                                    .join_and_upgrade(
+                                        &ssid,
+                                        &password,
+                                        &candidates,
+                                        p2p,
+                                        upi.is_some_and(|info| {
+                                            info.supports_client_introduction_ack()
+                                        }),
+                                    )
                                     .await;
                             }
                             #[cfg(not(all(feature = "experimental", target_os = "linux")))]
@@ -1307,15 +1441,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
             "BWU(send): phone offered {} WIFI_LAN candidates",
             candidates.len()
         );
-        let tcp = match crate::lan_policy::connect_candidates(&candidates).await {
+        let tcp = match self
+            .during_upgrade(
+                crate::lan_policy::connect_candidates(&candidates),
+                Duration::from_secs(20),
+            )
+            .await?
+        {
             Ok(socket) => socket,
             Err(_) => {
-                warn!("BWU(send): couldn't reach the phone's Wi-Fi candidates; staying on BLE");
+                self.decline_upgrade().await?;
                 return Ok(false);
             }
         };
 
-        self.finish_upgrade_over(tcp).await
+        self.finish_upgrade_over(tcp, requires_ack).await
     }
 
     /// Join the phone-hosted Wi-Fi network, connect to its gateway and run the
@@ -1328,28 +1468,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         password: &str,
         candidates: &[std::net::SocketAddr],
         p2p: Option<(&str, &str, u32)>,
+        requires_ack: bool,
     ) -> Result<bool, anyhow::Error> {
-        let joined = if let Some((name, pin, frequency)) = p2p {
-            crate::hdl::join_p2p(name, pin, frequency).await
-        } else {
-            crate::hdl::join_wifi(ssid, password, candidates).await
+        let setup = async {
+            let guard = if let Some((name, pin, frequency)) = p2p {
+                crate::hdl::join_p2p(name, pin, frequency).await?
+            } else {
+                crate::hdl::join_wifi(ssid, password, candidates).await?
+            };
+            let tcp = crate::hdl::connect_joined(&guard.interface, candidates).await?;
+            Ok((guard, tcp))
         };
-        let guard = match joined {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("BWU(send): couldn't join '{ssid}' ({e}); staying on BLE");
-                return Ok(false);
-            }
-        };
-        let tcp = match crate::hdl::connect_joined(&guard.interface, candidates).await {
-            Ok(socket) => socket,
+        let (guard, tcp) = match self.during_upgrade(setup, Duration::from_secs(80)).await? {
+            Ok(joined) => joined,
             Err(error) => {
-                warn!("BWU(send): dedicated-network connection failed ({error}); staying on BLE");
+                debug!("BWU(send): owned network setup failed: {error}");
+                self.decline_upgrade().await?;
                 return Ok(false);
             }
         };
         self.join_guard = Some(guard);
-        self.finish_upgrade_over(tcp).await
+        self.finish_upgrade_over(tcp, requires_ack).await
     }
 
     /// Common tail of a client-role upgrade: introduce ourselves on the new TCP
@@ -1357,6 +1496,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
     async fn finish_upgrade_over(
         &mut self,
         mut tcp: tokio::net::TcpStream,
+        requires_ack: bool,
     ) -> Result<bool, anyhow::Error> {
         use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
 
@@ -1369,53 +1509,35 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                 supports_disabling_encryption: Some(false),
             }),
         );
-        send_plain_frame(&mut tcp, &intro.encode_to_vec()).await?;
-        // The ack is best-effort (only sent if the phone set supports_client_introduction_ack).
-        let _ = tokio::time::timeout(Duration::from_secs(3), read_plain_frame(&mut tcp)).await;
-
-        // Drain the BLE channel: our LAST_WRITE, then respond to the phone's
-        // control frames until it is safe to close the prior channel.
-        self.encrypt_and_send(&Self::bwu_frame(
-            EventType::LastWriteToPriorChannel,
-            None,
-            None,
-        ))
-        .await?;
-        for _ in 0..16 {
-            let offline = match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.read_encrypted_offline_frame(),
-            )
-            .await
-            {
-                Ok(Ok(f)) => f,
-                _ => break,
-            };
-            let event = offline
-                .v1
-                .as_ref()
-                .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
-                .map(|b| b.event_type());
-            match event {
-                Some(EventType::LastWriteToPriorChannel) => {
-                    let _ = self
-                        .encrypt_and_send(&Self::bwu_frame(
-                            EventType::SafeToClosePriorChannel,
-                            None,
-                            None,
-                        ))
-                        .await;
-                }
-                Some(EventType::SafeToClosePriorChannel) => break,
-                other => debug!("BWU(send) drain: event {other:?}"),
+        let introduction = async {
+            send_plain_frame(&mut tcp, &intro.encode_to_vec()).await?;
+            if requires_ack {
+                let bytes = read_plain_frame(&mut tcp).await?;
+                let frame = OfflineFrame::decode(bytes.as_slice())?;
+                anyhow::ensure!(frame.version == Some(1) && frame.v1.as_ref().is_some_and(|v|
+                    v.r#type() == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                    && v.bandwidth_upgrade_negotiation.as_ref().is_some_and(|b|
+                        b.event_type() == EventType::ClientIntroductionAck && b.client_introduction_ack.is_some())),
+                    "Invalid bandwidth upgrade introduction acknowledgment");
             }
+            Ok(())
+        };
+        if let Err(error) = self
+            .during_upgrade(introduction, Duration::from_secs(5))
+            .await?
+        {
+            debug!("BWU(send): new channel introduction failed: {error}");
+            self.join_guard_release();
+            self.decline_upgrade().await?;
+            return Ok(false);
         }
+        self.drain_prior_channel().await?;
 
         if self.socket.upgrade_to_tcp(tcp) {
             info!("BWU(send): upgraded to Wi-Fi; payload continues over TCP");
             Ok(true)
         } else {
-            Ok(false)
+            anyhow::bail!("Transport cannot commit the completed bandwidth handoff")
         }
     }
 
@@ -1438,6 +1560,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
             UpMedium::WifiDirect
         } else {
             UpMedium::WifiHotspot
+        };
+        self.bwu_offer_medium = Some(medium.into());
+        let Some(expected) = self.peer_endpoint_id else {
+            self.decline_upgrade().await?;
+            return Ok(false);
         };
         let hosted = if let Some(auth) = auth {
             crate::hdl::start_direct_group_with_auth(auth).await
@@ -1477,92 +1604,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         ))
         .await?;
 
-        // The phone enables its Wi-Fi radio, joins our network, gets DHCP, then
-        // connects — allow generously, while staying responsive on BLE.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-        let mut tcp = loop {
-            tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((s, peer)) => {
-                        info!("BWU(send): phone joined our network and connected from {peer}");
-                        break s;
-                    }
-                    Err(e) => {
-                        warn!("BWU(send): accept on the hosted network failed ({e}); staying on BLE");
-                        return Ok(false);
-                    }
-                },
-                frame = self.read_encrypted_offline_frame() => {
-                    let offline = frame?;
-                    let event = offline.v1.as_ref()
-                        .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
-                        .map(|b| b.event_type());
-                    if event == Some(EventType::UpgradeFailure) {
-                        warn!("BWU(send): phone couldn't join our network (UPGRADE_FAILURE); staying on BLE");
-                        return Ok(false);
-                    }
-                    debug!("BWU(send): while hosting, got event {event:?}");
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    warn!("BWU(send): phone never joined our hosted network; staying on BLE");
-                    return Ok(false);
-                }
+        let tcp = match self
+            .during_upgrade(
+                super::upgrade_introduction::accept(&listener, expected, false),
+                Duration::from_secs(45),
+            )
+            .await?
+        {
+            Ok(tcp) => tcp,
+            Err(_) => {
+                self.decline_upgrade().await?;
+                return Ok(false);
             }
         };
 
-        // Plaintext CLIENT_INTRODUCTION from the phone → our ACK.
-        let intro = read_plain_frame(&mut tcp).await?;
-        if let Ok(f) = OfflineFrame::decode(&*intro) {
-            debug!(
-                "BWU(send): hosted-channel intro frame type={:?}",
-                f.v1.as_ref().map(|v| v.r#type())
-            );
-        }
-        send_plain_frame(&mut tcp, &Self::bwu_ack_frame().encode_to_vec()).await?;
-
-        // Drain the BLE channel, then swap the socket to the hosted TCP link.
-        self.encrypt_and_send(&Self::bwu_frame(
-            EventType::LastWriteToPriorChannel,
-            None,
-            None,
-        ))
-        .await?;
-        for _ in 0..16 {
-            let offline = match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.read_encrypted_offline_frame(),
-            )
-            .await
-            {
-                Ok(Ok(f)) => f,
-                _ => break,
-            };
-            let event = offline
-                .v1
-                .as_ref()
-                .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref())
-                .map(|b| b.event_type());
-            match event {
-                Some(EventType::LastWriteToPriorChannel) => {
-                    let _ = self
-                        .encrypt_and_send(&Self::bwu_frame(
-                            EventType::SafeToClosePriorChannel,
-                            None,
-                            None,
-                        ))
-                        .await;
-                }
-                Some(EventType::SafeToClosePriorChannel) => break,
-                other => debug!("BWU(send) host drain: event {other:?}"),
-            }
-        }
+        self.drain_prior_channel().await?;
 
         if self.socket.upgrade_to_tcp(tcp) {
             self.hotspot_guard = Some(guard);
             info!("BWU(send): upgraded to our hosted Wi-Fi; payload continues over TCP");
             Ok(true)
         } else {
-            Ok(false)
+            anyhow::bail!("Transport cannot commit the completed bandwidth handoff")
         }
     }
 
@@ -1628,13 +1691,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
                     info!("BWU(send): {total}-byte payload stays on BLE; skipping Wi-Fi upgrade");
                     false
                 } else {
-                    match self.try_wifi_upgrade_client().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!("BWU(send): upgrade attempt errored ({e}); staying on BLE");
-                            false
-                        }
-                    }
+                    self.try_wifi_upgrade_client().await?
                 };
 
                 // If we're still on a pure-BLE link, a large payload would stall
@@ -2322,3 +2379,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
         tokio::time::sleep(SANITY_DURATION).await;
     }
 }
+
+#[cfg(all(test, feature = "experimental", target_os = "linux"))]
+#[path = "outbound_bwu_tests.rs"]
+mod bwu_tests;
