@@ -5,7 +5,7 @@
 The first native package targets Ubuntu 24.04, GTK 4.14/libadwaita 1.5, GNOME Shell 46, and amd64. Download or build the matching `.deb` and keep its accompanying source archive.
 
 ```sh
-sudo apt install ./linuxdrop_0.1.0_amd64.deb
+sudo apt install ./linuxdrop_0.1.0~beta.1_amd64.deb
 ```
 
 Open **LinuxDrop** from the application menu. Select files or drag them into the send area, select a nearby device and send. Visibility starts hidden; turn it on deliberately when receiving. Files are saved only after approval. Settings and wireless hardware have separate pages. Quick Share and Nearby Share refer to the same protocol backend.

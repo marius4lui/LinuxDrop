@@ -5,7 +5,7 @@ Drop files, choose a device, and send. Incoming requests require approval. Sendi
 
 ![LinuxDrop on GNOME](docs/acceptance/ui/send-de-610x760.png)
 
-## Current release: 0.1.0 experimental
+## Current release: 0.1.0-beta.1
 
 This repository contains real protocol implementations. Ubuntu 24.04 amd64 is the initial package target. GNOME 46/Wayland and protocol loopback tests have been exercised in a dedicated Ubuntu WSL2 environment. **Apple/Android device interoperability and physical radio behavior are not yet verified for LinuxDrop.**
 
@@ -19,8 +19,10 @@ Quick Share direct upgrade and AirDrop use jointly selected idle adapters; you c
 
 ## Install
 
+Download the Ubuntu 24.04 amd64 package from [Releases](https://github.com/marius4lui/LinuxDrop/releases/tag/v0.1.0-beta.1). See the [beta release notes and AirDrop setup](docs/releases/0.1.0-beta.1.md).
+
 ```sh
-sudo apt install ./linuxdrop_0.1.0_amd64.deb
+sudo apt install ./linuxdrop_0.1.0~beta.1_amd64.deb
 ```
 
 Open **LinuxDrop** from the app menu. Enable visibility when receiving; it starts hidden. Enable the optional extension in GNOME **Extensions** for Quick Settings and the notch. Log out/in after first installing the extension if GNOME has not discovered it.

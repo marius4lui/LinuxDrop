@@ -29,6 +29,8 @@ install -Dm644 "$root/integrations/dolphin/linuxdrop.desktop" "$dest$prefix/shar
 install -Dm644 "$root/integrations/thunar/linuxdrop.desktop" "$dest$prefix/share/Thunar/sendto/linuxdrop.desktop"
 install -Dm644 "$root/integrations/thunar/uca.xml.example" "$dest$prefix/share/doc/linuxdrop/thunar-uca.xml.example"
 install -Dm755 "$root/integrations/thunar/install-action.py" "$dest$prefix/bin/linuxdrop-thunar-install"
+install -Dm644 "$root/docs/INSTALL.md" "$dest$prefix/share/doc/linuxdrop/INSTALL.md"
+install -Dm644 "$root/docs/releases/0.1.0-beta.1.md" "$dest$prefix/share/doc/linuxdrop/RELEASE.md"
 install -Dm644 "$root/LICENSE" "$dest$prefix/share/doc/linuxdrop/copyright"
 install -Dm644 "$root/vendor/open-quickshare/LICENSE" "$dest$prefix/share/doc/linuxdrop/licenses/open-quickshare-LICENSE"
 install -Dm644 "$root/vendor/bluez-async/LICENSE-MIT" "$dest$prefix/share/doc/linuxdrop/licenses/bluez-async-LICENSE-MIT"
