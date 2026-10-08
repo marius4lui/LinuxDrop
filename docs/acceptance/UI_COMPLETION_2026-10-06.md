@@ -1,0 +1,267 @@
+# Focused UI/UX completion pass
+
+Two additional Astra/high agents performed bounded, read-only UX and visual
+reviews. Their reports are in `docs/completion/UX_REVIEW.md` and `VISUAL_REVIEW.md`.
+One desktop implementation owner applied the findings; root integrated the daemon
+contracts and completed the last incoming-selection fix after agent credits ran
+out. The user's existing visible demo was not restarted.
+
+## Implemented changes
+
+- Compact file drop area and bounded file preview keep nearby devices reachable.
+- Wide windows use header navigation; narrow windows retain bottom navigation.
+  The send footer follows the content width.
+- File selection survives asynchronous submission; additions made while a send
+  starts remain in the draft. Zero-byte files are valid; individual invalid files
+  remain visible with their reason.
+- Protocol selection uses stable IDs. Peer widgets and keyboard focus survive
+  unrelated transfer progress. Dirty settings entries survive reconstruction.
+- Incoming review shows total size, code comparison where required, exact default
+  destination including subfolders, per-file selection and collision policy.
+  LocalSend accepts the selected subset natively. Quick Share/AirDrop explain that
+  the complete bundle is transferred and only selected files are published.
+- GNOME bubble confirmation has a full-width primary action; secondary actions
+  remain separate. Long unbroken names wrap within the bubble. An incoming code
+  request requiring a destination opens file review. The panel-first hidden
+  default remains intact.
+- Primary active/hover button backgrounds use #1c71d8/#1a65c2 with white text;
+  the active contrast is approximately 4.77:1.
+
+## Current evidence
+
+`cargo check --workspace --all-targets` and
+`cargo clippy --workspace --all-targets --no-deps -- -D warnings` passed after
+integration. The current native GTK regression passed in a separate D-Bus/Xvfb
+session using `app/linuxdrop/tests/run-native-regressions.sh`. It exercises real
+GTK widgets and a deliberately delayed fixture service: draft additions, protocol
+reordering, focused widget retention, file validation, dirty settings and incoming
+Quick Share subset plus exact destination. The fixture is test-only; real HTTPS
+and daemon consent are checked separately in `COMPLETION_DAEMON_2026-10-06.md`.
+
+The consolidated `cargo test --workspace` run passed 30 tests, with this one
+display-dependent GTK test correctly skipped by that headless command and passed
+separately through the native runner. No hardware WPS/PHY test is implied by the
+new helper compiling or its credential-validation unit test passing.
+
+Root inspected the 480x600 Send/Settings and wide Send captures under
+`docs/acceptance/ui/completion/`. Root also inspected
+`shell-verification-review.png` from the desktop owner's isolated GNOME 46 runtime:
+German confirmation text and a 100-character file name fit within the bubble.
+The test device is explicitly labelled as a fixture, not a connected phone.
+
+This is not a claim that every desktop/environment combination is accepted.
+Fractional scaling, mixed-monitor hotplug, full screen-reader traversal, portal
+exports and GNOME versions beyond the recorded runtime remain on the full goal's
+acceptance ledger. New installable artifacts still require the final integration
+build; old 0.1.0 packages do not contain this pass.
+
+## Download-offer reception follow-up
+
+Transfers now includes “Receive from a link” / “Über einen Link empfangen”. The
+native dialog discloses local HTTP, retains the address after validation failure
+and leads to the existing PIN and file-selection review. PIN text distinguishes
+incoming download offers from outgoing uploads. The isolated GTK regression and
+the real daemon reverse-download integration passed. Root inspected the fully
+opened German dialog at 480x600 in
+`ui/completion/download-offer-review.png`; all text, input and actions fit.
+The visible desktop demo was not restarted. Existing broader desktop acceptance
+items above remain open.
+
+
+## Focused Astra UX/UI follow-up ? 2026-10-07
+
+Two Astra/high agents owned separate native-dialog/settings and Shell/style areas.
+Changes preserve the panel-first flow and leave the live demo untouched:
+
+- Failed incoming consent reopens the review with the same destination, selected
+  subset and collision rule. The error is visible without the D-Bus namespace.
+- Receiving PIN setup precedes the dependent switch; search focus and unsaved
+  entries survive rebuilds. Offline switch/choice edits restore persisted values.
+- Link/PIN dialogs have entry focus and Enter actions; folder-picker failures are
+  reported while ordinary dismissal remains quiet.
+- The Shell bubble replaces stale actions when offline, disables duplicate
+  mutations during requests, preserves progress actors/focus and restores panel
+  focus on close. Its scroll area, labels and progress track use allocated space.
+- Essential secondary GTK instructions have higher contrast. Symlink selections
+  receive a specific explanation matching daemon validation.
+
+Evidence: 48 workspace tests pass (three environment-specific scenarios skipped
+by that command), warning-free all-target workspace Clippy, and the separately run
+native GTK regression passes. The native scenario explicitly injects an incoming
+consent error, checks the retained choices and verifies a successful retry; it
+also checks PIN dependencies and settings search focus. Updated 480x600 captures
+were inspected after dialog animations settled, including
+`ui/completion/incoming-retry-review.png`.
+
+The real daemon D-Bus/HTTPS integration also passes. Source-descriptor regressions
+exercise LocalSend, Quick Share, AirDrop and reverse downloads after replacing the
+original path; they receive the original bytes. This pins file identity and does
+not promise an immutable snapshot during concurrent in-place writes.
+
+A separate, temporary GNOME 46 profile/private bus passes the reproducible
+`extensions/gnome-shell/tests/run-bubble-smoke.sh` scenario with normal text and
+German 150% text: hidden/open, native scroll, verification, transfer navigation,
+progress geometry, busy/offline actions and focus. This uncovered and fixed a real
+progress allocation bug. These checks do not claim physical mixed-DPI, complete
+screen-reader or later GNOME-version acceptance. Installed demo/packages remain
+unchanged and do not yet contain these source changes.
+
+
+Root also inspected the final German 150% text capture
+`ui/completion/shell-verification-large-review.png`. The full confirmation and
+secondary actions fit; long peer/file names use intentional ellipsis. Relative
+font sizes now respect the system text setting. The final Shell regression also
+changes each file's byte progress and verifies stable Quick Settings device
+actors, covering the two focus regressions found during root review.
+
+
+## Portal descriptor handoff ? 2026-10-07
+
+The native app now passes opened regular files with `PrepareSendFiles`, using
+batches of at most 16 Unix descriptors. Combined draft count/size rules apply to
+all batches; each append is atomic. A failed preparation or failed start/offer
+releases its partial draft. The daemon also expires abandoned descriptors on its
+maintenance tick. Host-path PrepareSend stays available for existing clients.
+
+Passed: targeted daemon tests, all-target workspace Clippy and the isolated GTK
+regression including descriptor validation, 17-file client batching and cleanup
+when the next file cannot be opened. The new
+`tests/integration/run-fd-portal.sh` uses a private network namespace and bus with
+an actual document portal. It exports and revokes a document, closes client file
+handles, replaces the original path and receives all 25 offered files byte-for-byte
+from the retained descriptors. Write-only descriptors, directories, pipes, invalid
+names and combined-count overflow are rejected without partially appending a batch.
+No installed Flatpak or physical device acceptance is inferred from this test.
+
+## 2026-10-07: saved settings and effective service status
+
+The Settings page now keeps a persistent status card above search. It distinguishes
+saved choices while services apply, enabled services that failed or lack a usable
+network, and the last-known settings shown while disconnected. Details opens the
+Hardware page; successful recovery removes the warning. Backend-only updates do
+not rebuild the settings form or erase the search query.
+
+The native private-session GTK regression passed in German after exercising
+applying -> error -> offline -> recovered states, the Details navigation and
+search-widget identity. The rendered 480x600 view was inspected:
+`ui/completion/settings-apply-error.png`. All status text, actions, search and
+bottom navigation fit. No running user demo was restarted.
+
+## 2026-10-07: persistent link revocation
+
+The Transfers page shows an active-link card with an explicit stop action and
+explains that stopping cancels its downloads. It remains visible after a failed
+stop so the user can retry; it disappears only when the daemon reports completed
+cleanup. Restart/reset dialogs explain why a live link must be stopped first.
+The private GTK regression tested stop failure then successful retry. The German
+480x600 render `ui/completion/active-download-link.png` fits the text, button,
+transfer progress and navigation without overlap.
+
+
+## 2026-10-07: recoverable helper failure
+
+Lost radio-helper ownership no longer leaves nearby devices or active transfers
+shown as ready. The error explains that radio cleanup may still be running and
+points to adapter reconnection and service restart in Settings. GTK and the Shell
+bubble have the German translation; the Shell now translates terminal error text.
+The isolated GNOME 46 smoke passed with German/150% text, including replacement
+of Cancel with Details/Done after helper failure and the translated explanation.
+This is runtime behavior acceptance, not a new rendered image or physical-radio
+claim. The live demo remains unchanged.
+
+## 2026-10-07: focused native and Shell usability polish
+
+Two additional Astra/high agents worked on separate surfaces. GTK completed
+receives now expose every saved file, retain a direct Open action for one file,
+and provide destination-folder access. File-launch failures surface as feedback;
+user dismissal does not raise an error. File access remains usable while the
+sharing service is disconnected. Incoming filenames preserve their full
+accessible text while fitting a compact review dialog.
+
+The Shell's Previous/Next transfer controls keep keyboard focus when the body
+is rebuilt. Consent and cancellation state changes retain the safer header
+focus fallback. The header has a visible close affordance and accurately labels
+the PIN-required state. The bubble still opens only after its panel action.
+
+Validation: isolated German GTK regression at 480x600, scoped GTK and Quick Share
+Clippy, and isolated GNOME 46 smoke in English and German with 150% text passed.
+Rendered evidence is in `ui/completion/completed-received-files.png`,
+`ui/completion/incoming-long-name.png`, and `ui/completion/shell-polish-de150.png`.
+External application/file-manager launch, actual screen-reader traversal and
+physical mixed-DPI acceptance are not inferred from these checks. The live demo
+and installed packages were not changed.
+
+
+## 2026-10-07: settings search recovery and constrained keyboard navigation
+
+Two Astra/high agents owned the GTK and Shell surfaces separately. Settings
+search now retains every edit immediately during a settings refresh, searches
+translated option labels and category names, and tolerates additional whitespace.
+A no-results state explains how to recover; Show all settings clears search and
+category together and restores input focus. Settings and diagnostic icon actions
+have explicit translated accessibility labels.
+
+The Shell now scrolls a focused action into its viewport, including when a short
+viewport previously left the Details button entirely offscreen. The fixed-monitor
+index is enabled only in fixed mode, explains zero-based indexing and fallback,
+and follows external changes to the monitor mode.
+
+Passed: isolated native GTK regression in German at 480x600; real GNOME 46 bubble
+and GTK preferences tests in English and German at 150% text; workspace all-target
+Clippy. The keyboard scrolling regression failed before its fix and passed after.
+Root reviewed captures `ui/completion/settings-search-empty.png` and
+`ui/completion/shell-focus-de150.png`. Real screen-reader traversal and physical
+mixed-DPI hotplug remain unverified. Installed packages and the live demo were
+not changed.
+
+
+## 2026-10-07: device preference recovery and Shell reconnection
+
+Two further Astra/high agents worked in disjoint GTK and Shell directories.
+Device preferences now serialize edits per device, display pending status, and
+restore the last confirmed favorite/block/protocol value on failure. Failed
+name edits retain their draft and apply action. Ownerless/replaced service
+responses do not appear saved. External names render literally, including markup
+characters, and Forget has a device-specific accessible name.
+
+The Shell immediately retires transfer/consent actions on daemon owner changes.
+Late snapshots and action completions from an old owner or extension session
+cannot revive them or unlock a newer operation. Changes received during a
+snapshot are coalesced into an immediate follow-up read. A failed app launch
+reopens the bubble with its selected transfer, visible error and retry action.
+
+Passed: isolated native German GTK regression at 480x600 (including failed save,
+retry, latest-value rollback, protocol/name handling and offline edits); isolated
+GNOME 46 smoke at normal text and German 150%, including native preferences;
+all-target Clippy for the app and affected core/network/daemon/Quick Share crates.
+The Shell race cases use controlled replies inside real GNOME, not a physical
+service failure. Root reviewed `ui/completion/device-preference-failed.png`.
+This pass initially left the GTK snapshot owner-generation race open; the
+follow-up below closes it. Physical mixed-DPI, screen-reader
+and installed-package acceptance remain separate. Live demo unchanged.
+
+
+### GTK snapshot follow-up in the same two-agent pass
+
+The existing GTK agent then closed the confirmed snapshot race. Every read is
+associated with its installed proxy and service generation. Owner changes retire
+old request dialogs and remote actions immediately, then request a new snapshot
+without waiting for the old reply. Stale replies/signals cannot overwrite it.
+Normal D-Bus activation remains enabled; local file drafts and saved-file actions
+remain available. The history limit widget now matches the daemon's 10000-entry
+range (a saved 5000 is tested), and uncertain device write receipts say they could
+not be confirmed instead of claiming that persistence definitely failed.
+
+The native test uses two actual private-bus connections, ReleaseName/RequestName,
+and delayed replies in reverse order. It verifies that only the replacement
+snapshot survives and that even emitting an old dialog's accept response cannot
+reach the new owner. Native scenario passed in 11.02 seconds; app all-target Clippy
+with warnings denied passed. Root reviewed the diff and final logs.
+
+One intermediate test autoactivated the installed daemon on its private bus.
+That process was absent when checked after the test; no unverified PID cleanup
+is claimed. The runner now isolates config/data/cache and uses an explicit private
+service directory excluding LinuxDrop while preserving GTK/portal services. The
+final run passed with no LinuxDrop activation entry. No live demo restart or
+installed-package update was performed. Physical devices, mixed-DPI hotplug and
+screen-reader acceptance remain outside this fixture.

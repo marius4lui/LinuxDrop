@@ -1,0 +1,24 @@
+.linuxdrop-notch { background-color: rgba(24, 25, 31, 0.97); color: #fafafa; border-radius: 22px; border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 8px 24px rgba(0,0,0,0.25); padding: 5px; }
+.linuxdrop-notch-header { border-radius: 18px; padding: 7px 14px; spacing: 10px; }
+.linuxdrop-notch-header:hover { background-color: rgba(255,255,255,0.07); }
+.linuxdrop-notch-header:focus { border: 2px solid #8ab4f8; padding: 5px 12px; }
+.linuxdrop-notch-icon { color: #8ab4f8; icon-size: 16px; }
+.linuxdrop-notch-close { color: #b8bccb; icon-size: 12px; }
+.linuxdrop-notch-title { font-weight: 700; font-size: 0.82em; }
+.linuxdrop-notch-detail { color: #b8bccb; font-size: 0.75em; max-width: 130px; }
+.linuxdrop-notch-expanded { padding: 12px 14px 14px; spacing: 12px; }
+.linuxdrop-notch-heading { font-size: 1.03em; font-weight: 700; }
+.linuxdrop-notch-subtitle { font-size: 0.82em; color: #b8bccb; }
+.linuxdrop-notch-actions { spacing: 8px; }
+.linuxdrop-notch-action { border-radius: 12px; padding: 9px 14px; background-color: rgba(255,255,255,0.09); font-size: 0.82em; font-weight: 600; }
+.linuxdrop-notch-action:hover { background-color: rgba(255,255,255,0.17); }
+.linuxdrop-notch-action:focus { box-shadow: inset 0 0 0 2px #8ab4f8; }
+.linuxdrop-notch-action:insensitive { opacity: 0.5; }
+.linuxdrop-notch-navigation { padding: 9px; }
+.linuxdrop-notch-action.primary { background-color: #1c71d8; color: white; }
+.linuxdrop-notch-action.primary:hover { background-color: #1a65c2; }
+.linuxdrop-notch-code { font-size: 1.92em; font-weight: 800; letter-spacing: 5px; text-align: center; padding: 6px; }
+.linuxdrop-notch-track { background-color: rgba(255,255,255,0.1); border-radius: 99px; height: 5px; }
+.linuxdrop-notch-fill { background-color: #8ab4f8; border-radius: 99px; height: 5px; }
+.linuxdrop-notch-error { color: #ffb4ab; font-size: 0.82em; }
+.linuxdrop-panel-active { color: #8ab4f8; }

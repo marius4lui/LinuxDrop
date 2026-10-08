@@ -1,0 +1,2387 @@
+use anyhow::Context;
+use std::collections::HashMap;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
+use std::time::Duration;
+
+use anyhow::anyhow;
+use bytes::Bytes;
+use hmac::{Hmac, Mac};
+use libaes::{AES_256_KEY_LEN, Cipher};
+use p256::ecdh::diffie_hellman;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use prost::Message;
+use rand::Rng;
+use sha2::{Digest, Sha256, Sha512};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::broadcast::error::TryRecvError;
+use tokio::sync::broadcast::{Receiver, Sender};
+
+use super::info::{InternalFileInfo, TransferMetadata, TransferPayload, TransferPayloadKind};
+use super::{InnerState, TransferState};
+use crate::channel::{self, ChannelMessage, MessageClient, TransferAction, TransferKind};
+use crate::location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium;
+use crate::location_nearby_connections::connection_response_frame::ResponseStatus;
+use crate::location_nearby_connections::payload_transfer_frame::{
+    PacketType, PayloadChunk, PayloadHeader, payload_header,
+};
+use crate::location_nearby_connections::{KeepAliveFrame, OfflineFrame, PayloadTransferFrame};
+use crate::securegcm::ukey2_alert::AlertType;
+use crate::securegcm::ukey2_client_init::CipherCommitment;
+use crate::securegcm::{
+    DeviceToDeviceMessage, GcmMetadata, Type, Ukey2Alert, Ukey2ClientFinished, Ukey2ClientInit,
+    Ukey2HandshakeCipher, Ukey2Message, Ukey2ServerInit, ukey2_message,
+};
+use crate::securemessage::{
+    EcP256PublicKey, EncScheme, GenericPublicKey, Header, HeaderAndBody, PublicKeyType,
+    SecureMessage, SigScheme,
+};
+use crate::sharing_nearby::{
+    FileMetadata, IntroductionFrame, file_metadata, paired_key_result_frame,
+};
+use crate::utils::{
+    DeviceType, RemoteDeviceInfo, encode_point, gen_ecdsa_keypair, gen_random, hkdf_extract_expand,
+    stream_read_exact, to_four_digit_string,
+};
+use crate::{DEVICE_NAME, location_nearby_connections, sharing_nearby};
+
+type HmacSha256 = Hmac<Sha256>;
+
+const SANE_FRAME_LENGTH: i32 = 5 * 1024 * 1024;
+const SANITY_DURATION: Duration = Duration::from_micros(10);
+
+/// Classifies a transport as low-bandwidth (BLE) or not, and lets a BLE link be
+/// swapped to a fresh TCP socket during a Wi-Fi bandwidth upgrade. `TcpStream`
+/// (the Wi-Fi send path) is never low-bandwidth and never swaps.
+pub(crate) trait WifiUpgradable {
+    fn is_low_bandwidth(&self) -> bool;
+    /// Replace the underlying transport with `tcp`; returns false if unsupported.
+    fn upgrade_to_tcp(&mut self, tcp: TcpStream) -> bool;
+}
+
+impl WifiUpgradable for TcpStream {
+    fn is_low_bandwidth(&self) -> bool {
+        false
+    }
+    fn upgrade_to_tcp(&mut self, _tcp: TcpStream) -> bool {
+        false
+    }
+}
+
+/// Read one plaintext `[u32 len][frame]` message (the new TCP channel during a
+/// bandwidth upgrade, before encryption resumes).
+async fn read_plain_frame<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> Result<Vec<u8>, anyhow::Error> {
+    let mut len_buf = [0u8; 4];
+    stream_read_exact(stream, &mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > 1024 {
+        return Err(anyhow!("bad frame length {len}"));
+    }
+    let mut data = vec![0u8; len];
+    stream_read_exact(stream, &mut data).await?;
+    Ok(data)
+}
+
+/// Write one plaintext `[u32 len][frame]` message.
+async fn send_plain_frame<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    data: &[u8],
+) -> Result<(), anyhow::Error> {
+    let mut buf = Vec::with_capacity(4 + data.len());
+    buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(data);
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Largest payload we'll attempt over a pure-BLE link when no Wi-Fi upgrade
+/// happened. Above this the phone gives up, so we fail fast with guidance.
+const BLE_SEND_MAX_BYTES: i64 = 1024 * 1024;
+/// How long to wait, after consent, for the phone (advertiser) to offer a Wi-Fi
+/// upgrade path before falling back to sending over BLE. When it comes, the
+/// offer arrives within a few hundred ms, so this only bounds the give-up time.
+const BWU_OFFER_TIMEOUT: Duration = Duration::from_secs(6);
+/// How long to wait for the phone's retry offer after declining its first
+/// Wi-Fi Direct/hotspot offer in favour of a possible WIFI_LAN one (Nearby's
+/// BWU manager retries a failed upgrade after a short backoff).
+const BWU_RETRY_WAIT: Duration = Duration::from_secs(15);
+/// A single chunk write that blocks this long means the peer stopped reading;
+/// abort cleanly instead of hanging the transfer (and the UI).
+const CHUNK_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Payload chunk size over a pure-BLE link. Each file chunk becomes one
+/// length-prefixed frame on the L2CAP socket; a frame larger than the BLE MTU
+/// (~4 KB here) is never delivered/parsed by the phone — it accepts the
+/// transfer, waits for bytes that never arrive, then fails with "Can't
+/// transfer files". Keeping each chunk comfortably under the MTU (leaving room
+/// for the socket tag, protobuf and encryption overhead) lets big files stream
+/// over pure Bluetooth as a sequence of small frames, the way the protocol
+/// intends. Over a high-bandwidth (Wi-Fi/TCP) link we use a big buffer instead.
+const BLE_PAYLOAD_CHUNK: usize = 3 * 1024;
+const WIFI_PAYLOAD_CHUNK: usize = 512 * 1024;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum OutboundPayload {
+    Files(Vec<String>),
+    #[serde(skip)]
+    OpenedFiles(Vec<linuxdrop_network::SendSource>),
+}
+impl OutboundPayload {
+    pub fn sources(&self) -> Result<Vec<linuxdrop_network::SendSource>, anyhow::Error> {
+        match self {
+            Self::Files(paths) => Ok(paths
+                .iter()
+                .map(linuxdrop_network::SendSource::open)
+                .collect::<std::io::Result<Vec<_>>>()?),
+            Self::OpenedFiles(sources) => Ok(sources.clone()),
+        }
+    }
+    pub fn names(&self) -> Vec<String> {
+        match self {
+            Self::Files(paths) => paths
+                .iter()
+                .map(|path| {
+                    Path::new(path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
+            Self::OpenedFiles(sources) => sources
+                .iter()
+                .map(|source| source.name().to_owned())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct OutboundRequest<S = TcpStream> {
+    endpoint_id: [u8; 4],
+    peer_endpoint_id: Option<[u8; 4]>,
+    socket: S,
+    framing: super::inbound::FrameReader,
+    bwu_peer_last_write: bool,
+    bwu_offer_medium: Option<i32>,
+    pub state: InnerState,
+    sender: Sender<ChannelMessage>,
+    receiver: Receiver<ChannelMessage>,
+    bandwidth: linuxdrop_network::BandwidthLimiter,
+    payload: OutboundPayload,
+    /// Mediums advertised to the peer in the ConnectionRequest. Defaults to
+    /// Wi-Fi-LAN (the mDNS/TCP send path); a BLE send sets `[Ble, WifiLan]` so
+    /// the phone knows the link is BLE and may offer a Wi-Fi upgrade.
+    mediums: Vec<i32>,
+    /// A BandwidthUpgradeNegotiation frame that arrived while the state machine
+    /// was mid-handshake; consumed by the upgrade wait after consent.
+    pending_bwu: Option<OfflineFrame>,
+    /// The peer's OS as reported in its ConnectionResponse. Windows receivers
+    /// require the payload over a bandwidth-upgraded channel even when the
+    /// initial connection is already TCP, so the upgrade wait runs for them.
+    peer_os: Option<i32>,
+    /// Set once a Wi-Fi Direct/hotspot offer has been declined to nudge the
+    /// phone into re-evaluating (the LAN-preference dance in
+    /// [`Self::try_wifi_upgrade_client`]); the next offer is taken as-is.
+    bwu_declined_direct: bool,
+    /// Keeps a hotspot we host for a bandwidth upgrade alive for the length of
+    /// the transfer; torn down (and Wi-Fi restored) on drop.
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
+    hotspot_guard: Option<crate::hdl::HotspotGuard>,
+    /// Keeps our membership of a phone-hosted Wi-Fi Direct group/hotspot alive
+    /// for the length of the transfer; leaves it (and restores Wi-Fi) on drop.
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
+    join_guard: Option<crate::hdl::JoinGuard>,
+}
+
+#[allow(private_bounds)]
+impl<S: AsyncRead + AsyncWrite + Unpin + WifiUpgradable> OutboundRequest<S> {
+    pub fn new(
+        endpoint_id: [u8; 4],
+        socket: S,
+        id: String,
+        sender: Sender<ChannelMessage>,
+        payload: OutboundPayload,
+        rdi: RemoteDeviceInfo,
+    ) -> Self {
+        let receiver = sender.subscribe();
+        let files = payload.names();
+
+        Self {
+            endpoint_id,
+            peer_endpoint_id: None,
+            socket,
+            framing: super::inbound::FrameReader::default(),
+            bwu_peer_last_write: false,
+            bwu_offer_medium: None,
+            state: InnerState {
+                id,
+                server_seq: 0,
+                client_seq: 0,
+                state: TransferState::Initial,
+                encryption_done: true,
+                transfer_metadata: Some(TransferMetadata {
+                    source: Some(rdi),
+                    destination: None,
+                    payload_kind: TransferPayloadKind::Files,
+                    payload: Some(TransferPayload::Files(files.to_vec())),
+                    id: Default::default(),
+                    pin_code: Default::default(),
+                    payload_preview: Default::default(),
+                    total_bytes: Default::default(),
+                    ack_bytes: Default::default(),
+                }),
+                ..Default::default()
+            },
+            sender,
+            receiver,
+            bandwidth: crate::payload_budget::current(),
+            payload,
+            mediums: vec![Medium::WifiLan.into()],
+            pending_bwu: None,
+            peer_os: None,
+            bwu_declined_direct: false,
+            #[cfg(all(feature = "experimental", target_os = "linux"))]
+            hotspot_guard: None,
+            #[cfg(all(feature = "experimental", target_os = "linux"))]
+            join_guard: None,
+        }
+    }
+
+    /// Override the mediums advertised in the ConnectionRequest. Call before
+    /// [`Self::send_connection_request`]. Used by the BLE send path.
+    pub fn set_peer_endpoint(&mut self, endpoint: Option<[u8; 4]>) {
+        self.peer_endpoint_id = endpoint;
+    }
+
+    pub fn set_mediums(&mut self, mediums: Vec<i32>) {
+        self.mediums = mediums;
+    }
+
+    pub async fn handle(&mut self) -> Result<(), anyhow::Error> {
+        // Buffer for the 4-byte length
+        tokio::select! {
+            i = self.receiver.recv() => {
+                match i {
+                    Ok(channel_msg) => {
+                        if channel_msg.id != self.state.id && channel_msg.id != "*" {
+                            return Ok(());
+                        }
+
+                        if let channel::Message::Lib { action }  = &channel_msg.msg {
+                            debug!("outbound: got: {:?}", channel_msg);
+                            match action {
+                                TransferAction::TransferCancel => {
+                                    self.update_state(
+                                        |e| {
+                                            e.state = TransferState::Cancelled;
+                                        },
+                                        true,
+                                    ).await;
+                                    self.disconnection().await?;
+                                    return Err(anyhow!(crate::errors::AppError::NotAnError));
+                                },
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("inbound: channel error: {}", e);
+                    }
+                }
+            },
+            frame = self.framing.read(&mut self.socket) => {
+                self.process_frame(frame?).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn process_frame(&mut self, frame_data: Vec<u8>) -> Result<(), anyhow::Error> {
+        let current_state = &self.state;
+        // Now determine what will be the request type based on current state
+        match current_state.state {
+            TransferState::SentUkeyClientInit => {
+                debug!("Handling State::SentUkeyClientInit frame");
+                let msg = Ukey2Message::decode(&*frame_data)?;
+                self.update_state(
+                    |e| {
+                        e.server_init_data = Some(frame_data);
+                    },
+                    false,
+                )
+                .await;
+                self.process_ukey2_server_init(&msg).await?;
+
+                // Advance current state
+                self.update_state(
+                    |e: &mut InnerState| {
+                        e.state = TransferState::SentUkeyClientFinish;
+                        e.encryption_done = true;
+                    },
+                    false,
+                )
+                .await;
+            }
+            TransferState::SentUkeyClientFinish => {
+                debug!("Handling State::SentUkeyClientFinish frame");
+                let frame = location_nearby_connections::OfflineFrame::decode(&*frame_data)?;
+                self.process_connection_response(&frame).await?;
+
+                // Advance current state
+                self.update_state(
+                    |e: &mut InnerState| {
+                        e.state = TransferState::SentPairedKeyEncryption;
+                        e.server_init_data = Some(frame_data);
+                        e.encryption_done = true;
+                    },
+                    false,
+                )
+                .await;
+            }
+            _ => {
+                debug!("Handling SecureMessage frame");
+                let smsg = SecureMessage::decode(&*frame_data)?;
+                self.decrypt_and_process_secure_message(&smsg).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn send_connection_request(&mut self) -> Result<(), anyhow::Error> {
+        let device_name = DEVICE_NAME.read().unwrap().clone();
+        let medium_metadata = Some(crate::hdl::upgrade_metadata());
+        let request = location_nearby_connections::OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::ConnectionRequest.into(),
+                ),
+                connection_request: Some(location_nearby_connections::ConnectionRequestFrame {
+                    endpoint_id: Some(String::from_utf8_lossy(&self.endpoint_id).to_string()),
+                    endpoint_name: Some(device_name.clone().into()),
+                    endpoint_info: Some(
+                        RemoteDeviceInfo {
+                            name: device_name.clone().into(),
+                            device_type: DeviceType::Laptop,
+                        }
+                        .serialize(),
+                    ),
+                    mediums: self.mediums.clone(),
+                    // Tell the phone how we can carry the upgraded medium: our
+                    // LAN address (so it can offer WIFI_LAN for us to connect
+                    // to), and that we can HOST a Wi-Fi Direct group / hotspot
+                    // ourselves (the dynamic role switch it uses when there is
+                    // no shared LAN — the Quick Share for Windows path).
+                    medium_metadata,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        self.send_frame(request.encode_to_vec()).await?;
+
+        Ok(())
+    }
+
+    pub async fn send_ukey2_client_init(&mut self) -> Result<(), anyhow::Error> {
+        let (secret_key, public_key) = gen_ecdsa_keypair();
+
+        let encoded_point = public_key.to_encoded_point(false);
+        let x = encoded_point.x().unwrap();
+        let y = encoded_point.y().unwrap();
+
+        let pkey = GenericPublicKey {
+            r#type: PublicKeyType::EcP256.into(),
+            ec_p256_public_key: Some(EcP256PublicKey {
+                x: encode_point(Bytes::from(x.to_vec()))?,
+                y: encode_point(Bytes::from(y.to_vec()))?,
+            }),
+            ..Default::default()
+        };
+
+        let finish_frame = Ukey2Message {
+            message_type: Some(ukey2_message::Type::ClientFinish.into()),
+            message_data: Some(
+                Ukey2ClientFinished {
+                    public_key: Some(pkey.encode_to_vec()),
+                }
+                .encode_to_vec(),
+            ),
+        };
+
+        let sha512 = Sha512::digest(finish_frame.encode_to_vec());
+        let frame = Ukey2Message {
+            message_type: Some(ukey2_message::Type::ClientInit.into()),
+            message_data: Some(
+                Ukey2ClientInit {
+                    version: Some(1),
+                    random: Some(gen_random(32)),
+                    next_protocol: Some(String::from("AES_256_CBC-HMAC_SHA256")),
+                    cipher_commitments: vec![CipherCommitment {
+                        handshake_cipher: Some(Ukey2HandshakeCipher::P256Sha512.into()),
+                        commitment: Some(sha512.to_vec()),
+                    }],
+                }
+                .encode_to_vec(),
+            ),
+        };
+
+        self.send_frame(frame.encode_to_vec()).await?;
+
+        self.update_state(
+            |e| {
+                e.state = TransferState::SentUkeyClientInit;
+                e.private_key = Some(secret_key);
+                e.public_key = Some(public_key);
+                e.client_init_msg_data = Some(frame.encode_to_vec());
+                e.ukey_client_finish_msg_data = Some(finish_frame.encode_to_vec());
+            },
+            false,
+        )
+        .await;
+
+        Ok(())
+    }
+
+    async fn process_ukey2_server_init(&mut self, msg: &Ukey2Message) -> Result<(), anyhow::Error> {
+        if msg.message_type() != ukey2_message::Type::ServerInit {
+            self.send_ukey2_alert(AlertType::BadMessageType).await?;
+            return Err(anyhow!(
+                "UKey2: message_type({:?}) != ServerInit",
+                msg.message_type
+            ));
+        }
+
+        let server_init = match Ukey2ServerInit::decode(msg.message_data()) {
+            Ok(uk2si) => uk2si,
+            Err(e) => {
+                return Err(anyhow!("UKey2: Ukey2ClientFinished::decode: {}", e));
+            }
+        };
+
+        if server_init.version() != 1 {
+            self.send_ukey2_alert(AlertType::BadVersion).await?;
+            return Err(anyhow!("UKey2: server_init.version != 1"));
+        }
+
+        if server_init.random().len() != 32 {
+            self.send_ukey2_alert(AlertType::BadRandom).await?;
+            return Err(anyhow!("UKey2: server_init.random.len != 32"));
+        }
+
+        if server_init.handshake_cipher() != Ukey2HandshakeCipher::P256Sha512 {
+            self.send_ukey2_alert(AlertType::BadHandshakeCipher).await?;
+            return Err(anyhow!("UKey2: handshake_cipher != P256Sha512"));
+        }
+
+        let server_public_key = match GenericPublicKey::decode(server_init.public_key()) {
+            Ok(spk) => spk,
+            Err(e) => {
+                return Err(anyhow!("UKey2: GenericPublicKey::decode: {}", e));
+            }
+        };
+
+        self.finalize_key_exchange(server_public_key).await?;
+        self.send_frame(self.state.ukey_client_finish_msg_data.clone().unwrap())
+            .await?;
+
+        let frame = location_nearby_connections::OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::ConnectionResponse.into(),
+                ),
+                connection_response: Some(location_nearby_connections::ConnectionResponseFrame {
+                    response: Some(
+                        location_nearby_connections::connection_response_frame::ResponseStatus::Accept.into(),
+                    ),
+                    // Present as WINDOWS: GmsCore's dynamic role switch (the phone
+                    // asking US to host the Wi-Fi Direct/hotspot link when there is
+                    // no shared LAN) only fires for an Android⇄Windows pair — it has
+                    // no rule for LINUX. Same interop shim as Quick Share for
+                    // Windows; the protocol is identical from here on.
+                    // `PACKET_SEND_META=plain|linux` drops the shim (paired-key
+                    // disconnect experiment).
+                    os_info: match std::env::var("PACKET_SEND_META")
+                        .ok()
+                        .map(|v| v.to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("plain") | Some("linux") => None,
+                        _ => Some(location_nearby_connections::OsInfo {
+                            r#type: Some(
+                                location_nearby_connections::os_info::OsType::Windows.into(),
+                            ),
+                        }),
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        self.send_frame(frame.encode_to_vec()).await?;
+
+        Ok(())
+    }
+
+    async fn process_connection_response(
+        &mut self,
+        frame: &location_nearby_connections::OfflineFrame,
+    ) -> Result<(), anyhow::Error> {
+        let v1_frame = frame
+            .v1
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing required fields"))?;
+
+        if v1_frame.r#type() != location_nearby_connections::v1_frame::FrameType::ConnectionResponse
+        {
+            return Err(anyhow!(format!(
+                "Unexpected frame type: {:?}",
+                v1_frame.r#type()
+            )));
+        }
+
+        if v1_frame.connection_response.is_none() {
+            return Err(anyhow!(format!("Unexpected None connection_response",)));
+        }
+
+        // Remember who we're talking to: Windows receivers need the payload
+        // over an upgraded channel (see try_wifi_upgrade_client).
+        self.peer_os = v1_frame
+            .connection_response
+            .as_ref()
+            .unwrap()
+            .os_info
+            .as_ref()
+            .and_then(|o| o.r#type);
+        info!("peer os_info: {:?}", self.peer_os);
+
+        if v1_frame.connection_response.as_ref().unwrap().response() != ResponseStatus::Accept {
+            return Err(anyhow!(format!("Connection rejected by third party",)));
+        }
+
+        let paired_encryption = sharing_nearby::Frame {
+            version: Some(sharing_nearby::frame::Version::V1.into()),
+            v1: Some(sharing_nearby::V1Frame {
+                r#type: Some(sharing_nearby::v1_frame::FrameType::PairedKeyEncryption.into()),
+                paired_key_encryption: Some(sharing_nearby::PairedKeyEncryptionFrame {
+                    secret_id_hash: Some(gen_random(6)),
+                    signed_data: Some(gen_random(72)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        self.send_encrypted_frame(&paired_encryption).await?;
+
+        Ok(())
+    }
+
+    async fn decrypt_and_process_secure_message(
+        &mut self,
+        smsg: &SecureMessage,
+    ) -> Result<(), anyhow::Error> {
+        let mut hmac = HmacSha256::new_from_slice(
+            self.state
+                .recv_hmac_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("Encryption handshake incomplete"))?,
+        )?;
+        hmac.update(&smsg.header_and_body);
+        if hmac.verify_slice(&smsg.signature).is_err() {
+            return Err(anyhow!("hmac!=signature"));
+        }
+
+        let header_and_body = HeaderAndBody::decode(&*smsg.header_and_body)?;
+        if header_and_body.header.iv().len() != 16
+            || header_and_body.body.is_empty()
+            || header_and_body.body.len() % 16 != 0
+        {
+            return Err(anyhow!("Invalid AES-CBC frame dimensions"));
+        }
+
+        let msg_data = header_and_body.body;
+        let key = self
+            .state
+            .decrypt_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("Encryption handshake incomplete"))?;
+
+        let mut cipher = Cipher::new_256(key[..AES_256_KEY_LEN].try_into()?);
+        cipher.set_auto_padding(true);
+        let decrypted = cipher.cbc_decrypt(header_and_body.header.iv(), &msg_data);
+
+        let d2d_msg = DeviceToDeviceMessage::decode(&*decrypted)?;
+
+        let seq = self.get_client_seq_inc().await;
+        if d2d_msg.sequence_number() != seq {
+            return Err(anyhow!(
+                "Error d2d_msg.sequence_number invalid ({} vs {})",
+                d2d_msg.sequence_number(),
+                seq
+            ));
+        }
+
+        let offline = location_nearby_connections::OfflineFrame::decode(d2d_msg.message())?;
+        self.process_offline_frame(offline).await
+    }
+
+    async fn process_offline_frame(&mut self, offline: OfflineFrame) -> Result<(), anyhow::Error> {
+        let v1_frame = offline
+            .v1
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing required fields"))?;
+        debug!(
+            "outbound recv offline frame: type={:?} (state={:?})",
+            v1_frame.r#type(),
+            self.state.state
+        );
+        match v1_frame.r#type() {
+            location_nearby_connections::v1_frame::FrameType::PayloadTransfer => {
+                trace!("Received FrameType::PayloadTransfer");
+                let payload_transfer = v1_frame
+                    .payload_transfer
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Missing required fields"))?;
+
+                let header = payload_transfer
+                    .payload_header
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Missing required fields"))?;
+                let chunk = payload_transfer
+                    .payload_chunk
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("Missing required fields"))?;
+
+                match header.r#type() {
+                    payload_header::PayloadType::Bytes => {
+                        info!("Processing PayloadType::Bytes");
+                        let payload_id = header.id();
+
+                        if header.total_size() < 0
+                            || header.total_size() > SANE_FRAME_LENGTH.into()
+                            || self.state.payload_buffers.len() > 32
+                        {
+                            self.state.payload_buffers.remove(&payload_id);
+                            return Err(anyhow!(
+                                "Payload too large: {} bytes",
+                                header.total_size()
+                            ));
+                        }
+
+                        self.state
+                            .payload_buffers
+                            .entry(payload_id)
+                            .or_insert_with(|| Vec::with_capacity(header.total_size() as usize));
+
+                        // Get the current length of the buffer, if it exists, without holding a mutable borrow.
+                        let buffer_len = self.state.payload_buffers.get(&payload_id).unwrap().len();
+                        if chunk.offset() != buffer_len as i64 {
+                            self.state.payload_buffers.remove(&payload_id);
+                            return Err(anyhow!(
+                                "Unexpected chunk offset: {}, expected: {}",
+                                chunk.offset(),
+                                buffer_len
+                            ));
+                        }
+
+                        let buffer = self.state.payload_buffers.get_mut(&payload_id).unwrap();
+                        if let Some(body) = &chunk.body {
+                            if buffer.len().saturating_add(body.len()) > SANE_FRAME_LENGTH as usize
+                            {
+                                return Err(anyhow!("Payload buffer limit exceeded"));
+                            }
+                            buffer.extend(body);
+                        }
+
+                        if (chunk.flags() & 1) == 1 {
+                            debug!("Chunk flags & 1 == 1 ?? End of data ??");
+
+                            let inner_frame = sharing_nearby::Frame::decode(buffer.as_slice())?;
+                            self.process_transfer_setup(&inner_frame).await?;
+                        }
+                    }
+                    payload_header::PayloadType::File => {
+                        error!("Unhandled PayloadType::File: {:?}", header.r#type())
+                    }
+                    payload_header::PayloadType::Stream => {
+                        error!("Unhandled PayloadType::Stream: {:?}", header.r#type())
+                    }
+                    payload_header::PayloadType::UnknownPayloadType => {
+                        error!(
+                            "Invalid PayloadType::UnknownPayloadType: {:?}",
+                            header.r#type()
+                        )
+                    }
+                }
+            }
+            location_nearby_connections::v1_frame::FrameType::KeepAlive => {
+                trace!("Sending keepalive");
+                self.send_keepalive(true).await?;
+            }
+            location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation => {
+                // The phone can start the upgrade negotiation while our state
+                // machine is still mid-handshake; stash it for the upgrade wait.
+                debug!("Stashing a BWU frame that arrived mid-handshake");
+                self.pending_bwu = Some(offline.clone());
+            }
+            _ => {
+                error!("Unhandled offline frame encrypted: {:?}", offline);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_transfer_setup(
+        &mut self,
+        frame: &sharing_nearby::Frame,
+    ) -> Result<(), anyhow::Error> {
+        let v1_frame = frame
+            .v1
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing required fields"))?;
+        debug!(
+            "outbound recv sharing frame: type={:?} (state={:?})",
+            v1_frame.r#type(),
+            self.state.state
+        );
+
+        if v1_frame.r#type() == sharing_nearby::v1_frame::FrameType::Cancel {
+            info!("Transfer canceled");
+            self.update_state(
+                |e| {
+                    e.state = TransferState::Cancelled;
+                },
+                true,
+            )
+            .await;
+            self.disconnection().await?;
+            return Err(anyhow!(crate::errors::AppError::NotAnError));
+        }
+
+        match self.state.state {
+            TransferState::SentPairedKeyEncryption => {
+                debug!("Processing State::SentPairedKeyEncryption");
+                self.process_paired_key_encryption_frame(v1_frame).await?;
+                self.update_state(
+                    |e| {
+                        e.state = TransferState::SentPairedKeyResult;
+                    },
+                    false,
+                )
+                .await;
+            }
+            TransferState::SentPairedKeyResult => {
+                debug!("Processing State::SentPairedKeyResult");
+                self.process_paired_key_result(v1_frame).await?;
+                self.update_state(
+                    |e| {
+                        e.state = TransferState::SentIntroduction;
+                    },
+                    true,
+                )
+                .await;
+            }
+            TransferState::SentIntroduction => {
+                debug!("Processing State::SentIntroduction");
+                self.process_consent(v1_frame).await?;
+            }
+            TransferState::SendingFiles => {}
+            _ => {
+                info!(
+                    "Unhandled connection state in process_transfer_setup: {:?}",
+                    self.state.state
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn process_paired_key_encryption_frame(
+        &mut self,
+        v1_frame: &sharing_nearby::V1Frame,
+    ) -> Result<(), anyhow::Error> {
+        if v1_frame.paired_key_encryption.is_none() {
+            return Err(anyhow!("Missing required fields"));
+        }
+
+        let paired_result = sharing_nearby::Frame {
+            version: Some(sharing_nearby::frame::Version::V1.into()),
+            v1: Some(sharing_nearby::V1Frame {
+                r#type: Some(sharing_nearby::v1_frame::FrameType::PairedKeyResult.into()),
+                paired_key_result: Some(sharing_nearby::PairedKeyResultFrame {
+                    status: Some(paired_key_result_frame::Status::Unable.into()),
+                }),
+                ..Default::default()
+            }),
+        };
+
+        self.send_encrypted_frame(&paired_result).await?;
+
+        Ok(())
+    }
+
+    async fn process_paired_key_result(
+        &mut self,
+        v1_frame: &sharing_nearby::V1Frame,
+    ) -> Result<(), anyhow::Error> {
+        if v1_frame.paired_key_result.is_none() {
+            return Err(anyhow!("Missing required fields"));
+        }
+
+        let mut file_metadata: Vec<FileMetadata> = vec![];
+        let mut transferred_files: HashMap<i64, InternalFileInfo> = HashMap::new();
+        let mut total_to_send = 0u64;
+        // TODO - Handle sending Text
+        for source in self.payload.sources()? {
+            let path = Path::new(source.name());
+            let file = source.reader()?;
+            let fmetadata = file.metadata()?;
+            let ftype = mime_guess::from_path(path)
+                .first_or_octet_stream()
+                .to_string();
+
+            let meta_type = if ftype.starts_with("image/") {
+                file_metadata::Type::Image
+            } else if ftype.starts_with("video/") {
+                file_metadata::Type::Video
+            } else if ftype.starts_with("audio/") {
+                file_metadata::Type::Audio
+            } else if path.extension().unwrap_or_default() == "apk" {
+                file_metadata::Type::App
+            } else {
+                file_metadata::Type::Unknown
+            };
+
+            info!("File type to send: {}", ftype);
+            let fname = path
+                .file_name()
+                .ok_or_else(|| anyhow!("Missing source filename"))?;
+            let fmeta = FileMetadata {
+                // Positive like Google's own implementations generate —
+                // a strict receiver (Windows) may discard payloads with
+                // a negative id as invalid.
+                payload_id: Some(rand::rng().random::<i64>().unsigned_abs() as i64 & i64::MAX),
+                name: Some(fname.to_os_string().into_string().unwrap()),
+                size: Some(fmetadata.size() as i64),
+                mime_type: Some(ftype),
+                r#type: Some(meta_type.into()),
+                // The attachment uuid ("Should be unique across all
+                // attachments"). Receivers key their transfer
+                // bookkeeping on it — Android tolerates its absence,
+                // Windows sits at "Connecting…" without it while the
+                // payload still saves.
+                id: Some(rand::rng().random::<i64>().unsigned_abs() as i64 & i64::MAX),
+                ..Default::default()
+            };
+            info!(
+                "introduction attachment: id={:?} payload_id={:?} name={:?} size={:?} mime={:?}",
+                fmeta.id, fmeta.payload_id, fmeta.name, fmeta.size, fmeta.mime_type
+            );
+            transferred_files.insert(
+                fmeta.payload_id(),
+                InternalFileInfo {
+                    payload_id: fmeta.payload_id(),
+                    file_url: path.to_path_buf(),
+                    bytes_transferred: 0,
+                    total_size: fmeta.size(),
+                    file: Some(file),
+                },
+            );
+            file_metadata.push(fmeta);
+            total_to_send = total_to_send
+                .checked_add(fmetadata.size())
+                .ok_or_else(|| anyhow!("File size overflow"))?;
+        }
+
+        self.update_state(
+            |e| {
+                if let Some(tmd) = e.transfer_metadata.as_mut() {
+                    tmd.total_bytes = total_to_send;
+                }
+                e.transferred_files = transferred_files;
+            },
+            false,
+        )
+        .await;
+
+        let introduction = sharing_nearby::Frame {
+            version: Some(sharing_nearby::frame::Version::V1.into()),
+            v1: Some(sharing_nearby::V1Frame {
+                r#type: Some(sharing_nearby::v1_frame::FrameType::Introduction.into()),
+                introduction: Some(IntroductionFrame {
+                    file_metadata,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        self.send_encrypted_frame(&introduction).await?;
+
+        // Consent is mutual in the sharing layer: real senders (Android and
+        // Windows alike) follow the INTRODUCTION with their own
+        // Response(ACCEPT). Android receivers don't miss it, but Windows
+        // waits for the sender's accept before leaving "Connecting…" — and
+        // reports "Can't complete transfer" without it even after saving the
+        // whole payload.
+        let sender_accept = sharing_nearby::Frame {
+            version: Some(sharing_nearby::frame::Version::V1.into()),
+            v1: Some(sharing_nearby::V1Frame {
+                r#type: Some(sharing_nearby::v1_frame::FrameType::Response.into()),
+                connection_response: Some(sharing_nearby::ConnectionResponseFrame {
+                    status: Some(sharing_nearby::connection_response_frame::Status::Accept.into()),
+                }),
+                ..Default::default()
+            }),
+        };
+        self.send_encrypted_frame(&sender_accept).await?;
+
+        Ok(())
+    }
+
+    /// Build a BandwidthUpgradeNegotiation OfflineFrame.
+    fn bwu_frame(
+        event_type: location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType,
+        upgrade_path_info: Option<
+            location_nearby_connections::bandwidth_upgrade_negotiation_frame::UpgradePathInfo,
+        >,
+        client_introduction: Option<
+            location_nearby_connections::bandwidth_upgrade_negotiation_frame::ClientIntroduction,
+        >,
+    ) -> OfflineFrame {
+        use location_nearby_connections::BandwidthUpgradeNegotiationFrame;
+        OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                        .into(),
+                ),
+                bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
+                    event_type: Some(event_type.into()),
+                    upgrade_path_info,
+                    client_introduction,
+                    client_introduction_ack: None,
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Plaintext CLIENT_INTRODUCTION_ACK, sent over the newly-established
+    /// upgrade channel.
+    #[cfg(test)]
+    fn bwu_ack_frame() -> OfflineFrame {
+        use location_nearby_connections::BandwidthUpgradeNegotiationFrame;
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            ClientIntroductionAck, EventType,
+        };
+        OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                        .into(),
+                ),
+                bandwidth_upgrade_negotiation: Some(BandwidthUpgradeNegotiationFrame {
+                    event_type: Some(EventType::ClientIntroductionAck.into()),
+                    client_introduction_ack: Some(ClientIntroductionAck {}),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Read one encrypted frame from the current channel, decrypt it (advancing
+    /// client_seq), and return the OfflineFrame without dispatching to the
+    /// payload state machine.
+    async fn read_encrypted_offline_frame(&mut self) -> Result<OfflineFrame, anyhow::Error> {
+        let data = self.framing.read(&mut self.socket).await?;
+        self.decrypt_offline_frame(&data).await
+    }
+    async fn decrypt_offline_frame(&mut self, data: &[u8]) -> anyhow::Result<OfflineFrame> {
+        let smsg = SecureMessage::decode(data)?;
+        let mut hmac = HmacSha256::new_from_slice(
+            self.state
+                .recv_hmac_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("Encryption handshake incomplete"))?,
+        )?;
+        hmac.update(&smsg.header_and_body);
+        if hmac.verify_slice(&smsg.signature).is_err() {
+            return Err(anyhow!("hmac!=signature"));
+        }
+        let header_and_body = HeaderAndBody::decode(&*smsg.header_and_body)?;
+        if header_and_body.header.iv().len() != 16
+            || header_and_body.body.is_empty()
+            || header_and_body.body.len() % 16 != 0
+        {
+            return Err(anyhow!("Invalid AES-CBC frame dimensions"));
+        }
+        let key = self
+            .state
+            .decrypt_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("Encryption handshake incomplete"))?;
+        let mut cipher = Cipher::new_256(key[..AES_256_KEY_LEN].try_into()?);
+        cipher.set_auto_padding(true);
+        let decrypted = cipher.cbc_decrypt(header_and_body.header.iv(), &header_and_body.body);
+        let d2d_msg = DeviceToDeviceMessage::decode(&*decrypted)?;
+
+        let seq = self.get_client_seq_inc().await;
+        if d2d_msg.sequence_number() != seq {
+            return Err(anyhow!(
+                "seq invalid ({} vs {})",
+                d2d_msg.sequence_number(),
+                seq
+            ));
+        }
+        Ok(OfflineFrame::decode(d2d_msg.message())?)
+    }
+
+    async fn decline_upgrade(&mut self) -> anyhow::Result<()> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            EventType, UpgradePathInfo,
+        };
+        let info = self.bwu_offer_medium.map(|medium| UpgradePathInfo {
+            medium: Some(medium),
+            ..Default::default()
+        });
+        self.encrypt_and_send(&Self::bwu_frame(EventType::UpgradeFailure, info, None))
+            .await
+    }
+
+    fn join_guard_release(&mut self) {
+        #[cfg(all(feature = "experimental", target_os = "linux"))]
+        self.join_guard.take();
+    }
+
+    async fn next_upgrade_frame(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Option<OfflineFrame>> {
+        loop {
+            tokio::select! {
+                biased;
+                message = self.receiver.recv() => {
+                    let message = message.context("Upgrade control channel closed or lagged")?;
+                    if message.id != self.state.id && message.id != "*" { continue; }
+                    if let channel::Message::Lib { action: TransferAction::TransferCancel | TransferAction::ConsentDecline } = message.msg {
+                        self.update_state(|s| s.state = TransferState::Cancelled, true).await;
+                        let _ = tokio::time::timeout(Duration::from_secs(2), self.disconnection()).await;
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+                bytes = self.framing.read(&mut self.socket) => return Ok(Some(self.decrypt_offline_frame(&bytes?).await?)),
+            }
+        }
+    }
+
+    async fn during_upgrade<T>(
+        &mut self,
+        operation: impl std::future::Future<Output = anyhow::Result<T>>,
+        timeout: Duration,
+    ) -> anyhow::Result<anyhow::Result<T>> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::pin!(operation);
+        loop {
+            tokio::select! {
+                result = &mut operation => {
+                    anyhow::ensure!(result.is_ok() || !self.bwu_peer_last_write, "New channel failed after prior-channel LAST_WRITE");
+                    return Ok(result);
+                }
+                frame = self.next_upgrade_frame(deadline) => {
+                    let Some(frame) = frame? else {
+                        anyhow::ensure!(!self.bwu_peer_last_write, "Upgrade timed out after prior-channel LAST_WRITE");
+                        return Ok(Err(anyhow!("Bandwidth upgrade setup timed out")));
+                    };
+                    let event = frame.v1.as_ref()
+                        .filter(|v| v.r#type() == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation)
+                        .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref()).map(|b| b.event_type());
+                    if event == Some(EventType::LastWriteToPriorChannel) {
+                        self.bwu_peer_last_write = true;
+                        continue;
+                    }
+                    anyhow::ensure!(!self.bwu_peer_last_write, "Traffic after prior-channel LAST_WRITE before handoff");
+                    if event == Some(EventType::UpgradeFailure) { return Ok(Err(anyhow!("Peer rejected upgrade"))); }
+                    Box::pin(self.process_offline_frame(frame)).await?;
+                }
+            }
+        }
+    }
+
+    async fn drain_prior_channel(&mut self) -> anyhow::Result<()> {
+        use location_nearby_connections::{
+            bandwidth_upgrade_negotiation_frame::EventType, v1_frame::FrameType,
+        };
+        self.encrypt_and_send(&Self::bwu_frame(
+            EventType::LastWriteToPriorChannel,
+            None,
+            None,
+        ))
+        .await?;
+        let mut last_write = self.bwu_peer_last_write;
+        if last_write {
+            self.encrypt_and_send(&Self::bwu_frame(
+                EventType::SafeToClosePriorChannel,
+                None,
+                None,
+            ))
+            .await?;
+        }
+        let mut safe = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while !(last_write && safe) {
+            let frame = self
+                .next_upgrade_frame(deadline)
+                .await?
+                .context("Incomplete prior-channel handoff")?;
+            let v1 = frame.v1.as_ref().context("Missing prior-channel frame")?;
+            match v1.r#type() {
+                FrameType::BandwidthUpgradeNegotiation => match v1
+                    .bandwidth_upgrade_negotiation
+                    .as_ref()
+                    .context("Missing negotiation")?
+                    .event_type()
+                {
+                    EventType::LastWriteToPriorChannel => {
+                        last_write = true;
+                        self.encrypt_and_send(&Self::bwu_frame(
+                            EventType::SafeToClosePriorChannel,
+                            None,
+                            None,
+                        ))
+                        .await?;
+                    }
+                    EventType::SafeToClosePriorChannel => safe = true,
+                    EventType::UpgradeFailure => {
+                        anyhow::bail!("Peer rejected handoff after LAST_WRITE")
+                    }
+                    _ => {}
+                },
+                FrameType::KeepAlive => {} // No new keepalive writes after LAST_WRITE.
+                FrameType::Disconnection => {
+                    anyhow::bail!("Peer disconnected before handoff completed")
+                }
+                _ => {
+                    anyhow::ensure!(!last_write, "Payload after prior-channel LAST_WRITE");
+                    Box::pin(self.process_offline_frame(frame)).await?;
+                }
+            }
+        }
+        self.bwu_peer_last_write = false;
+        Ok(())
+    }
+
+    /// As the SENDER (the *discoverer*), take the Wi-Fi upgrade the phone (the
+    /// *advertiser*) offers: the phone hosts and sends UPGRADE_PATH_AVAILABLE
+    /// with its own ip:port; we connect out to it, introduce ourselves, drain the
+    /// BLE channel, and swap the socket to TCP. This is the correct role — Google's
+    /// bwu_manager drops a discoverer-hosted offer as "ignored by Advertiser", so
+    /// we must be the client, not the host. `Ok(true)` if upgraded.
+    async fn try_wifi_upgrade_client(&mut self) -> Result<bool, anyhow::Error> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium as UpMedium;
+
+        let peer_is_windows =
+            self.peer_os == Some(location_nearby_connections::os_info::OsType::Windows as i32);
+        if !self.socket.is_low_bandwidth() && !peer_is_windows {
+            return Ok(false); // already on Wi-Fi/TCP and the peer is fine with it.
+        }
+        if !self.socket.is_low_bandwidth() {
+            // Windows accepts the transfer but never consumes the payload on
+            // the initial connection — it offers an upgraded channel and spins
+            // "Connecting…" until the sender joins it. Take the offer.
+            info!("BWU(send): peer is Windows; waiting for its upgrade offer");
+        }
+
+        // Wait for the phone's move: an UPGRADE_PATH_AVAILABLE (WIFI_LAN — same
+        // LAN, we connect to it) or an UPGRADE_PATH_REQUEST (no shared LAN —
+        // the phone asks US to host; the Quick Share for Windows path).
+        let mut deadline = tokio::time::Instant::now() + BWU_OFFER_TIMEOUT;
+        let (candidates, requires_ack) = loop {
+            let offline = if let Some(stashed) = self.pending_bwu.take() {
+                stashed
+            } else {
+                let Some(frame) = self.next_upgrade_frame(deadline).await? else {
+                    return Ok(false);
+                };
+                frame
+            };
+            let bwu = offline
+                .v1
+                .as_ref()
+                .filter(|v| {
+                    v.r#type()
+                        == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                })
+                .and_then(|v| v.bandwidth_upgrade_negotiation.as_ref());
+            let Some(bwu) = bwu else {
+                // KeepAlive or other in-band frame while waiting; ack pings so
+                // the peer's keepalive timer doesn't kill the session, then
+                // keep waiting.
+                if offline.v1.as_ref().map(|v| v.r#type())
+                    == Some(location_nearby_connections::v1_frame::FrameType::KeepAlive)
+                {
+                    let _ = self.send_keepalive(true).await;
+                }
+                continue;
+            };
+            match bwu.event_type() {
+                EventType::UpgradePathAvailable => {
+                    let upi = bwu.upgrade_path_info.as_ref();
+                    self.bwu_offer_medium = upi.and_then(|u| u.medium);
+                    let medium = upi.map(|u| u.medium());
+                    match medium {
+                        Some(UpMedium::WifiLan) => {
+                            if let Some(w) = upi.and_then(|u| u.wifi_lan_socket.as_ref()) {
+                                if let Ok(candidates) = crate::lan_policy::upgrade_candidates(w) {
+                                    break (
+                                        candidates,
+                                        upi.is_some_and(|info| {
+                                            info.supports_client_introduction_ack()
+                                        }),
+                                    );
+                                }
+                            }
+                            info!("BWU(send): WIFI_LAN offer had no usable socket; staying on BLE");
+                            return Ok(false);
+                        }
+                        Some(UpMedium::WifiDirect) | Some(UpMedium::WifiHotspot) => {
+                            // LAN-preference dance: a phone sitting on its
+                            // receive screen drops off Wi-Fi for discovery and
+                            // only rejoins after the connection lands, so its
+                            // FIRST offer says Wi-Fi Direct even when both
+                            // devices share a network. Declining one offer
+                            // makes the phone's BWU manager retry a few
+                            // seconds later with Wi-Fi back up: same LAN → the
+                            // retry offers WIFI_LAN (no need to drop this
+                            // machine off its own network); genuinely no
+                            // shared network → Direct again, taken as-is.
+                            // `PACKET_BWU_LAN_PREF=off` disables the dance.
+                            if !self.bwu_declined_direct
+                                && crate::utils::local_lan_ip().is_some()
+                                && !std::env::var("PACKET_BWU_LAN_PREF")
+                                    .map(|v| v.eq_ignore_ascii_case("off"))
+                                    .unwrap_or(false)
+                            {
+                                self.bwu_declined_direct = true;
+                                info!(
+                                    "BWU(send): declining the first {medium:?} offer in case the phone re-offers WIFI_LAN now that its Wi-Fi is back"
+                                );
+                                let failure = location_nearby_connections::bandwidth_upgrade_negotiation_frame::UpgradePathInfo {
+                                    medium: upi.and_then(|u| u.medium),
+                                    ..Default::default()
+                                };
+                                let _ = self
+                                    .encrypt_and_send(&Self::bwu_frame(
+                                        EventType::UpgradeFailure,
+                                        Some(failure),
+                                        None,
+                                    ))
+                                    .await;
+                                deadline = tokio::time::Instant::now() + BWU_RETRY_WAIT;
+                                continue;
+                            }
+                            // The phone hosts its own Wi-Fi Direct group /
+                            // hotspot (the no-shared-LAN path): join it and
+                            // connect to its gateway.
+                            let creds = upi
+                                .and_then(|u| u.wifi_direct_credentials.as_ref())
+                                .map(|c| {
+                                    (
+                                        c.ssid().to_owned(),
+                                        c.password().to_owned(),
+                                        c.gateway().to_owned(),
+                                        c.port(),
+                                        c.frequency(),
+                                        c.device_name().to_owned(),
+                                        c.pin().to_owned(),
+                                        crate::hdl::direct_candidates(c),
+                                    )
+                                })
+                                .or_else(|| {
+                                    upi.and_then(|u| u.wifi_hotspot_credentials.as_ref())
+                                        .map(|c| {
+                                            (
+                                                c.ssid().to_owned(),
+                                                c.password().to_owned(),
+                                                c.gateway().to_owned(),
+                                                c.port(),
+                                                c.frequency(),
+                                                String::new(),
+                                                String::new(),
+                                                crate::hdl::hotspot_candidates(c),
+                                            )
+                                        })
+                                });
+                            let Some((
+                                ssid,
+                                password,
+                                gateway,
+                                port,
+                                freq,
+                                device_name,
+                                pin,
+                                candidates,
+                            )) = creds
+                            else {
+                                info!(
+                                    "BWU(send): {medium:?} offer carried no credentials; staying on BLE"
+                                );
+                                return Ok(false);
+                            };
+                            info!(
+                                "BWU(send): phone hosts {medium:?} '{ssid}' (gateway {gateway}:{port}, freq {freq}); joining"
+                            );
+                            #[cfg(all(feature = "experimental", target_os = "linux"))]
+                            {
+                                let Ok(candidates) = candidates else {
+                                    return Ok(false);
+                                };
+                                let p2p = if ssid.is_empty() && !device_name.is_empty() {
+                                    Some((
+                                        device_name.as_str(),
+                                        pin.as_str(),
+                                        u32::try_from(freq).unwrap_or(0),
+                                    ))
+                                } else {
+                                    None
+                                };
+                                return self
+                                    .join_and_upgrade(
+                                        &ssid,
+                                        &password,
+                                        &candidates,
+                                        p2p,
+                                        upi.is_some_and(|info| {
+                                            info.supports_client_introduction_ack()
+                                        }),
+                                    )
+                                    .await;
+                            }
+                            #[cfg(not(all(feature = "experimental", target_os = "linux")))]
+                            return Ok(false);
+                        }
+                        other => {
+                            info!(
+                                "BWU(send): phone offered unsupported medium {other:?}; staying on BLE"
+                            );
+                            return Ok(false);
+                        }
+                    }
+                }
+                EventType::UpgradeFailure => {
+                    warn!("BWU(send): phone reported UPGRADE_FAILURE; staying on BLE");
+                    return Ok(false);
+                }
+                EventType::UpgradePathRequest => {
+                    // Dynamic role switch: no shared LAN, so the phone asks US
+                    // to host the upgraded medium.
+                    let request = bwu
+                        .upgrade_path_info
+                        .as_ref()
+                        .and_then(|u| u.upgrade_path_request.as_ref());
+                    let selected = request.and_then(|request| {
+                        crate::hdl::select_host_medium(
+                            &request.mediums,
+                            request.medium_meta_data.as_ref(),
+                        )
+                    });
+                    #[cfg(all(feature = "experimental", target_os = "linux"))]
+                    if let Some(medium) = selected {
+                        let auth = if medium == UpMedium::WifiDirect {
+                            Some(
+                                crate::hdl::host_auth_for(
+                                    request.and_then(|r| r.medium_meta_data.as_ref()),
+                                )
+                                .context("Missing P2P authentication intersection")?,
+                            )
+                        } else {
+                            None
+                        };
+                        return self.host_wifi_upgrade(auth).await;
+                    } else {
+                        // A role switch cannot invent a medium the peer did not
+                        // request or a host role our reserved radio cannot perform.
+                        let _ = self
+                            .encrypt_and_send(&Self::bwu_frame(
+                                EventType::UpgradeFailure,
+                                bwu.upgrade_path_info.clone(),
+                                None,
+                            ))
+                            .await;
+                        return Ok(false);
+                    }
+                    #[cfg(not(all(feature = "experimental", target_os = "linux")))]
+                    return Ok(false);
+                }
+                other => {
+                    debug!("BWU(send): awaiting offer, got event {other:?}");
+                }
+            }
+        };
+
+        info!(
+            "BWU(send): phone offered {} WIFI_LAN candidates",
+            candidates.len()
+        );
+        let tcp = match self
+            .during_upgrade(
+                crate::lan_policy::connect_candidates(&candidates),
+                Duration::from_secs(20),
+            )
+            .await?
+        {
+            Ok(socket) => socket,
+            Err(_) => {
+                self.decline_upgrade().await?;
+                return Ok(false);
+            }
+        };
+
+        self.finish_upgrade_over(tcp, requires_ack).await
+    }
+
+    /// Join the phone-hosted Wi-Fi network, connect to its gateway and run the
+    /// upgrade over that link. The network membership lives until the transfer
+    /// ends (`join_guard`); the previous Wi-Fi connection is then restored.
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
+    async fn join_and_upgrade(
+        &mut self,
+        ssid: &str,
+        password: &str,
+        candidates: &[std::net::SocketAddr],
+        p2p: Option<(&str, &str, u32)>,
+        requires_ack: bool,
+    ) -> Result<bool, anyhow::Error> {
+        let setup = async {
+            let guard = if let Some((name, pin, frequency)) = p2p {
+                crate::hdl::join_p2p(name, pin, frequency).await?
+            } else {
+                crate::hdl::join_wifi(ssid, password, candidates).await?
+            };
+            let tcp = crate::hdl::connect_joined(&guard.interface, candidates).await?;
+            Ok((guard, tcp))
+        };
+        let (guard, tcp) = match self.during_upgrade(setup, Duration::from_secs(80)).await? {
+            Ok(joined) => joined,
+            Err(error) => {
+                debug!("BWU(send): owned network setup failed: {error}");
+                self.decline_upgrade().await?;
+                return Ok(false);
+            }
+        };
+        self.join_guard = Some(guard);
+        self.finish_upgrade_over(tcp, requires_ack).await
+    }
+
+    /// Common tail of a client-role upgrade: introduce ourselves on the new TCP
+    /// channel, drain the BLE channel, and swap the socket.
+    async fn finish_upgrade_over(
+        &mut self,
+        mut tcp: tokio::net::TcpStream,
+        requires_ack: bool,
+    ) -> Result<bool, anyhow::Error> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::EventType;
+
+        // Introduce ourselves on the new channel (plaintext), then read the ack.
+        let intro = Self::bwu_frame(
+            EventType::ClientIntroduction,
+            None,
+            Some(location_nearby_connections::bandwidth_upgrade_negotiation_frame::ClientIntroduction {
+                endpoint_id: Some(String::from_utf8_lossy(&self.endpoint_id).to_string()),
+                supports_disabling_encryption: Some(false),
+            }),
+        );
+        let introduction = async {
+            send_plain_frame(&mut tcp, &intro.encode_to_vec()).await?;
+            if requires_ack {
+                // Google's ForBwuIntroductionAck emits only the event; the
+                // optional empty client_introduction_ack message may be absent.
+                let bytes = read_plain_frame(&mut tcp).await?;
+                let frame = OfflineFrame::decode(bytes.as_slice())?;
+                anyhow::ensure!(frame.version == Some(1) && frame.v1.as_ref().is_some_and(|v|
+                    v.r#type() == location_nearby_connections::v1_frame::FrameType::BandwidthUpgradeNegotiation
+                    && v.bandwidth_upgrade_negotiation.as_ref().is_some_and(|b|
+                        b.event_type() == EventType::ClientIntroductionAck)),
+                    "Invalid bandwidth upgrade introduction acknowledgment");
+            }
+            Ok(())
+        };
+        if let Err(error) = self
+            .during_upgrade(introduction, Duration::from_secs(5))
+            .await?
+        {
+            debug!("BWU(send): new channel introduction failed: {error}");
+            self.join_guard_release();
+            self.decline_upgrade().await?;
+            return Ok(false);
+        }
+        self.drain_prior_channel().await?;
+
+        if self.socket.upgrade_to_tcp(tcp) {
+            info!("BWU(send): upgraded to Wi-Fi; payload continues over TCP");
+            Ok(true)
+        } else {
+            anyhow::bail!("Transport cannot commit the completed bandwidth handoff")
+        }
+    }
+
+    /// Host the upgraded medium ourselves (the dynamic role switch): bring up a
+    /// hotspot, offer its credentials over the BLE channel, wait for the phone
+    /// to join our network and connect, introduce, drain the BLE channel and
+    /// swap the socket. Mirror of Quick Share for Windows when sender and
+    /// receiver share no LAN. The hotspot lives until the transfer ends.
+    #[cfg(all(feature = "experimental", target_os = "linux"))]
+    async fn host_wifi_upgrade(
+        &mut self,
+        auth: Option<linuxdrop_network::P2pHostAuth>,
+    ) -> Result<bool, anyhow::Error> {
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::upgrade_path_info::Medium as UpMedium;
+        use location_nearby_connections::bandwidth_upgrade_negotiation_frame::{
+            EventType, UpgradePathInfo,
+        };
+
+        let medium = if auth.is_some() {
+            UpMedium::WifiDirect
+        } else {
+            UpMedium::WifiHotspot
+        };
+        self.bwu_offer_medium = Some(medium.into());
+        let Some(expected) = self.peer_endpoint_id else {
+            self.decline_upgrade().await?;
+            return Ok(false);
+        };
+        let hosted = if let Some(auth) = auth {
+            crate::hdl::start_direct_group_with_auth(auth).await
+        } else {
+            crate::hdl::start_hotspot().await
+        };
+        let guard = match hosted {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("BWU(send): couldn't host {medium:?} ({e}); staying on BLE");
+                let failure = UpgradePathInfo {
+                    medium: Some(medium.into()),
+                    ..Default::default()
+                };
+                let _ = self
+                    .encrypt_and_send(&Self::bwu_frame(
+                        EventType::UpgradeFailure,
+                        Some(failure),
+                        None,
+                    ))
+                    .await;
+                return Ok(false);
+            }
+        };
+        let listener = crate::hdl::listen_hosted(&guard).await?;
+        let port = listener.port();
+        info!(
+            "BWU(send): hosting '{}' as {:?} (gateway {}:{port}); waiting for the phone to join",
+            guard.ssid, medium, guard.gateway
+        );
+
+        let info = crate::hdl::hosted_offer(&guard, &listener, medium)?;
+        self.encrypt_and_send(&Self::bwu_frame(
+            EventType::UpgradePathAvailable,
+            Some(info),
+            None,
+        ))
+        .await?;
+
+        let tcp = match self
+            .during_upgrade(
+                super::upgrade_introduction::accept(&listener, expected, false),
+                Duration::from_secs(45),
+            )
+            .await?
+        {
+            Ok(tcp) => tcp,
+            Err(_) => {
+                self.decline_upgrade().await?;
+                return Ok(false);
+            }
+        };
+
+        self.drain_prior_channel().await?;
+
+        if self.socket.upgrade_to_tcp(tcp) {
+            self.hotspot_guard = Some(guard);
+            info!("BWU(send): upgraded to our hosted Wi-Fi; payload continues over TCP");
+            Ok(true)
+        } else {
+            anyhow::bail!("Transport cannot commit the completed bandwidth handoff")
+        }
+    }
+
+    async fn process_consent(
+        &mut self,
+        v1_frame: &sharing_nearby::V1Frame,
+    ) -> Result<(), anyhow::Error> {
+        if v1_frame.r#type() != sharing_nearby::v1_frame::FrameType::Response
+            || v1_frame.connection_response.is_none()
+        {
+            return Err(anyhow!("Missing required fields"));
+        }
+
+        match v1_frame.connection_response.as_ref().unwrap().status() {
+            sharing_nearby::connection_response_frame::Status::Accept => {
+                // LinuxDrop requires explicit local SAS confirmation before any
+                // payload bytes leave this process, also on the sender side.
+                self.update_state(|e| e.state = TransferState::WaitingForUserConsent, true)
+                    .await;
+                let consent = tokio::time::timeout(Duration::from_secs(120), async {
+                    loop {
+                        let message = self.receiver.recv().await?;
+                        if message.id != self.state.id {
+                            continue;
+                        }
+                        if let channel::Message::Lib { action } = message.msg {
+                            return Ok::<_, tokio::sync::broadcast::error::RecvError>(
+                                action == TransferAction::ConsentAccept,
+                            );
+                        }
+                    }
+                })
+                .await;
+                if !matches!(consent, Ok(Ok(true))) {
+                    self.update_state(|e| e.state = TransferState::Rejected, true)
+                        .await;
+                    self.disconnection().await?;
+                    return Err(anyhow!(crate::errors::AppError::NotAnError));
+                }
+                info!("State is now State::SendingFiles");
+                self.update_state(
+                    |e| {
+                        e.state = TransferState::SendingFiles;
+                    },
+                    true,
+                )
+                .await;
+
+                let total: i64 = self
+                    .state
+                    .transferred_files
+                    .values()
+                    .map(|f| f.total_size)
+                    .sum();
+
+                // Take the phone's Wi-Fi upgrade if it offers one (we connect out
+                // to it — the phone, as advertiser, hosts). No-op on a Wi-Fi/TCP
+                // send. If it upgrades, the transfer streams fast over Wi-Fi.
+                // A payload that fits over BLE skips the upgrade outright: a
+                // multi-second Wi-Fi Direct join (which also drops this machine
+                // off its own network) is never worth it for a few bytes.
+                let upgraded = if self.socket.is_low_bandwidth() && total <= BLE_SEND_MAX_BYTES {
+                    info!("BWU(send): {total}-byte payload stays on BLE; skipping Wi-Fi upgrade");
+                    false
+                } else {
+                    self.try_wifi_upgrade_client().await?
+                };
+
+                // If we're still on a pure-BLE link, a large payload would stall
+                // then get dropped by the phone. Refuse it up front with guidance.
+                if !upgraded && self.socket.is_low_bandwidth() {
+                    if total > BLE_SEND_MAX_BYTES {
+                        warn!(
+                            "Payload {total} bytes is too large to send over Bluetooth; \
+                             put both devices on the same Wi-Fi and send over Wi-Fi instead"
+                        );
+                        self.update_state(|e| e.state = TransferState::Cancelled, true)
+                            .await;
+                        self.disconnection().await?;
+                        return Err(anyhow!(crate::errors::AppError::NotAnError));
+                    }
+                }
+
+                // TODO - Handle sending Text
+                let ids: Vec<i64> = self.state.transferred_files.keys().cloned().collect();
+                info!("We are sending: {:?}", ids);
+                let mut ids_iter = ids.into_iter();
+
+                // Over pure BLE the socket MTU caps how big a single frame can be
+                // delivered, so stream the payload in small chunks; over Wi-Fi a
+                // large buffer keeps throughput high.
+                let peer_is_windows = self.peer_os
+                    == Some(location_nearby_connections::os_info::OsType::Windows as i32);
+                let payload_buf_len = if self.socket.is_low_bandwidth() {
+                    BLE_PAYLOAD_CHUNK
+                } else if peer_is_windows {
+                    // Mirror Windows' own chunking (its sender uses 64 KB).
+                    64 * 1024
+                } else {
+                    WIFI_PAYLOAD_CHUNK
+                };
+
+                // Loop through all files
+                'send_all_files: loop {
+                    let current = match ids_iter.next() {
+                        Some(i) => i,
+                        None => {
+                            info!("All files have been transferred");
+                            // Let the RECEIVER hang up first. Windows finalizes the share
+                            // after the payload completes, and a DISCONNECTION frame from
+                            // us in that window makes it abort with "Can't complete
+                            // transfer" (observed: it slams the socket shut the same
+                            // second ours lands). Android receivers close / send their own
+                            // disconnection within ~1s of the last chunk, so waiting first
+                            // costs nothing there. Only if the peer holds the socket open
+                            // past the grace period do we announce our own disconnection
+                            // (the previous behavior) so nobody waits on us forever.
+                            let peer_closed =
+                                self.wait_for_peer_close(Duration::from_secs(8)).await;
+                            if !peer_closed {
+                                // Windows never sends a DISCONNECTION frame as a
+                                // sender and treats receiving one as a broken
+                                // transfer ("Can't complete") even with the file
+                                // already saved — mirror its etiquette: linger,
+                                // then hang up silently. Android peers keep the
+                                // announced disconnection (proven behavior).
+                                if peer_is_windows {
+                                    debug!("windows peer: closing quietly, no disconnection frame");
+                                } else {
+                                    debug!(
+                                        "peer still connected after grace; sending disconnection"
+                                    );
+                                    self.disconnection().await?;
+                                    self.wait_for_peer_close(Duration::from_secs(2)).await;
+                                }
+                            }
+                            self.update_state(
+                                |e| {
+                                    e.state = TransferState::Finished;
+                                },
+                                true,
+                            )
+                            .await;
+                            // Breaking instead of NotAnError to allow peacefull termination
+                            break;
+                        }
+                    };
+
+                    // Loop until we reached end of file
+                    loop {
+                        // Since this task's runtime is blocked with the outer loop,
+                        // OutboundRequest::handle() will not be called again.
+                        // Thus, we need to check for cancellation here.
+                        match self.receiver.try_recv() {
+                            Ok(channel_msg) => {
+                                if channel_msg.id == self.state.id || channel_msg.id == "*" {
+                                    // TODO: if-let chains will be available in 1.88
+                                    if let channel::Message::Lib { action } = &channel_msg.msg {
+                                        debug!("outbound: got: {:?}", channel_msg);
+                                        match action {
+                                            TransferAction::TransferCancel => {
+                                                self.update_state(
+                                                    |e| {
+                                                        e.state = TransferState::Cancelled;
+                                                    },
+                                                    true,
+                                                )
+                                                .await;
+                                                self.disconnection().await?;
+                                                break 'send_all_files;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                match e {
+                                    TryRecvError::Empty => {}
+                                    e => {
+                                        error!("inbound: channel error: {}", e)
+                                    }
+                                };
+                            }
+                        };
+
+                        // Workaround to limit scope of the immutable borrow on self
+                        let (curr_state, buffer, bytes_read) = {
+                            let curr_state = match self.state.transferred_files.get(&current) {
+                                Some(s) => s,
+                                None => break,
+                            };
+
+                            info!("> Currently sending {:?}", curr_state.file_url);
+                            if curr_state.total_size == 0 {
+                                let wrapper = location_nearby_connections::OfflineFrame {
+                                    version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+                                    v1: Some(location_nearby_connections::V1Frame {
+                                        r#type: Some(location_nearby_connections::v1_frame::FrameType::PayloadTransfer.into()),
+                                        payload_transfer: Some(PayloadTransferFrame {
+                                            packet_type: Some(PacketType::Data.into()),
+                                            payload_header: Some(PayloadHeader {id:Some(current), r#type:Some(payload_header::PayloadType::File.into()),total_size:Some(0),..Default::default()}),
+                                            payload_chunk: Some(PayloadChunk {offset:Some(0),flags:Some(1),body:Some(vec![]),..Default::default()}),
+                                            ..Default::default()
+                                        }), ..Default::default()
+                                    })
+                                };
+                                self.encrypt_and_send(&wrapper).await?;
+                                self.state.transferred_files.remove(&current);
+                                break;
+                            }
+                            if curr_state.bytes_transferred == curr_state.total_size {
+                                debug!("File {current} finished");
+                                self.update_state(
+                                    |e| {
+                                        e.transferred_files.remove(&current);
+                                    },
+                                    false,
+                                )
+                                .await;
+                                break;
+                            }
+
+                            if curr_state.file.is_none() {
+                                warn!("File {current} is none");
+                                break;
+                            }
+
+                            if curr_state.file.as_ref().unwrap().metadata()?.len()
+                                != curr_state.total_size as u64
+                            {
+                                return Err(anyhow!("Source file changed size during transfer"));
+                            }
+                            let remaining =
+                                (curr_state.total_size - curr_state.bytes_transferred) as usize;
+                            let mut buffer = vec![0u8; payload_buf_len.min(remaining)];
+                            let bytes_read = curr_state.file.as_ref().unwrap().read(&mut buffer)?;
+                            if bytes_read == 0 {
+                                return Err(anyhow!("Source ended before advertised size"));
+                            }
+
+                            (
+                                InternalFileInfo {
+                                    payload_id: curr_state.payload_id,
+                                    file_url: curr_state.file_url.clone(),
+                                    bytes_transferred: curr_state.bytes_transferred,
+                                    total_size: curr_state.total_size,
+                                    file: None,
+                                },
+                                buffer,
+                                bytes_read,
+                            )
+                        };
+
+                        if !crate::payload_budget::acquire(
+                            &self.bandwidth,
+                            bytes_read,
+                            &mut self.receiver,
+                            &self.state.id,
+                        )
+                        .await?
+                        {
+                            self.update_state(|state| state.state = TransferState::Cancelled, true)
+                                .await;
+                            self.disconnection().await?;
+                            return Err(anyhow!(crate::errors::AppError::NotAnError));
+                        }
+                        let sending_buffer = buffer[..bytes_read].to_vec();
+                        info!(
+                            "> File ready: {bytes_read} bytes && {} && left to send: {} with current offset: {}",
+                            sending_buffer.len(),
+                            curr_state.total_size - curr_state.bytes_transferred,
+                            curr_state.bytes_transferred
+                        );
+
+                        let payload_header = PayloadHeader {
+                            id: Some(current),
+                            r#type: Some(payload_header::PayloadType::File.into()),
+                            total_size: Some(curr_state.total_size),
+                            is_sensitive: Some(false),
+                            file_name: curr_state
+                                .file_url
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned()),
+                            // Present-but-empty, matching Windows' own frames.
+                            parent_folder: Some(String::new()),
+                            ..Default::default()
+                        };
+
+                        let wrapper = location_nearby_connections::OfflineFrame {
+							version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+							v1: Some(location_nearby_connections::V1Frame {
+								r#type: Some(
+									location_nearby_connections::v1_frame::FrameType::PayloadTransfer.into(),
+								),
+								payload_transfer: Some(PayloadTransferFrame {
+									packet_type: Some(PacketType::Data.into()),
+									payload_chunk: Some(PayloadChunk {
+										offset: Some(curr_state.bytes_transferred),
+										flags: Some(0),
+										body: Some(buffer[..bytes_read].to_vec()),
+										// Sequential chunk index — some receivers
+										// (Windows) reassemble by index, not offset.
+										index: Some((curr_state.bytes_transferred
+											/ payload_buf_len as i64) as i32),
+										..Default::default()
+									}),
+									payload_header: Some(payload_header.clone()),
+									..Default::default()
+								}),
+								..Default::default()
+							}),
+						};
+
+                        tokio::time::timeout(CHUNK_WRITE_TIMEOUT, self.encrypt_and_send(&wrapper))
+                            .await
+                            .map_err(|_| anyhow!("chunk write stalled (peer stopped reading)"))??;
+                        self.update_state(
+                            |e| {
+                                if let Some(mu) = e.transferred_files.get_mut(&current) {
+                                    mu.bytes_transferred += bytes_read as i64;
+                                }
+
+                                if let Some(tmd) = e.transfer_metadata.as_mut() {
+                                    tmd.ack_bytes += bytes_read as u64;
+                                }
+                            },
+                            true,
+                        )
+                        .await;
+
+                        // If we just sent the last bytes of the file, mark it as finished
+                        if curr_state.bytes_transferred + bytes_read as i64 == curr_state.total_size
+                        {
+                            debug!(
+                                "File {current} finished, curr offset: {} over total: {}",
+                                curr_state.bytes_transferred + bytes_read as i64,
+                                curr_state.total_size
+                            );
+
+                            let wrapper = location_nearby_connections::OfflineFrame {
+								version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+								v1: Some(location_nearby_connections::V1Frame {
+									r#type: Some(
+										location_nearby_connections::v1_frame::FrameType::PayloadTransfer.into(),
+									),
+									payload_transfer: Some(PayloadTransferFrame {
+										packet_type: Some(PacketType::Data.into()),
+										payload_chunk: Some(PayloadChunk {
+											offset: Some(curr_state.total_size),
+											flags: Some(1), // lastChunk
+											body: Some(vec![]),
+											index: Some(((curr_state.total_size
+												+ payload_buf_len as i64
+												- 1) / payload_buf_len as i64)
+												as i32),
+											..Default::default()
+										}),
+										payload_header: Some(payload_header),
+										..Default::default()
+									}),
+									..Default::default()
+								}),
+							};
+
+                            tokio::time::timeout(
+                                CHUNK_WRITE_TIMEOUT,
+                                self.encrypt_and_send(&wrapper),
+                            )
+                            .await
+                            .map_err(|_| anyhow!("chunk write stalled (peer stopped reading)"))??;
+                            break;
+                        }
+                    }
+                }
+            }
+            sharing_nearby::connection_response_frame::Status::Reject
+            | sharing_nearby::connection_response_frame::Status::NotEnoughSpace
+            | sharing_nearby::connection_response_frame::Status::UnsupportedAttachmentType
+            | sharing_nearby::connection_response_frame::Status::TimedOut => {
+                // An explicit answer from the peer (declined, out of space, or
+                // its accept prompt timed out — Windows expires the prompt
+                // after ~60s) — surface it as Rejected, not "unexpected
+                // disconnection".
+                warn!(
+                    "Cannot process: consent denied: {:?}",
+                    v1_frame.connection_response.as_ref().unwrap().status()
+                );
+                self.update_state(
+                    |e| {
+                        e.state = TransferState::Rejected;
+                    },
+                    true,
+                )
+                .await;
+                self.disconnection().await?;
+                return Err(anyhow!(crate::errors::AppError::NotAnError));
+            }
+            sharing_nearby::connection_response_frame::Status::Unknown => {
+                error!("Unknown consent type: aborting");
+                self.update_state(
+                    |e| {
+                        e.state = TransferState::Disconnected;
+                    },
+                    true,
+                )
+                .await;
+                self.disconnection().await?;
+                return Err(anyhow!(crate::errors::AppError::NotAnError));
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn disconnection(&mut self) -> Result<(), anyhow::Error> {
+        let frame = location_nearby_connections::OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::Disconnection.into(),
+                ),
+                disconnection: Some(location_nearby_connections::DisconnectionFrame {
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+
+        if self.state.encryption_done {
+            self.encrypt_and_send(&frame).await
+        } else {
+            self.send_frame(frame.encode_to_vec()).await
+        }
+    }
+
+    /// After the last payload chunk, give the receiver time to finish writing
+    /// the file and close the connection on its own. We drain (and discard) any
+    /// trailing frames it sends — its own keep-alives / disconnection — and
+    /// return as soon as the peer closes (EOF) or `grace` elapses. This prevents
+    /// a fast caller from ripping the TCP socket down before the phone has
+    /// finalized the transfer.
+    /// Drain incoming frames until the peer closes the connection or `grace`
+    /// elapses, ACKING ITS KEEPALIVES along the way — a receiver that pings
+    /// every 5s (Windows) tears the session down if the pings go unanswered
+    /// while it finalizes. Returns `true` if the peer closed (EOF or an
+    /// explicit DISCONNECTION frame).
+    async fn wait_for_peer_close(&mut self, grace: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            match tokio::time::timeout_at(deadline, self.read_encrypted_offline_frame()).await {
+                Err(_) => return false,    // grace elapsed, peer still connected
+                Ok(Err(_)) => return true, // EOF / read error — peer is gone
+                Ok(Ok(frame)) => {
+                    if let Some(v1) = frame.v1.as_ref() {
+                        match v1.r#type() {
+                            location_nearby_connections::v1_frame::FrameType::KeepAlive => {
+                                let _ = self.send_keepalive(true).await;
+                            }
+                            location_nearby_connections::v1_frame::FrameType::Disconnection => {
+                                debug!("peer sent DISCONNECTION during close-wait");
+                                return true;
+                            }
+                            _ => {} // drained and ignored
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn finalize_key_exchange(
+        &mut self,
+        raw_peer_key: GenericPublicKey,
+    ) -> Result<(), anyhow::Error> {
+        if raw_peer_key.r#type != PublicKeyType::EcP256 as i32 {
+            return Err(anyhow!("Unexpected public key type"));
+        }
+        let peer_p256_key = raw_peer_key
+            .ec_p256_public_key
+            .ok_or_else(|| anyhow!("Missing required fields"))?;
+        let peer_key = crate::utils::decode_p256_public_key(&peer_p256_key.x, &peer_p256_key.y)?;
+        let priv_key = self.state.private_key.as_ref().unwrap();
+
+        let dhs = diffie_hellman(priv_key.to_nonzero_scalar(), peer_key.as_affine());
+        let derived_secret = Sha256::digest(dhs.raw_secret_bytes());
+
+        let mut ukey_info: Vec<u8> = vec![];
+        ukey_info.extend_from_slice(self.state.client_init_msg_data.as_ref().unwrap());
+        ukey_info.extend_from_slice(self.state.server_init_data.as_ref().unwrap());
+
+        let auth_label = "UKEY2 v1 auth".as_bytes();
+        let next_label = "UKEY2 v1 next".as_bytes();
+
+        let auth_string = hkdf_extract_expand(auth_label, &derived_secret, &ukey_info, 32)?;
+        let next_secret = hkdf_extract_expand(next_label, &derived_secret, &ukey_info, 32)?;
+
+        let salt_hex = "82AA55A0D397F88346CA1CEE8D3909B95F13FA7DEB1D4AB38376B8256DA85510";
+        let salt =
+            hex::decode(salt_hex).map_err(|e| anyhow!("Failed to decode salt_hex: {}", e))?;
+
+        let d2d_client = hkdf_extract_expand(&salt, &next_secret, "client".as_bytes(), 32)?;
+        let d2d_server = hkdf_extract_expand(&salt, &next_secret, "server".as_bytes(), 32)?;
+
+        let key_salt_hex = "BF9D2A53C63616D75DB0A7165B91C1EF73E537F2427405FA23610A4BE657642E";
+        let key_salt = hex::decode(key_salt_hex)
+            .map_err(|e| anyhow!("Failed to decode key_salt_hex: {}", e))?;
+
+        let client_key = hkdf_extract_expand(&key_salt, &d2d_client, "ENC:2".as_bytes(), 32)?;
+        let client_hmac_key = hkdf_extract_expand(&key_salt, &d2d_client, "SIG:1".as_bytes(), 32)?;
+        let server_key = hkdf_extract_expand(&key_salt, &d2d_server, "ENC:2".as_bytes(), 32)?;
+        let server_hmac_key = hkdf_extract_expand(&key_salt, &d2d_server, "SIG:1".as_bytes(), 32)?;
+
+        self.update_state(
+            |e| {
+                e.decrypt_key = Some(server_key);
+                e.recv_hmac_key = Some(server_hmac_key);
+                e.encrypt_key = Some(client_key);
+                e.send_hmac_key = Some(client_hmac_key);
+                e.pin_code = Some(to_four_digit_string(&auth_string));
+                e.encryption_done = true;
+
+                if let Some(ref mut tm) = e.transfer_metadata {
+                    tm.pin_code = Some(to_four_digit_string(&auth_string));
+                }
+            },
+            true,
+        )
+        .await;
+
+        info!("Pin code: {:?}", self.state.pin_code);
+
+        Ok(())
+    }
+
+    async fn send_ukey2_alert(&mut self, atype: AlertType) -> Result<(), anyhow::Error> {
+        let alert = Ukey2Alert {
+            r#type: Some(atype.into()),
+            error_message: None,
+        };
+
+        let data = Ukey2Message {
+            message_type: Some(atype.into()),
+            message_data: Some(alert.encode_to_vec()),
+        };
+
+        self.send_frame(data.encode_to_vec()).await
+    }
+
+    async fn send_encrypted_frame(
+        &mut self,
+        frame: &sharing_nearby::Frame,
+    ) -> Result<(), anyhow::Error> {
+        let frame_data = frame.encode_to_vec();
+        let body_size = frame_data.len();
+
+        let payload_header = PayloadHeader {
+            id: Some(rand::rng().random_range(i64::MIN..i64::MAX)),
+            r#type: Some(payload_header::PayloadType::Bytes.into()),
+            total_size: Some(body_size as i64),
+            is_sensitive: Some(false),
+            ..Default::default()
+        };
+
+        let transfer = PayloadTransferFrame {
+            packet_type: Some(PacketType::Data.into()),
+            payload_chunk: Some(PayloadChunk {
+                offset: Some(0),
+                flags: Some(0),
+                body: Some(frame_data),
+                index: Some(0),
+                ..Default::default()
+            }),
+            payload_header: Some(payload_header.clone()),
+            ..Default::default()
+        };
+
+        let wrapper = location_nearby_connections::OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::PayloadTransfer.into(),
+                ),
+                payload_transfer: Some(transfer),
+                ..Default::default()
+            }),
+        };
+
+        // Encrypt and send offline
+        self.encrypt_and_send(&wrapper).await?;
+
+        // Send lastChunk
+        let transfer = PayloadTransferFrame {
+            packet_type: Some(PacketType::Data.into()),
+            payload_chunk: Some(PayloadChunk {
+                offset: Some(body_size as i64),
+                flags: Some(1), // lastChunk
+                body: Some(vec![]),
+                index: Some(1),
+                ..Default::default()
+            }),
+            payload_header: Some(payload_header),
+            ..Default::default()
+        };
+
+        let wrapper = location_nearby_connections::OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(
+                    location_nearby_connections::v1_frame::FrameType::PayloadTransfer.into(),
+                ),
+                payload_transfer: Some(transfer),
+                ..Default::default()
+            }),
+        };
+
+        // Encrypt and send offline
+        self.encrypt_and_send(&wrapper).await?;
+
+        Ok(())
+    }
+
+    async fn encrypt_and_send(&mut self, frame: &OfflineFrame) -> Result<(), anyhow::Error> {
+        let d2d_msg = DeviceToDeviceMessage {
+            sequence_number: Some(self.get_server_seq_inc().await),
+            message: Some(frame.encode_to_vec()),
+        };
+
+        let key = self.state.encrypt_key.as_ref().unwrap();
+        let msg_data = d2d_msg.encode_to_vec();
+        let iv = gen_random(16);
+
+        let mut cipher = Cipher::new_256(&key[..AES_256_KEY_LEN].try_into().unwrap());
+        cipher.set_auto_padding(true);
+        let encrypted = cipher.cbc_encrypt(&iv, &msg_data);
+
+        let hb = HeaderAndBody {
+            body: encrypted,
+            header: Header {
+                encryption_scheme: EncScheme::Aes256Cbc.into(),
+                signature_scheme: SigScheme::HmacSha256.into(),
+                iv: Some(iv),
+                public_metadata: Some(
+                    GcmMetadata {
+                        r#type: Type::DeviceToDeviceMessage.into(),
+                        version: Some(1),
+                    }
+                    .encode_to_vec(),
+                ),
+                ..Default::default()
+            },
+        };
+
+        let mut hmac = HmacSha256::new_from_slice(self.state.send_hmac_key.as_ref().unwrap())?;
+        hmac.update(&hb.encode_to_vec());
+        let result = hmac.finalize();
+
+        let smsg = SecureMessage {
+            header_and_body: hb.encode_to_vec(),
+            signature: result.into_bytes().to_vec(),
+        };
+
+        self.send_frame(smsg.encode_to_vec()).await?;
+
+        Ok(())
+    }
+
+    async fn send_keepalive(&mut self, ack: bool) -> Result<(), anyhow::Error> {
+        let ack_frame = location_nearby_connections::OfflineFrame {
+            version: Some(location_nearby_connections::offline_frame::Version::V1.into()),
+            v1: Some(location_nearby_connections::V1Frame {
+                r#type: Some(location_nearby_connections::v1_frame::FrameType::KeepAlive.into()),
+                keep_alive: Some(KeepAliveFrame { ack: Some(ack) }),
+                ..Default::default()
+            }),
+        };
+
+        if self.state.encryption_done {
+            self.encrypt_and_send(&ack_frame).await
+        } else {
+            self.send_frame(ack_frame.encode_to_vec()).await
+        }
+    }
+
+    async fn send_frame(&mut self, data: Vec<u8>) -> Result<(), anyhow::Error> {
+        let length = data.len();
+
+        // Prepare length prefix in big-endian format
+        let length_bytes = [
+            (length >> 24) as u8,
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+        ];
+
+        let mut prefixed_length = Vec::with_capacity(length + 4);
+        prefixed_length.extend_from_slice(&length_bytes);
+        prefixed_length.extend_from_slice(&data);
+
+        self.socket.write_all(&prefixed_length).await?;
+        self.socket.flush().await?;
+
+        Ok(())
+    }
+
+    async fn get_server_seq_inc(&mut self) -> i32 {
+        self.update_state(
+            |e| {
+                e.server_seq += 1;
+            },
+            false,
+        )
+        .await;
+
+        self.state.server_seq
+    }
+
+    async fn get_client_seq_inc(&mut self) -> i32 {
+        self.update_state(
+            |e| {
+                e.client_seq += 1;
+            },
+            false,
+        )
+        .await;
+
+        self.state.client_seq
+    }
+
+    async fn update_state<F>(&mut self, f: F, inform: bool)
+    where
+        F: FnOnce(&mut InnerState),
+    {
+        f(&mut self.state);
+
+        if !inform {
+            return;
+        }
+
+        let _ = self.sender.send(ChannelMessage {
+            id: self.state.id.clone(),
+            msg: channel::Message::Client(MessageClient {
+                kind: TransferKind::Outbound,
+                state: Some(self.state.state.clone()),
+                metadata: self.state.transfer_metadata.clone(),
+            }),
+        });
+        // Add a small sleep timer to allow the Tokio runtime to have
+        // some spare time to process channel's message. Otherwise it
+        // get spammed by new requests. Currently set to 10 micro secs.
+        tokio::time::sleep(SANITY_DURATION).await;
+    }
+}
+
+#[cfg(all(test, feature = "experimental", target_os = "linux"))]
+#[path = "outbound_bwu_tests.rs"]
+mod bwu_tests;

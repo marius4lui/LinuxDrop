@@ -1,0 +1,23 @@
+[Unit]
+Description=LinuxDrop nearby sharing
+Documentation=https://github.com/marius4lui/LinuxDrop
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=io.github.marius4lui.LinuxDrop
+ExecStart=/usr/bin/linuxdropd
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=150
+NoNewPrivileges=yes
+# This user service must start without a privileged user namespace and must see
+# the same selected files as the desktop, including paths under /tmp. Keep
+# capability/mount-namespace hardening on the separate system helper instead.
+SystemCallFilter=~@module
+SystemCallArchitectures=native
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

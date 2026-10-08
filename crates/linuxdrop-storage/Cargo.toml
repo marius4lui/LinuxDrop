@@ -1,0 +1,15 @@
+[package]
+name = "linuxdrop-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+linuxdrop-core = { path = "../linuxdrop-core" }
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

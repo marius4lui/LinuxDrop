@@ -1,0 +1,109 @@
+<node name="/io/github/marius4lui/LinuxDrop">
+  <interface name="io.github.marius4lui.LinuxDrop.Manager1">
+    <method name="GetSnapshot">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="GetSettings">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="GetDefaults">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="UpdatePeerPreferences">
+      <arg name="peer_id" type="s" direction="in" />
+      <arg name="patch" type="s" direction="in" />
+    </method>
+    <method name="ForgetPeer">
+      <arg name="peer_id" type="s" direction="in" />
+    </method>
+    <method name="ExportDiagnostics">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="RestartBackends">
+    </method>
+    <method name="StopWhenIdle">
+    </method>
+    <method name="ResetSettings">
+    </method>
+    <method name="GetDiagnostics">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="PrepareSend">
+      <arg name="paths" type="as" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="PrepareSendFiles">
+      <arg name="draft_id" type="s" direction="in" />
+      <arg name="entries" type="a(sh)" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="ExportReceivedFile">
+      <arg name="path" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="ResolveReceiveDirectory">
+      <arg name="document_id" type="s" direction="in" />
+      <arg name="relative_path" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="DiscardDraft">
+      <arg name="draft_id" type="s" direction="in" />
+    </method>
+    <method name="CreateDownloadOffer">
+      <arg name="draft_id" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="StopDownloadOffer">
+    </method>
+    <method name="ReceiveDownloadOffer">
+      <arg name="url" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="StartSend">
+      <arg name="draft_id" type="s" direction="in" />
+      <arg name="peer_id" type="s" direction="in" />
+      <arg name="protocol" type="s" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="AcceptTransfer">
+      <arg name="id" type="s" direction="in" />
+    </method>
+    <method name="AcceptTransferWithOptions">
+      <arg name="id" type="s" direction="in" />
+      <arg name="options" type="s" direction="in" />
+    </method>
+    <method name="ProvideTransferPin">
+      <arg name="id" type="s" direction="in" />
+      <arg name="pin" type="s" direction="in" />
+    </method>
+    <method name="RunHardwareDiagnostic">
+      <arg name="radio_id" type="s" direction="in" />
+      <arg name="channel" type="q" direction="in" />
+      <arg type="s" direction="out" />
+    </method>
+    <method name="GetRecoveryStatus">
+      <arg type="s" direction="out" />
+    </method>
+    <method name="RejectTransfer">
+      <arg name="id" type="s" direction="in" />
+    </method>
+    <method name="CancelTransfer">
+      <arg name="id" type="s" direction="in" />
+    </method>
+    <method name="ClearHistory">
+    </method>
+    <method name="SetVisibility">
+      <arg name="mode" type="s" direction="in" />
+    </method>
+    <method name="UpdateSettings">
+      <arg name="patch" type="s" direction="in" />
+    </method>
+    <method name="OpenNotchPreferences">
+    </method>
+    <method name="OpenApplication">
+    </method>
+    <signal name="Changed">
+      <arg name="revision" type="t" />
+    </signal>
+  </interface>
+</node>

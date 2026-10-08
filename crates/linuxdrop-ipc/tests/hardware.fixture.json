@@ -1,0 +1,75 @@
+{
+  "observed_unix": 1,
+  "radios": [
+    {
+      "id": "radio-test",
+      "phy": "phy-test",
+      "bus": "usb",
+      "device_path": "/test/radio",
+      "vendor_id": null,
+      "product_id": null,
+      "serial": null,
+      "driver": "test-driver",
+      "kernel": "test",
+      "rfkill": false,
+      "interfaces": [],
+      "channels": [],
+      "modes": [
+        "monitor"
+      ],
+      "interface_combinations": [],
+      "monitor": {
+        "value": "unknown",
+        "source": "test fixture",
+        "evidence": "No physical test"
+      },
+      "management_injection": {
+        "value": "unknown",
+        "source": "test fixture",
+        "evidence": "No physical test"
+      },
+      "data_injection": {
+        "value": "unknown",
+        "source": "test fixture",
+        "evidence": "No physical test"
+      },
+      "awdl": {
+        "value": "unknown",
+        "source": "test fixture",
+        "evidence": "No physical test"
+      },
+      "protected": false,
+      "reserved_for": "Not reserved",
+      "driver_details": {
+        "version": null,
+        "firmware": "test-firmware",
+        "bus_info": null,
+        "source": "test fixture"
+      },
+      "bands": [
+        "2.4 GHz"
+      ],
+      "combinations": [],
+      "evidence_profile": {
+        "name": "test",
+        "qualification": "unverified",
+        "limitations": []
+      }
+    }
+  ],
+  "interfaces": [],
+  "bluetooth": [
+    {
+      "id": "hci1",
+      "name": "Test Bluetooth",
+      "powered": true,
+      "discovering": false,
+      "supported_advertisements": 1,
+      "active_advertisements": 0,
+      "remaining_advertisements": 1,
+      "supported_includes": [],
+      "supported_secondary_channels": []
+    }
+  ],
+  "warnings": []
+}

@@ -1,0 +1,44 @@
+{
+  "app-id": "io.github.marius4lui.LinuxDrop.App",
+  "runtime": "org.gnome.Platform",
+  "runtime-version": "50",
+  "sdk": "org.gnome.Sdk",
+  "command": "linuxdrop",
+  "finish-args": [
+    "--socket=wayland",
+    "--socket=fallback-x11",
+    "--share=ipc",
+    "--device=dri",
+    "--talk-name=io.github.marius4lui.LinuxDrop"
+  ],
+  "modules": [
+    {
+      "name": "linuxdrop-client",
+      "buildsystem": "simple",
+      "build-commands": [
+        "install -Dm755 linuxdrop /app/bin/linuxdrop",
+        "install -Dm644 io.github.marius4lui.LinuxDrop.App.desktop /app/share/applications/io.github.marius4lui.LinuxDrop.App.desktop",
+        "install -Dm644 io.github.marius4lui.LinuxDrop.App.svg /app/share/icons/hicolor/scalable/apps/io.github.marius4lui.LinuxDrop.App.svg",
+        "install -Dm644 io.github.marius4lui.LinuxDrop.App.metainfo.xml /app/share/metainfo/io.github.marius4lui.LinuxDrop.App.metainfo.xml"
+      ],
+      "sources": [
+        {
+          "type": "file",
+          "path": "linuxdrop"
+        },
+        {
+          "type": "file",
+          "path": "io.github.marius4lui.LinuxDrop.App.desktop"
+        },
+        {
+          "type": "file",
+          "path": "io.github.marius4lui.LinuxDrop.App.svg"
+        },
+        {
+          "type": "file",
+          "path": "io.github.marius4lui.LinuxDrop.App.metainfo.xml"
+        }
+      ]
+    }
+  ]
+}

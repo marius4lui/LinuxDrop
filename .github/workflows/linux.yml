@@ -1,0 +1,186 @@
+name: Linux
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev protobuf-compiler desktop-file-utils appstream polkitd iw iproute2 python3-gi python3-dbus python3-dbusmock python3-pexpect busybox gjs
+      - name: Rust tools
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: Formatting
+        run: |
+          cargo fmt --all --check
+          python3 tools/sync-ipc-contract.py --check
+          python3 tools/sync-ipc-schema.py --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --no-deps --locked -- -D warnings
+      - name: Unit and integration tests
+        run: |
+          cargo test --workspace --locked
+          cargo build -p linuxdrop-ipc --features client --example check_contract --locked
+          sh crates/linuxdrop-network/tests/run-nm-lifecycle.sh
+          sh crates/linuxdrop-network/tests/run-p2p-host.sh
+          sh crates/linuxdrop-network/tests/run-bluetooth-lifecycle.sh
+          cargo test --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs linuxdrop_policy_tests --lib
+          cargo test --locked --manifest-path vendor/opendrop-rs/Cargo.toml -p filin-rs state::tests --lib
+      - name: Isolated kernel network and upgrade lifecycles
+        run: python3 packaging/ci/network-lifecycle.py
+      - name: Native resources
+        run: |
+          desktop-file-validate packaging/io.github.marius4lui.LinuxDrop.desktop
+          appstreamcli validate --no-net packaging/io.github.marius4lui.LinuxDrop.metainfo.xml
+          glib-compile-schemas --strict --dry-run extensions/gnome-shell/schemas
+          python3 -m py_compile integrations/nautilus/linuxdrop.py
+          python3 integrations/thunar/test_install_action.py
+          python3 packaging/helpers/test_p2p_dhcp.py
+          node --check extensions/gnome-shell/extension.js
+          gjs -m extensions/gnome-shell/tests/snapshot-smoke.js
+          sh -n packaging/install.sh packaging/build-deb.sh
+      - name: Build installable package
+        run: sh packaging/build-deb.sh
+      - name: Isolated helper startup and journal recovery
+        run: |
+          sudo sh crates/linuxdrop-netd/tests/run-startup-recovery.sh "$PWD/target/release/linuxdrop-netd"
+          sudo sh crates/linuxdrop-netd/tests/run-formation-recovery.sh "$PWD/target/release/linuxdrop-netd"
+      - name: Daemon session and HTTPS integration
+        run: |
+          LINUXDROP_TEST_GJS_STATUS=1 LINUXDROP_TEST_CONTRACT=1 LINUXDROP_CONTRACT_PROBE="$PWD/target/debug/examples/check_contract" dbus-run-session -- python3 tests/integration/daemon_session.py target/release/linuxdropd
+          dbus-run-session -- python3 tests/integration/daemon_shutdown.py target/release/linuxdropd
+      - name: Package smoke test
+        run: |
+          sudo apt-get install -y --no-install-recommends ./dist/linuxdrop_*.deb
+          dpkg-query -W linuxdrop
+          sudo sh crates/linuxdrop-netd/tests/run-awdl-watchdog.sh "$PWD/target/release/linuxdrop-netd" "$PWD/target/release/linuxdropd"
+          test -x /usr/bin/linuxdrop
+          test -x /usr/bin/linuxdropd
+          test -x /usr/libexec/linuxdrop/filin
+          systemd-analyze verify /usr/lib/systemd/system/linuxdrop-netd.service
+          printf '%s\n' linuxdrop-systemd-acceptance-v1 | sudo tee /etc/linuxdrop-disposable-acceptance >/dev/null
+          sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 python3 tests/integration/netd_systemd.py > dist/BOOTED_SERVICE.json
+          cat dist/BOOTED_SERVICE.json
+          sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 python3 tests/integration/netd_polkit.py > dist/POLKIT_AUTHORIZATION.json
+          cat dist/POLKIT_AUTHORIZATION.json
+          sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 python3 tests/integration/package_lifecycle.py dist/linuxdrop_*.deb > dist/PACKAGE_LIFECYCLE.json
+          cat dist/PACKAGE_LIFECYCLE.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linuxdrop-ubuntu-24.04
+          path: |
+            dist/BOOTED_SERVICE.json
+            dist/POLKIT_AUTHORIZATION.json
+            dist/PACKAGE_LIFECYCLE.json
+            dist/*.deb
+            dist/*_source.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+  accessibility:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Download this run's package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name linuxdrop-ubuntu-24.04 --dir dist
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Install native screen-reader runtime
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends orca python3-pyatspi python3-gi openbox xvfb xauth xdotool dbus-x11 locales ./dist/linuxdrop_*.deb
+          sudo localedef -i de_DE -f UTF-8 de_DE.UTF-8
+      - name: Traverse the installed application with Orca
+        run: sh app/linuxdrop/tests/run-orca-smoke.sh /usr/bin/linuxdrop "$PWD/dist/orca-acceptance"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linuxdrop-orca-acceptance
+          path: |
+            dist/orca-acceptance/RESULT.json
+            dist/orca-acceptance/speech-evidence.txt
+          if-no-files-found: error
+  desktop-authorization:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Download the tested package from this run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --name linuxdrop-ubuntu-24.04 --dir dist
+          (cd dist && sha256sum --check SHA256SUMS)
+      - name: Install real graphical authorization runtime
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnome-shell gjs accountsservice \
+            dbus-x11 libgl1-mesa-dri libegl-mesa0 python3-pexpect locales language-pack-gnome-de ./dist/linuxdrop_*.deb
+          printf '%s\n' linuxdrop-systemd-acceptance-v1 | sudo tee /etc/linuxdrop-disposable-acceptance >/dev/null
+      - name: Authenticate and cancel through the actual GNOME dialog
+        run: |
+          sudo env LINUXDROP_TEST_DISPOSABLE_SYSTEM=1 LINUXDROP_GUI_LANGUAGE=de_DE.UTF-8 \
+            LINUXDROP_GUI_CAPTURE_DIR="$PWD/dist/polkit-gnome" \
+            python3 tests/integration/netd_polkit.py --graphical > dist/GNOME_POLKIT.json
+          cat dist/GNOME_POLKIT.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: linuxdrop-gnome-authorization
+          path: |
+            dist/GNOME_POLKIT.json
+            dist/polkit-gnome/*.png
+          if-no-files-found: error
+  dependency-policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Verified audit tools
+        run: sh packaging/ci/install-audit-tools.sh "$RUNNER_TEMP/linuxdrop-tools"
+      - name: Vulnerabilities, licenses and dependency sources
+        run: |
+          "$RUNNER_TEMP/linuxdrop-tools/cargo-audit" audit
+          "$RUNNER_TEMP/linuxdrop-tools/cargo-audit" audit --file vendor/opendrop-rs/Cargo.lock
+          "$RUNNER_TEMP/linuxdrop-tools/cargo-deny" check licenses sources advisories
+  parser-fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Bounded fuzz dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libdbus-1-dev libudev-dev libnl-3-dev libnl-genl-3-dev libpcap-dev libev-dev clang
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Production parser fuzz smoke
+        env:
+          CARGO_BUILD_JOBS: 3
+        run: sh packaging/ci/fuzz-smoke.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: parser-fuzz-failures
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

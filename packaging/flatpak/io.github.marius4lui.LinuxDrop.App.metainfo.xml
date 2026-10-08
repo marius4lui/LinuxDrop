@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.marius4lui.LinuxDrop.App</id>
+  <name>LinuxDrop</name>
+  <summary>Nearby sharing with the LinuxDrop host service</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <developer id="io.github.marius4lui"><name>LinuxDrop contributors</name></developer>
+  <description><p>This Flatpak contains the LinuxDrop desktop app. Install the native LinuxDrop package on your Linux system first to provide the sharing service and desktop integration.</p><p>LinuxDrop brings nearby sharing to Linux with a native desktop application, transfer controls, and clear wireless hardware diagnostics.</p><p>LocalSend and Quick Share connect devices on your network. Experimental AirDrop requires a suitable dedicated wireless adapter; compatibility depends on the radio and the receiving device.</p></description>
+  <launchable type="desktop-id">io.github.marius4lui.LinuxDrop.App.desktop</launchable>
+  <url type="homepage">https://github.com/marius4lui/LinuxDrop</url>
+  <url type="bugtracker">https://github.com/marius4lui/LinuxDrop/issues</url>
+  <content_rating type="oars-1.1"/>
+  <provides><binary>linuxdrop</binary></provides>
+  <supports><control>pointing</control><control>keyboard</control><control>touch</control></supports>
+</component>

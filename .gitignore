@@ -1,0 +1,9 @@
+/target/
+/dist/
+*.deb
+*.rpm
+*.part
+/.dev/
+__pycache__/
+*.pyc
+/.flatpak-builder/

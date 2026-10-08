@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Add this action in Thunar > Edit > Configure custom actions. Existing user configuration is never overwritten. -->
+<actions><action><icon>io.github.marius4lui.LinuxDrop</icon><name>Send with LinuxDrop</name><command>linuxdrop send -- %F</command><description>Share files with nearby devices</description><patterns>*</patterns><audio-files/><image-files/><other-files/><text-files/><video-files/></action></actions>

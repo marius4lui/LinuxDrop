@@ -1,0 +1,23 @@
+[package]
+name = "linuxdrop-quickshare"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[dependencies]
+anyhow = "1"
+linuxdrop-core = { path = "../linuxdrop-core" }
+linuxdrop-network = { path = "../linuxdrop-network" }
+linuxdrop-storage = { path = "../linuxdrop-storage" }
+rqs_lib = { path = "../../vendor/open-quickshare" }
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
+bluer = { version = "0.17", features = ["bluetoothd"] }
+
+[dev-dependencies]
+bluez-async = "0.8.2"
+futures-util.workspace = true
+prost = "0.13"
+zbus.workspace = true
+tokio-util.workspace = true

@@ -1,0 +1,1171 @@
+{
+  "$defs": {
+    "AirdropSettings": {
+      "properties": {
+        "ble_wakeup": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "receive": {
+          "type": "boolean"
+        },
+        "send": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "ble_wakeup",
+        "send",
+        "receive"
+      ],
+      "type": "object"
+    },
+    "BackendState": {
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "state",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "BluetoothController": {
+      "properties": {
+        "active_advertisements": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "discovering": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "powered": {
+          "type": "boolean"
+        },
+        "remaining_advertisements": {
+          "default": null,
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supported_advertisements": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "supported_includes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "supported_secondary_channels": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "powered",
+        "discovering"
+      ],
+      "type": "object"
+    },
+    "BluetoothSettings": {
+      "properties": {
+        "adapter": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter"
+      ],
+      "type": "object"
+    },
+    "Capability": {
+      "properties": {
+        "evidence": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/CapabilityValue"
+        }
+      },
+      "required": [
+        "value",
+        "source",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "CapabilityValue": {
+      "enum": [
+        "yes",
+        "no",
+        "unknown"
+      ],
+      "type": "string"
+    },
+    "Channel": {
+      "properties": {
+        "disabled": {
+          "type": "boolean"
+        },
+        "frequency_mhz": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "no_ir": {
+          "type": "boolean"
+        },
+        "number": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "radar": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "frequency_mhz",
+        "number",
+        "disabled",
+        "no_ir",
+        "radar"
+      ],
+      "type": "object"
+    },
+    "DiagnosticsSettings": {
+      "properties": {
+        "log_level": {
+          "enum": [
+            "warn",
+            "info",
+            "debug"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "log_level"
+      ],
+      "type": "object"
+    },
+    "DriverDetails": {
+      "properties": {
+        "bus_info": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "firmware": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "EvidenceProfile": {
+      "properties": {
+        "limitations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "type": "string"
+        },
+        "qualification": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "qualification",
+        "limitations"
+      ],
+      "type": "object"
+    },
+    "GeneralSettings": {
+      "properties": {
+        "appearance": {
+          "enum": [
+            "system",
+            "light",
+            "dark"
+          ],
+          "type": "string"
+        },
+        "autostart": {
+          "type": "boolean"
+        },
+        "close_behavior": {
+          "enum": [
+            "background",
+            "quit_when_idle"
+          ],
+          "type": "string"
+        },
+        "device_name": {
+          "type": "string"
+        },
+        "language": {
+          "enum": [
+            "system",
+            "de",
+            "en"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "device_name",
+        "autostart",
+        "appearance",
+        "language",
+        "close_behavior"
+      ],
+      "type": "object"
+    },
+    "HardwareSettings": {
+      "properties": {
+        "auto_use_usb": {
+          "type": "boolean"
+        },
+        "open_on_adapter": {
+          "type": "boolean"
+        },
+        "prefer_usb": {
+          "type": "boolean"
+        },
+        "preferred_adapter": {
+          "type": "string"
+        },
+        "protect_active_connection": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "preferred_adapter",
+        "prefer_usb",
+        "protect_active_connection",
+        "auto_use_usb",
+        "open_on_adapter"
+      ],
+      "type": "object"
+    },
+    "HardwareStatus": {
+      "properties": {
+        "bluetooth": {
+          "items": {
+            "$ref": "#/$defs/BluetoothController"
+          },
+          "type": "array"
+        },
+        "interfaces": {
+          "items": {
+            "$ref": "#/$defs/NetworkInterface"
+          },
+          "type": "array"
+        },
+        "observed_unix": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "radios": {
+          "items": {
+            "$ref": "#/$defs/RadioView"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "observed_unix",
+        "radios",
+        "interfaces",
+        "bluetooth",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "InterfaceCombination": {
+      "properties": {
+        "different_channels": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "limits": {
+          "items": {
+            "$ref": "#/$defs/InterfaceLimit"
+          },
+          "type": "array"
+        },
+        "raw": {
+          "type": "string"
+        },
+        "total": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "limits",
+        "raw"
+      ],
+      "type": "object"
+    },
+    "InterfaceLimit": {
+      "properties": {
+        "maximum": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "modes",
+        "maximum"
+      ],
+      "type": "object"
+    },
+    "KnownPeer": {
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "blocked": {
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "favorite": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "preferred_protocol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "favorite",
+        "display_name",
+        "blocked",
+        "preferred_protocol",
+        "available"
+      ],
+      "type": "object"
+    },
+    "LocalsendSettings": {
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "https": {
+          "type": "boolean"
+        },
+        "multicast": {
+          "type": "boolean"
+        },
+        "pin": {
+          "type": "string"
+        },
+        "port": {
+          "format": "uint64",
+          "maximum": 65535,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "require_pin": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "port",
+        "https",
+        "multicast",
+        "require_pin",
+        "pin"
+      ],
+      "type": "object"
+    },
+    "NetworkInterface": {
+      "properties": {
+        "active_connection": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active_connection_uuid": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default_route": {
+          "type": "boolean"
+        },
+        "ifindex": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "name": {
+          "type": "string"
+        },
+        "nm_managed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "nm_state": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "phy": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "ifindex",
+        "state",
+        "default_route"
+      ],
+      "type": "object"
+    },
+    "NetworkSettings": {
+      "properties": {
+        "allow_virtual_interfaces": {
+          "type": "boolean"
+        },
+        "allowed_interfaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "allowed_interfaces",
+        "allow_virtual_interfaces"
+      ],
+      "type": "object"
+    },
+    "NotificationsSettings": {
+      "properties": {
+        "completed": {
+          "type": "boolean"
+        },
+        "errors": {
+          "type": "boolean"
+        },
+        "incoming": {
+          "type": "boolean"
+        },
+        "private_content": {
+          "type": "boolean"
+        },
+        "sound": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "completed",
+        "errors",
+        "incoming",
+        "sound",
+        "private_content"
+      ],
+      "type": "object"
+    },
+    "PeerView": {
+      "properties": {
+        "address": {
+          "type": "string"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "blocked": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "favorite": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "identity_scope": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "preferred_protocol": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protocols": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "platform",
+        "protocols",
+        "address",
+        "available",
+        "identity_scope"
+      ],
+      "type": "object"
+    },
+    "QuickshareSettings": {
+      "properties": {
+        "ble": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "port": {
+          "format": "uint64",
+          "maximum": 65535,
+          "minimum": 1024,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enabled",
+        "ble",
+        "port"
+      ],
+      "type": "object"
+    },
+    "RadioView": {
+      "properties": {
+        "awdl": {
+          "$ref": "#/$defs/Capability"
+        },
+        "bands": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "bus": {
+          "type": "string"
+        },
+        "channels": {
+          "items": {
+            "$ref": "#/$defs/Channel"
+          },
+          "type": "array"
+        },
+        "combinations": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/InterfaceCombination"
+          },
+          "type": "array"
+        },
+        "data_injection": {
+          "$ref": "#/$defs/Capability"
+        },
+        "device_path": {
+          "type": "string"
+        },
+        "driver": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "driver_details": {
+          "$ref": "#/$defs/DriverDetails",
+          "default": {
+            "bus_info": null,
+            "firmware": null,
+            "source": "",
+            "version": null
+          }
+        },
+        "evidence_profile": {
+          "$ref": "#/$defs/EvidenceProfile",
+          "default": {
+            "limitations": [],
+            "name": "",
+            "qualification": ""
+          }
+        },
+        "id": {
+          "type": "string"
+        },
+        "interface_combinations": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "interfaces": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "kernel": {
+          "type": "string"
+        },
+        "management_injection": {
+          "$ref": "#/$defs/Capability"
+        },
+        "modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "monitor": {
+          "$ref": "#/$defs/Capability"
+        },
+        "phy": {
+          "type": "string"
+        },
+        "product_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "protected": {
+          "type": "boolean"
+        },
+        "reserved_for": {
+          "$ref": "#/$defs/Reservation"
+        },
+        "rfkill": {
+          "type": "boolean"
+        },
+        "serial": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vendor_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "phy",
+        "bus",
+        "device_path",
+        "kernel",
+        "rfkill",
+        "interfaces",
+        "channels",
+        "modes",
+        "interface_combinations",
+        "monitor",
+        "management_injection",
+        "data_injection",
+        "awdl",
+        "protected",
+        "reserved_for"
+      ],
+      "type": "object"
+    },
+    "ReceiveSettings": {
+      "properties": {
+        "ask_directory": {
+          "type": "boolean"
+        },
+        "collision_policy": {
+          "enum": [
+            "rename",
+            "reject"
+          ],
+          "type": "string"
+        },
+        "directory": {
+          "type": "string"
+        },
+        "max_bytes": {
+          "format": "uint64",
+          "maximum": 10995116277760,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_files": {
+          "format": "uint64",
+          "maximum": 10000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "open_after": {
+          "type": "boolean"
+        },
+        "open_folder": {
+          "type": "boolean"
+        },
+        "subfolders": {
+          "enum": [
+            "none",
+            "sender",
+            "date",
+            "sender_date"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "directory",
+        "open_after",
+        "open_folder",
+        "max_files",
+        "max_bytes",
+        "ask_directory",
+        "collision_policy",
+        "subfolders"
+      ],
+      "type": "object"
+    },
+    "Reservation": {
+      "enum": [
+        "AirDrop",
+        "Quick Share",
+        "Not reserved"
+      ],
+      "type": "string"
+    },
+    "SelectionMode": {
+      "enum": [
+        "native",
+        "publish_selected"
+      ],
+      "type": "string"
+    },
+    "Settings": {
+      "properties": {
+        "airdrop": {
+          "$ref": "#/$defs/AirdropSettings"
+        },
+        "bluetooth": {
+          "$ref": "#/$defs/BluetoothSettings"
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/DiagnosticsSettings"
+        },
+        "general": {
+          "$ref": "#/$defs/GeneralSettings"
+        },
+        "hardware": {
+          "$ref": "#/$defs/HardwareSettings"
+        },
+        "localsend": {
+          "$ref": "#/$defs/LocalsendSettings"
+        },
+        "network": {
+          "$ref": "#/$defs/NetworkSettings"
+        },
+        "notifications": {
+          "$ref": "#/$defs/NotificationsSettings"
+        },
+        "quickshare": {
+          "$ref": "#/$defs/QuickshareSettings"
+        },
+        "receive": {
+          "$ref": "#/$defs/ReceiveSettings"
+        },
+        "schema_version": {
+          "const": 1,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transfers": {
+          "$ref": "#/$defs/TransfersSettings"
+        },
+        "visibility": {
+          "$ref": "#/$defs/VisibilitySettings"
+        }
+      },
+      "required": [
+        "schema_version",
+        "general",
+        "receive",
+        "visibility",
+        "localsend",
+        "quickshare",
+        "airdrop",
+        "hardware",
+        "bluetooth",
+        "notifications",
+        "transfers",
+        "network",
+        "diagnostics"
+      ],
+      "type": "object"
+    },
+    "TransferFile": {
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transferred": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "size",
+        "transferred"
+      ],
+      "type": "object"
+    },
+    "TransferView": {
+      "properties": {
+        "direction": {
+          "enum": [
+            "incoming",
+            "outgoing"
+          ],
+          "type": "string"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "files": {
+          "items": {
+            "$ref": "#/$defs/TransferFile"
+          },
+          "type": "array"
+        },
+        "id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "peer_id": {
+          "type": "string"
+        },
+        "peer_name": {
+          "type": "string"
+        },
+        "protocol": {
+          "type": "string"
+        },
+        "receive_directory": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "saved_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "selection_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SelectionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "type": "string"
+        },
+        "total_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transferred_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "verification_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "peer_id",
+        "peer_name",
+        "protocol",
+        "direction",
+        "state",
+        "files",
+        "total_bytes",
+        "transferred_bytes",
+        "saved_paths"
+      ],
+      "type": "object"
+    },
+    "TransfersSettings": {
+      "properties": {
+        "bandwidth_limit_mbps": {
+          "format": "uint64",
+          "maximum": 100000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "history_days": {
+          "format": "uint64",
+          "maximum": 3650,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "history_limit": {
+          "format": "uint64",
+          "maximum": 10000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_parallel": {
+          "format": "uint64",
+          "maximum": 16,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_parallel",
+        "history_limit",
+        "history_days",
+        "bandwidth_limit_mbps"
+      ],
+      "type": "object"
+    },
+    "VisibilitySettings": {
+      "properties": {
+        "duration_minutes": {
+          "format": "uint64",
+          "maximum": 1440,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hide_on_lock": {
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            "hidden",
+            "everyone"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode",
+        "duration_minutes",
+        "hide_on_lock"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "backends": {
+      "items": {
+        "$ref": "#/$defs/BackendState"
+      },
+      "type": "array"
+    },
+    "download_link_active": {
+      "type": "boolean"
+    },
+    "epoch": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "hardware": {
+      "$ref": "#/$defs/HardwareStatus"
+    },
+    "known_peers": {
+      "items": {
+        "$ref": "#/$defs/KnownPeer"
+      },
+      "type": "array"
+    },
+    "peers": {
+      "items": {
+        "$ref": "#/$defs/PeerView"
+      },
+      "type": "array"
+    },
+    "restarting": {
+      "type": "boolean"
+    },
+    "revision": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "settings": {
+      "$ref": "#/$defs/Settings"
+    },
+    "transfers": {
+      "items": {
+        "$ref": "#/$defs/TransferView"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "epoch",
+    "revision",
+    "restarting",
+    "download_link_active",
+    "peers",
+    "known_peers",
+    "transfers",
+    "backends",
+    "settings",
+    "hardware"
+  ],
+  "title": "Snapshot",
+  "type": "object"
+}

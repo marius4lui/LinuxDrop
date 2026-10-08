@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "general": {
+    "device_name": "LinuxDrop",
+    "autostart": false,
+    "appearance": "system",
+    "language": "system",
+    "close_behavior": "background"
+  },
+  "receive": {
+    "directory": "/tmp/LinuxDrop",
+    "open_after": false,
+    "open_folder": false,
+    "max_files": 1000,
+    "max_bytes": 107374182400,
+    "ask_directory": false,
+    "collision_policy": "rename",
+    "subfolders": "none"
+  },
+  "visibility": {
+    "mode": "hidden",
+    "duration_minutes": 10,
+    "hide_on_lock": true
+  },
+  "localsend": {
+    "enabled": true,
+    "port": 53317,
+    "https": true,
+    "multicast": true,
+    "require_pin": false,
+    "pin": ""
+  },
+  "quickshare": {
+    "enabled": true,
+    "ble": true,
+    "port": 53320
+  },
+  "airdrop": {
+    "enabled": false,
+    "ble_wakeup": true,
+    "send": true,
+    "receive": true
+  },
+  "hardware": {
+    "preferred_adapter": "",
+    "prefer_usb": true,
+    "protect_active_connection": true,
+    "auto_use_usb": true,
+    "open_on_adapter": false
+  },
+  "bluetooth": {
+    "adapter": ""
+  },
+  "notifications": {
+    "completed": true,
+    "errors": true,
+    "incoming": true,
+    "sound": false,
+    "private_content": true
+  },
+  "transfers": {
+    "max_parallel": 3,
+    "history_limit": 100,
+    "history_days": 30,
+    "bandwidth_limit_mbps": 0
+  },
+  "network": {
+    "allowed_interfaces": [],
+    "allow_virtual_interfaces": false
+  },
+  "diagnostics": {
+    "log_level": "info"
+  }
+}

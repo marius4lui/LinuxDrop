@@ -1,0 +1,30 @@
+[package]
+name = "linuxdrop-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+schema = ["dep:schemars", "linuxdrop-core/schema", "linuxdrop-hardware/schema"]
+client = ["dep:zbus"]
+
+[dependencies]
+linuxdrop-hardware = { path = "../linuxdrop-hardware" }
+schemars = { version = "1.2", optional = true }
+linuxdrop-core = { path = "../linuxdrop-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+zbus = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio.workspace = true
+futures-util.workspace = true
+
+[[example]]
+name = "check_contract"
+required-features = ["client"]
+
+[[example]]
+name = "export_schema"
+required-features = ["schema"]
